@@ -55,7 +55,7 @@ def feed(t):
 
 # 设备启动入口：先打开外设 3.3V，再创建横屏界面并进入 LVGL 事件循环。
 if __name__ == "__main__":
-    print("run 1111qqq11")
+    print("run 1111q11qq11")
     # LCD 供电恢复前先关闭背光，避免 ST7789 尚未刷新时显示历史 GRAM 内容。
     lcd_touch.prepare_backlight_off()
     EN_3V3 = Pin(Pin.GPIO12, Pin.OUT, Pin.PULL_DISABLE, 1)
