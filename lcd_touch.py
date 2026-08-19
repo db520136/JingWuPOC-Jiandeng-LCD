@@ -1055,9 +1055,10 @@ class JingWuUI:
                     pass
         self._sleep_scroll_positions = []
 
-        if self.brightness != self._sleep_brightness:
-            self.set_brightness(self._sleep_brightness)
-        elif self._brightness_slider is not None:
+        # 息屏时只把硬件 PWM 置为 0，不改变逻辑亮度；唤醒后必须
+        # 无条件重写息屏前占空比，否则 brightness 数值相同会跳过恢复。
+        self.set_brightness(self._sleep_brightness)
+        if self._brightness_slider is not None:
             try:
                 self._brightness_slider.set_value(
                     self._sleep_brightness, lv.ANIM.OFF)
@@ -1201,6 +1202,12 @@ class JingWuUI:
             print("[息屏] ST7789息屏失败：{}".format(error))
             self.notify_activity()
             return False
+        if self._brightness_pwm is not None:
+            try:
+                self._brightness_pwm.open(
+                    BRIGHTNESS_PWM_FREQUENCY, BRIGHTNESS_BOOT_OFF)
+            except Exception as error:
+                print("[息屏] 背光PWM关闭失败：{}".format(error))
         self._screen_sleeping = True
         self._display_wake_last_attempt_ms = None
         self._display_wake_error_reported = False

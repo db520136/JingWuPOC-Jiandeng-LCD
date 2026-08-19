@@ -58,8 +58,8 @@ if __name__ == "__main__":
     print("run 1111q11qq11")
     # LCD 供电恢复前先关闭背光，避免 ST7789 尚未刷新时显示历史 GRAM 内容。
     lcd_touch.prepare_backlight_off()
-    EN_3V3 = Pin(Pin.GPIO12, Pin.OUT, Pin.PULL_DISABLE, 1)
-    EN_3V3.write(1)
+    #EN_3V3 = Pin(Pin.GPIO12, Pin.OUT, Pin.PULL_DISABLE, 1)
+    #EN_3V3.write(1)
     # 给 LCD 电源和控制器留出稳定时间，不再固定黑屏等待 10 秒。
     #utime.sleep_ms(100)
     print("run 2")
