@@ -105,7 +105,7 @@ if __name__ == "__main__":
         hardware_version=HARDWARE_VER,
         poc_client=poc_client,
     )
-    print("run 4")
+    print("run 41")
     # 此时登录页和LCD首帧已准备完成，再启动网络和POC线程；
     # 进入run()后网络连接、登录页面和LVGL主循环并行运行。
     if not network_monitor.start_network_worker():
