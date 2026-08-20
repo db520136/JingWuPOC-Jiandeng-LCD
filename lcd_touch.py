@@ -3593,6 +3593,19 @@ class JingWuUI:
         return str(person.get("device_id") or
                    person.get("police_code") or person.get("name") or "")
 
+    def _is_logged_in_person(self, person):
+        """判断HTTP人员是否为当前登录警号对应的人员。"""
+        if not isinstance(person, dict) or self._poc_client is None:
+            return False
+        login_police = getattr(self._poc_client, "_login_police_no", None)
+        if not login_police:
+            login_police = getattr(self._poc_client, "_police_no", None)
+        person_police = person.get("police_code")
+        if not login_police or not person_police:
+            return False
+        return (str(person_police).strip().upper() ==
+                str(login_police).strip().upper())
+
     def _group_name(self, key):
         for group in self._intercom_groups:
             if str(group.get("raw_id", "")) == key:
@@ -3661,13 +3674,16 @@ class JingWuUI:
         none_radio.set_text("无/解散")
         none_radio.set_pos(0, 6)
         none_radio.clear_flag(lv.obj.FLAG.HIDDEN)
-        for raw_index, person in enumerate(self._intercom_people):
-            index = raw_index + 1
+        index = 1
+        for person in self._intercom_people:
+            if self._is_logged_in_person(person):
+                continue
             key = self._person_key(person)
             if not key:
                 continue
             active_keys[key] = True
             y = 6 + index * (SETTINGS_ROW_HEIGHT + SETTINGS_ROW_GAP)
+            index += 1
             text = str(person.get("name") or
                        person.get("police_code") or key)
             online = person.get("online") is True
@@ -3757,6 +3773,10 @@ class JingWuUI:
             return
         if person != self._single_none_key:
             for item in self._intercom_people:
+                if self._is_logged_in_person(item) and \
+                        self._person_key(item) == person:
+                    self._sync_intercom_selection_ui()
+                    return
                 if self._person_key(item) == person and item.get("online") is not True:
                     self._sync_intercom_selection_ui()
                     return

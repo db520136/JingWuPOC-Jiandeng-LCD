@@ -2713,11 +2713,9 @@ class POCClient:
         return groups
 
     def _normalize_people(self, groups):
-        """跨组去重；优先用deviceId，其次policeCode，保证同名不同编号保留。"""
-        people = []
-        seen_device = set()
-        seen_code = set()
-        seen_fallback = set()
+        """跨组按警号去重，优先保留同警号的首条在线记录。"""
+        selected_by_code = {}
+        code_order = []
         for group in groups:
             for user in group.get("users", []):
                 if not isinstance(user, dict):
@@ -2726,22 +2724,25 @@ class POCClient:
                     user, "deviceId", "deviceID", "device_id") or "").strip()
                 code = str(self._json_value(
                     user, "policeCode", "policeNo", "police_no") or "").strip()
+                # 警号和设备号是单呼目标的必要字段，任一缺失就丢弃整条记录。
+                if not device or not code:
+                    continue
                 name = str(self._json_value(
                     user, "policeName", "name", "userName", "username") or "").strip()
-                if ((device and device in seen_device) or
-                        (code and code in seen_code)):
-                    continue
-                if not device and not code:
-                    if not name or name in seen_fallback:
-                        continue
-                    seen_fallback.add(name)
-                if device:
-                    seen_device.add(device)
-                if code:
-                    seen_code.add(code)
-                people.append({"name": name or code or device,
-                               "police_code": code, "device_id": device,
-                               "online": self._json_value(user, "online", "isOnline")})
+                online = (self._json_value(user, "online", "isOnline") is True)
+                record = {"name": name or code or device,
+                          "police_code": code, "device_id": device,
+                          "online": online}
+                code_key = code.upper()
+                current = selected_by_code.get(code_key)
+                if current is None:
+                    selected_by_code[code_key] = record
+                    code_order.append(code_key)
+                elif current["online"] is not True and online:
+                    # 之前保留的是离线记录，遇到在线设备时替换；
+                    # 已经保留在线记录后，后续重复项不再覆盖它。
+                    selected_by_code[code_key] = record
+        people = [selected_by_code[key] for key in code_order]
         # 在线成员优先，离线成员保持HTTP原始相对顺序并置于末尾。
         online = [item for item in people if item.get("online") is True]
         offline = [item for item in people if item.get("online") is not True]
@@ -2792,6 +2793,7 @@ class POCClient:
             # QuecPython官方request响应对象提供json()，优先让底层按实际
             # 响应编码解析；不要再把response.text转成字符串交给ujson。
             json_reader = getattr(response, "json", None)
+            
             if json_reader is not None:
                 payload = json_reader()
             else:
@@ -2802,7 +2804,7 @@ class POCClient:
                 if isinstance(body, bytes):
                     body = body.decode("utf-8")
                 payload = _json.loads(body)
-
+            print("http payload={}".format(payload))
             # 服务端固定返回 {'data': [组信息...]}，真正的组列表是data键值。
             if not isinstance(payload, dict):
                 raise ValueError("HTTP JSON顶层不是对象")
@@ -2821,6 +2823,12 @@ class POCClient:
                 self.request_join_group(first["raw_id"], first["id"])
             print("[POC] HTTP名单获取成功：{}个组，{}名人员".format(
                 len(groups), len(people)))
+            for person in people:
+                print("{} -> {} -> {}-->{}".format(
+                    person.get("name", ""),
+                    person.get("device_id", ""),
+                    person.get("police_code", ""),
+                    "在线" if person.get("online") is True else "离线"))
         except Exception as error:
             self.last_error = error
             self._set_http_failed()

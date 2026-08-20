@@ -13,10 +13,10 @@ import uos
 import checkNet
 from machine import WDT,Timer
 FIRMWARE_VER = modem.getDevFwVersion()  #获取到固件版本
-SOFTWARE_VER = "1.0.9"                  #软件版本
+SOFTWARE_VER = "1.0.10"                  #软件版本
 HARDWARE_VER = "1.0.0"                  #硬件版本
 # POC服务器参数集中放在启动入口，后续更换测试服务器无需修改业务模块。
-DEVICE_ID = "33030002002000000590"
+DEVICE_ID = "33030002002000000591"
 #POC_TCP_HOST = "125.124.233.231"
 POC_TCP_HOST = "68.95.0.31"
 
@@ -123,3 +123,31 @@ if __name__ == "__main__":
     if not hardware_key_service.start():
         print("[按键] 物理按键服务未能启动")
     ui.run()
+
+
+
+ayload=
+{'data': 
+[
+    {
+         'groupUsers': 
+            [ {'deviceId': '33030002002000000591', 'policeCode': 'M100002', 'policeName': '潘三', 'online': True},
+            {'deviceId': '33030002002000000592', 'policeCode': 'M100001', 'policeName': '潘一', 'online': False},
+                {'deviceId': '33030002002000000590', 'policeCode': 'M100001', 'policeName': '潘一', 'online': True}
+            ],
+        'groupName': 
+            'POC肩灯测试组', 'groupId': '50001'
+    }, 
+    {
+        'groupUsers':
+          [ {'deviceId': '33030002002000000591', 'policeCode': 'M100002', 'policeName': '潘三', 'online': True}, 
+           {'deviceId': '33030002002000000592', 'policeCode': 'M100001', 'policeName': '潘一', 'online': False}, 
+           {'deviceId': '33030002002000000590', 'policeCode': 'M100001', 'policeName': '潘一', 'online': True}
+         ],
+        'groupName': 'POC肩灯测试组2', 'groupId': '50002'
+    }
+
+]
+
+
+}
