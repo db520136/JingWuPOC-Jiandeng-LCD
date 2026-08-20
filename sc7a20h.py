@@ -277,7 +277,7 @@ class SC7A20H:
         """
         self._write_register(REG_CLICK_CTRL, 0x1F)
         self._write_register(REG_CLICK_COEFF1, 0x12)
-        self._write_register(REG_CLICK_COEFF2, 0x9A)
+        self._write_register(REG_CLICK_COEFF2, 0xA2)
         self._write_register(REG_CLICK_COEFF3, 0x04)
         self._write_register(REG_CLICK_COEFF4, 0x12)
 

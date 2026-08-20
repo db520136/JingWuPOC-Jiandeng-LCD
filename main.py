@@ -1,6 +1,7 @@
+from machine import Pin
+a = Pin(Pin.GPIO38, Pin.OUT, Pin.PULL_DISABLE, 0)
 # -*- coding: utf-8 -*-
 import utime
-from machine import Pin
 from misc import Power
 from usr import lcd_touch
 from usr.poc_client import POCClient
@@ -12,12 +13,13 @@ import uos
 import checkNet
 from machine import WDT,Timer
 FIRMWARE_VER = modem.getDevFwVersion()  #获取到固件版本
-SOFTWARE_VER = "1.1.3"                  #软件版本
+SOFTWARE_VER = "1.0.9"                  #软件版本
 HARDWARE_VER = "1.0.0"                  #硬件版本
 # POC服务器参数集中放在启动入口，后续更换测试服务器无需修改业务模块。
-DEVICE_ID = "33030002002000000591"
+DEVICE_ID = "33030002002000000590"
 #POC_TCP_HOST = "125.124.233.231"
 POC_TCP_HOST = "68.95.0.31"
+
 POC_TCP_PORT = 6060
 POC_RTP_LOCAL_PORT = DEFAULT_LOCAL_RTP_PORT
 # GNSS定位信息上传周期，单位毫秒；后续可由设置页替换该参数。
@@ -51,18 +53,17 @@ def mount_external_flash():
             return False
         
 def feed(t):
+    print("11")
     wdt.feed()
 
 # 设备启动入口：先打开外设 3.3V，再创建横屏界面并进入 LVGL 事件循环。
 if __name__ == "__main__":
-    print("run 2")
     # LCD 供电恢复前先关闭背光，避免 ST7789 尚未刷新时显示历史 GRAM 内容。
     lcd_touch.prepare_backlight_off()
-    EN_3V3 = Pin(Pin.GPIO12, Pin.OUT, Pin.PULL_DISABLE, 1)
-    EN_3V3.write(1)
+    #EN_3V3 = Pin(Pin.GPIO12, Pin.OUT, Pin.PULL_DISABLE, 1)
+    #EN_3V3.write(1)
     # 给 LCD 电源和控制器留出稳定时间，不再固定黑屏等待 10 秒。
     #utime.sleep_ms(100)
-    print("run 2")
     mount_external_flash()
     print("开机原因：",Power.powerOnReason())
     print("关机原因：",Power.powerDownReason())
@@ -89,7 +90,7 @@ if __name__ == "__main__":
         tcp_retry_initial_timeout_ms=POC_TCP_RETRY_INITIAL_TIMEOUT_MS,
         tcp_retry_timeout_step_ms=POC_TCP_RETRY_TIMEOUT_STEP_MS,
     )
-    # RTP 与 TCP 使用同一服务器地址；服务器UDP端口由0x88/0x0B应答更新。
+    # RTP 与 TCP 使用同一服务器地址；服务器UDP端口由0x88/0x0B应答更新。  ptt 27
     rtp_audio = RTPAudioController(
         server_ip=POC_TCP_HOST,
         local_port=POC_RTP_LOCAL_PORT,
@@ -97,7 +98,6 @@ if __name__ == "__main__":
         pcm_periodcnt=POC_PCM_PERIOD_COUNT,
         jitter_packets=POC_RTP_JITTER_PACKETS,
     )
-    print("run 3")
     poc_client.set_audio_controller(rtp_audio)
     ui = lcd_touch.JingWuUI(
         firmware_version=FIRMWARE_VER,
@@ -105,7 +105,6 @@ if __name__ == "__main__":
         hardware_version=HARDWARE_VER,
         poc_client=poc_client,
     )
-    print("run 4")
     # 此时登录页和LCD首帧已准备完成，再启动网络和POC线程；
     # 进入run()后网络连接、登录页面和LVGL主循环并行运行。
     if not network_monitor.start_network_worker():
@@ -118,10 +117,9 @@ if __name__ == "__main__":
         rtp_audio,
         on_activity=ui.notify_activity,
         ptt_gpio=29,
-        volume_up_gpio=
+        volume_up_gpio=30,
         volume_down_gpio=31,
     )
     if not hardware_key_service.start():
         print("[按键] 物理按键服务未能启动")
-    print("run 5")
     ui.run()

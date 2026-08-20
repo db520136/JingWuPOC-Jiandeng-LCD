@@ -315,11 +315,11 @@ class ShoulderLampController:
             self._lock.release()
 
     def cycle_mode(self):
-        """按 off -> alternate -> diagonal -> off 循环切换。"""
+        """双击切换模式：关闭时开启交替闪，任一开启模式下关闭。"""
         self._lock.acquire()
         try:
-            index = self.VALID_MODES.index(self.mode)
-            next_mode = self.VALID_MODES[(index + 1) % len(self.VALID_MODES)]
+            next_mode = (self.MODE_ALTERNATE
+                         if self.mode == self.MODE_OFF else self.MODE_OFF)
         finally:
             self._lock.release()
         return next_mode if self.set_mode(next_mode) else next_mode
