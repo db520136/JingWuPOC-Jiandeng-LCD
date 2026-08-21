@@ -16,7 +16,7 @@ FIRMWARE_VER = modem.getDevFwVersion()  #获取到固件版本
 SOFTWARE_VER = "1.0.11"                  #软件版本
 HARDWARE_VER = "1.0.0"                  #硬件版本
 # POC服务器参数集中放在启动入口，后续更换测试服务器无需修改业务模块。
-DEVICE_ID = "33030002002000000591"
+DEVICE_ID = "33030002002000000590"
 POC_TCP_HOST = "125.124.233.231"
 #POC_TCP_HOST = "68.95.0.31"
 
@@ -65,7 +65,7 @@ if __name__ == "__main__":
     # 给 LCD 电源和控制器留出稳定时间，不再固定黑屏等待 10 秒。
     #utime.sleep_ms(100)
     mount_external_flash()
-    print("开机原因：",Power.powerOnReason())
+    print("开机原因1：",Power.powerOnReason())
     print("关机原因：",Power.powerDownReason())
 
     wdt = WDT(20)  # 启动看门狗，设置超时时间
@@ -94,7 +94,7 @@ if __name__ == "__main__":
     rtp_audio = RTPAudioController(
         server_ip=POC_TCP_HOST,
         local_port=POC_RTP_LOCAL_PORT,
-        speaker_gpio=27,
+        speaker_gpio=22,#27,
         pcm_periodcnt=POC_PCM_PERIOD_COUNT,
         jitter_packets=POC_RTP_JITTER_PACKETS,
     )

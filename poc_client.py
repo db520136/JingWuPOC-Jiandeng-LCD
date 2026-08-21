@@ -18,6 +18,9 @@ except Exception:
 INVITE_FINAL_RESPONSE_TIMEOUT_MS = 10000
 # TCP连接建立后按固定周期发送心跳。
 HEARTBEAT_INTERVAL_MS = 60000
+# 登录前名单获取失败后按固定间隔重试；断网恢复时不等待该间隔，立即刷新。
+PRELOGIN_HTTP_RETRY_INTERVAL_MS = 5000
+PRELOGIN_NETWORK_CHECK_INTERVAL_MS = 500
 REQUEST_CNT_HISTORY_SIZE = 128
 SERVER_REQUEST_CACHE_SIZE = 64
 SERVER_REQUEST_CACHE_TTL_MS = 60000
@@ -201,6 +204,9 @@ class POCClient:
         self._http_refresh_auto_join = False
         self._http_refresh_reason = None
         self._http_worker_running = False
+        self._prelogin_network_ready = False
+        self._prelogin_http_retry_at_ms = None
+        self._prelogin_network_check_at_ms = None
         self.last_error = None
         self._revision = 0
         self._reported_revision = -1
@@ -654,11 +660,16 @@ class POCClient:
         print("[GNSS] 已发送定位信息上报：gnss_len={}，frame={}".format(
             len(gnss_data), self._hex(packet)))
 
-    def request_http_refresh(self, reason="页面", auto_join_first=False):
+    def request_http_refresh(self, reason="页面", auto_join_first=False,
+                             allow_before_login=False):
         """请求后台刷新HTTP名单；并发请求合并，绝不阻塞调用线程。"""
         if (_thread is None or not self._running or
-                self.login_state != "success"):
+                (self.login_state != "success" and
+                 not allow_before_login)):
             return False
+        if self.login_state != "success":
+            # 登录前只获取身份名单，绝不能触发登录后的默认入组动作。
+            auto_join_first = False
         start_worker = False
         self._lock_acquire()
         try:
@@ -711,6 +722,7 @@ class POCClient:
                 self._fetch_http_info(auto_join_first, reason)
         except Exception as error:
             print("[POC] HTTP后台任务异常：{}".format(error))
+            self._set_http_failed()
         self._lock_acquire()
         try:
             self._http_worker_running = False
@@ -2840,11 +2852,55 @@ class POCClient:
                 except Exception:
                     pass
 
+    def _process_prelogin_http_refresh(self):
+        """网络首次就绪、失败重试或断网恢复时刷新登录前身份名单。"""
+        if self._login_session_active:
+            self._prelogin_network_ready = False
+            self._prelogin_http_retry_at_ms = None
+            return
+        now_ms = utime.ticks_ms()
+        if (self._prelogin_network_check_at_ms is not None and
+                not self._time_reached(
+                    self._prelogin_network_check_at_ms, now_ms)):
+            return
+        self._prelogin_network_check_at_ms = self._add_ms(
+            now_ms, PRELOGIN_NETWORK_CHECK_INTERVAL_MS)
+        network_ready = self._network_ready()
+        if not network_ready:
+            self._prelogin_network_ready = False
+            self._prelogin_http_retry_at_ms = None
+            return
+
+        should_refresh = not self._prelogin_network_ready
+        self._prelogin_network_ready = True
+        if (should_refresh and
+                (self._http_worker_running or self._http_refresh_pending)):
+            # 已有请求覆盖本次网络就绪事件；等待其结果后再决定是否重试。
+            self._prelogin_http_retry_at_ms = self._add_ms(
+                now_ms, PRELOGIN_HTTP_RETRY_INTERVAL_MS)
+            return
+        if (not should_refresh and self.http_state != "success" and
+                self._time_reached(
+                    self._prelogin_http_retry_at_ms, now_ms)):
+            should_refresh = True
+        if not should_refresh:
+            return
+        if self._http_worker_running or self._http_refresh_pending:
+            return
+        started = self.request_http_refresh(
+            "登录前名单", auto_join_first=False,
+            allow_before_login=True)
+        self._prelogin_http_retry_at_ms = self._add_ms(
+            now_ms, PRELOGIN_HTTP_RETRY_INTERVAL_MS)
+        if not started:
+            self._set_http_failed()
+
     def _worker(self):
         """网络就绪后连接TCP，处理登录包和服务器应答。"""
         retry_ms = 1000
         try:
             while self._running:
+                self._process_prelogin_http_refresh()
                 if self._socket is None:
                     if not self._network_ready():
                         utime.sleep_ms(500)
@@ -2890,6 +2946,9 @@ class POCClient:
         try:
             return {"tcp_connected": self.tcp_connected,
                     "login_state": self.login_state,
+                    "login_police_no": (
+                        self._login_police_no
+                        if self._login_session_active else None),
                     "login_result": self.login_result,
                     "login_error": self.login_error,
                     "logout_revision": self._logout_revision,
@@ -2935,6 +2994,9 @@ class POCClient:
                 return None
             snapshot = {"tcp_connected": self.tcp_connected,
                         "login_state": self.login_state,
+                        "login_police_no": (
+                            self._login_police_no
+                            if self._login_session_active else None),
                         "login_result": self.login_result,
                         "login_error": self.login_error,
                         "logout_revision": self._logout_revision,

@@ -252,6 +252,7 @@ LOGIN_ROW_BG = 0x252D32
 LOGIN_KEY_BG = 0x30383D
 LOGIN_SELECTED_BG = 0x006F7A
 LOGIN_CONFIRM_BG = 0x007A42
+LOGIN_IDENTITY_BG = 0xFFD400
 
 # 肩灯每个亮灭阶段的默认持续时间，单位毫秒；运行时可通过公开方法调整。
 SHOULDER_FLASH_INTERVAL_MS = 500
@@ -470,6 +471,8 @@ class JingWuUI:
         self._network_snapshot = None
         self._network_icon = None
         self._network_icon_path = None
+        self._status_police_label = None
+        self._status_police_no = ""
         self._network_labels = {}
         self._network_refresh_pending = False
         self._network_error_reported = False
@@ -478,6 +481,7 @@ class JingWuUI:
         self._poc_snapshot = None
         self._poc_error_reported = False
         self._poc_http_data_applied = False
+        self._prelogin_http_result_seen = None
         # HTTP结果可能与对讲音频同时到达；先缓存，等弹框首帧和音频结束后
         # 再在LVGL主线程更新名单控件，避免名单重排抢占语音关键时序。
         self._pending_intercom_data = None
@@ -516,6 +520,14 @@ class JingWuUI:
         self._force_login_box = None
         self._force_login_cancel_button = None
         self._force_login_confirm_button = None
+        self._login_identity_blocker = None
+        self._login_identity_box = None
+        self._login_identity_line1 = None
+        self._login_identity_line2 = None
+        self._login_identity_cancel_button = None
+        self._login_identity_confirm_button = None
+        self._login_identity_prompt = False
+        self._pending_login_police_no = None
         self._login_message_until_ms = None
         self._force_login_prompt = False
         self._login_home_loaded = False
@@ -741,6 +753,14 @@ class JingWuUI:
         lv.scr_load(self._root_screen)
 
         # 状态栏控件在根屏幕中只创建一次，所有页面共享。
+        self._status_police_label = lv.label(self._root_screen)
+        self._status_police_label.set_size(120, 24)
+        self._status_police_label.set_pos(14, 3)
+        self._status_police_label.set_text("")
+        self._status_police_label.add_style(self._get_style(
+            FONT_SMALL, WHITE, lv.TEXT_ALIGN.LEFT), lv.PART.MAIN)
+        self._status_police_label.add_flag(lv.obj.FLAG.HIDDEN)
+
         self._network_icon = lv.img(self._root_screen)
         self._network_icon.set_size(NETWORK_ICON_SIZE, NETWORK_ICON_SIZE)
         self._network_icon.set_pos(NETWORK_ICON_X, NETWORK_ICON_Y)
@@ -781,6 +801,19 @@ class JingWuUI:
             pass
         self._refresh_status()
         self._init_poc_popup()
+
+    def _sync_police_status_visibility(self, key=None):
+        """按登录身份和当前页面更新状态栏左侧警号。"""
+        label = self._status_police_label
+        if label is None:
+            return
+        if key is None:
+            key = self.current[0] if self.current is not None else None
+        label.set_text(self._status_police_no)
+        if self._status_police_no and key not in ("login", "settings"):
+            label.clear_flag(lv.obj.FLAG.HIDDEN)
+        else:
+            label.add_flag(lv.obj.FLAG.HIDDEN)
 
     def _init_poc_popup(self):
         """创建一次全局对讲弹框，后续只更新文本、颜色和隐藏状态。"""
@@ -1807,6 +1840,25 @@ class JingWuUI:
                 self._process_pending_intercom_data()
                 return
             self._poc_snapshot = snapshot
+            self._status_police_no = str(
+                snapshot.get("login_police_no") or "").strip()
+            self._sync_police_status_visibility()
+            if not self._status_police_no:
+                prelogin_result = (
+                    snapshot.get("http_state"),
+                    tuple((str(person.get("police_code") or ""),
+                           str(person.get("name") or ""),
+                           str(person.get("device_id") or ""),
+                           person.get("online") is True)
+                          for person in (snapshot.get("people") or [])))
+                if prelogin_result != self._prelogin_http_result_seen:
+                    self._prelogin_http_result_seen = prelogin_result
+                    state = prelogin_result[0]
+                    if state == "success":
+                        print("[登录] HTTP名单已就绪：{}人".format(
+                            len(prelogin_result[1])))
+                    elif state == "failed":
+                        print("[登录] HTTP名单获取失败，等待自动重试")
             logout_revision = snapshot.get("logout_revision")
             if logout_revision is None:
                 logout_revision = (snapshot.get("logout_state"),
@@ -1817,6 +1869,8 @@ class JingWuUI:
                 logout_error = snapshot.get("logout_error")
                 if logout_state == "success":
                     self._force_login_prompt = False
+                    self._status_police_no = ""
+                    self._sync_police_status_visibility("login")
                     self._login_home_loaded = False
                     if (self.current is not None and
                             self.current[0] != "login"):
@@ -1880,7 +1934,8 @@ class JingWuUI:
                 self._login_home_loaded = True
                 self.show_home()
 
-            if snapshot.get("http_state") in ("success", "failed"):
+            if (state == "success" and
+                    snapshot.get("http_state") in ("success", "failed")):
                 groups = snapshot.get("groups") or []
                 people = snapshot.get("people") or []
                 self._queue_intercom_data(groups, people)
@@ -2389,6 +2444,7 @@ class JingWuUI:
             if self.stack and self.stack[-1][1] is previous[1]:
                 self.stack.pop()
             self.current = previous
+            self._sync_police_status_visibility(previous[0])
             # 页面对象是长期复用的，返回过程没有新分配对象；不在收尾帧
             # 立即执行 gc.collect()，避免回收停顿造成偶发卡顿。
         else:
@@ -2658,6 +2714,7 @@ class JingWuUI:
         """在同一根屏幕内切换页面，避免反复加载屏幕产生资源碎片。"""
         previous = self.current
         if previous is not None and previous[0] == key:
+            self._sync_police_status_visibility(key)
             return
         if push_history and previous is not None:
             self.stack.append(previous)
@@ -2667,6 +2724,7 @@ class JingWuUI:
         page.set_x(0)
         self._set_page_visible(page, True)
         self.current = (key, page)
+        self._sync_police_status_visibility(key)
         # 页面容器切到前景后，重新把全局弹框放到最上层；登录页保持隐藏。
         if getattr(self, "_poc_popup", None) is not None:
             if key == "login":
@@ -3104,6 +3162,33 @@ class JingWuUI:
             return False
         current_page = self.current[1]
 
+        if self._login_identity_prompt:
+            # 身份确认框是模态控件，只允许点击本框的取消和确认按钮。
+            for obj, callback in (
+                    (self._login_identity_cancel_button,
+                     self._cancel_login_identity_prompt),
+                    (self._login_identity_confirm_button,
+                     self._confirm_login_identity_prompt)):
+                if obj is None:
+                    continue
+                preferred_matches = preferred_obj is obj
+                if not preferred_matches and preferred_obj is not None:
+                    try:
+                        preferred_matches = preferred_obj.get_parent() is obj
+                    except Exception:
+                        preferred_matches = False
+                if preferred_matches:
+                    callback()
+                    return True
+                if point is not None:
+                    area = self._get_obj_area(obj)
+                    if (area is not None and
+                            area.x1 <= point[0] <= area.x2 and
+                            area.y1 <= point[1] <= area.y2):
+                        callback()
+                        return True
+            return True
+
         # 子控件（例如左侧圆点）收到事件时优先使用事件对象，避免
         # 坐标命中顺序先找到外层整行而丢失圆点自身的点击。
         if preferred_obj is not None:
@@ -3239,6 +3324,8 @@ class JingWuUI:
 
     def _set_login_prefix(self, prefix):
         """选择M或F，二者始终保持单选。"""
+        if self._login_identity_prompt:
+            return
         if prefix not in ("M", "F"):
             return
         self._login_prefix = prefix
@@ -3259,7 +3346,7 @@ class JingWuUI:
 
     def _login_digit(self, digit):
         """追加数字，最多保存6位。"""
-        if self._force_login_prompt:
+        if self._force_login_prompt or self._login_identity_prompt:
             return
         if len(self._login_digits) >= LOGIN_DIGIT_COUNT:
             return
@@ -3267,6 +3354,8 @@ class JingWuUI:
         self._refresh_login_number()
 
     def _login_delete(self):
+        if self._login_identity_prompt:
+            return
         if self._force_login_prompt:
             self._force_login_prompt = False
             self._hide_login_message()
@@ -3336,9 +3425,70 @@ class JingWuUI:
             self._force_login_prompt = False
             self._show_login_message("转机登录中", LOGIN_SELECTED_BG, None)
 
+    def _login_identity_result(self, police_no):
+        """根据最近一次HTTP名单返回登录身份确认框第二行内容。"""
+        snapshot = None
+        if self._poc_client is not None:
+            try:
+                snapshot = self._poc_client.get_snapshot()
+            except Exception:
+                snapshot = None
+        if snapshot is None:
+            snapshot = self._poc_snapshot or {}
+        if snapshot.get("http_state") != "success":
+            return "HTTP获取失败"
+        people = snapshot.get("people") or []
+        if not people:
+            return "空名单"
+        target = str(police_no).strip().upper()
+        for person in people:
+            code = str(person.get("police_code") or "").strip().upper()
+            if code == target:
+                return str(person.get("name") or police_no)
+        return "警号未注册"
+
+    def _show_login_identity_prompt(self, police_no):
+        if self._login_identity_box is None:
+            return
+        self._pending_login_police_no = str(police_no).strip().upper()
+        self._login_identity_line2.set_text(
+            self._login_identity_result(self._pending_login_police_no))
+        self._login_identity_prompt = True
+        self._login_identity_blocker.clear_flag(lv.obj.FLAG.HIDDEN)
+        try:
+            self._login_identity_blocker.move_foreground()
+        except Exception:
+            pass
+
+    def _hide_login_identity_prompt(self):
+        self._login_identity_prompt = False
+        if self._login_identity_blocker is not None:
+            self._login_identity_blocker.add_flag(lv.obj.FLAG.HIDDEN)
+
+    def _cancel_login_identity_prompt(self):
+        """取消身份确认，只关闭弹框并保留登录页输入。"""
+        if not self._login_identity_prompt:
+            return
+        self._pending_login_police_no = None
+        self._hide_login_identity_prompt()
+
+    def _confirm_login_identity_prompt(self):
+        """身份确认后继续执行已有TCP登录流程。"""
+        if not self._login_identity_prompt:
+            return
+        police_no = self._pending_login_police_no
+        self._pending_login_police_no = None
+        self._hide_login_identity_prompt()
+        if (police_no and self._poc_client is not None and
+                self._poc_client.submit_login(police_no)):
+            self._show_login_message("登录中", LOGIN_SELECTED_BG, None)
+        else:
+            self._show_login_message(
+                "登录失败", RED, LOGIN_MESSAGE_DURATION_MS)
+
     def _confirm_login(self):
-        """组合M/F和6位数字，并提交给后台POC客户端。"""
-        if self._force_login_prompt:
+        """组合M/F和6位数字，先显示身份确认框。"""
+        if self._force_login_prompt or self._login_identity_prompt:
             return
         if self._login_message_until_ms is not None:
             if not self._poc_time_reached(self._login_message_until_ms):
@@ -3353,11 +3503,7 @@ class JingWuUI:
                 "登录服务不可用", RED, LOGIN_MESSAGE_DURATION_MS)
             return
         police_no = self._login_prefix + self._login_digits
-        if self._poc_client.submit_login(police_no):
-            self._show_login_message("登录中", LOGIN_SELECTED_BG, None)
-        else:
-            self._show_login_message(
-                "登录失败", RED, LOGIN_MESSAGE_DURATION_MS)
+        self._show_login_identity_prompt(police_no)
 
     def _create_login_page(self, page):
         """创建编号栏和3x4数字键盘。"""
@@ -3511,6 +3657,75 @@ class JingWuUI:
                 pass
         self._force_login_cancel_button.add_flag(lv.obj.FLAG.HIDDEN)
         self._force_login_confirm_button.add_flag(lv.obj.FLAG.HIDDEN)
+
+        # 登录身份确认框独立于红色强制登录框，覆盖整页并阻止底层键盘响应。
+        self._login_identity_blocker = lv.obj(page)
+        self._login_identity_blocker.set_size(LCD_WIDTH, LCD_HEIGHT)
+        self._login_identity_blocker.set_pos(0, 0)
+        _fix_position(self._login_identity_blocker)
+        try:
+            self._login_identity_blocker.set_style_bg_opa(
+                0, lv.PART.MAIN | lv.STATE.DEFAULT)
+            self._login_identity_blocker.set_style_border_width(
+                0, lv.PART.MAIN | lv.STATE.DEFAULT)
+            self._login_identity_blocker.add_flag(lv.obj.FLAG.CLICKABLE)
+        except Exception:
+            pass
+
+        self._login_identity_box = lv.obj(self._login_identity_blocker)
+        self._login_identity_box.set_size(280, 160)
+        self._login_identity_box.set_pos(
+            (LCD_WIDTH - 280) // 2, (LCD_HEIGHT - 160) // 2)
+        _fix_position(self._login_identity_box)
+        _set_bg(self._login_identity_box, LOGIN_IDENTITY_BG)
+        self._login_identity_box.set_style_radius(
+            8, lv.PART.MAIN | lv.STATE.DEFAULT)
+
+        self._login_identity_line1 = lv.label(self._login_identity_box)
+        self._login_identity_line1.set_size(250, FONT_LOGIN_UNIFORM[1])
+        self._login_identity_line1.set_pos(15, 12)
+        self._login_identity_line1.set_text("当前登录：")
+        self._login_identity_line1.add_style(self._get_style(
+            FONT_LOGIN_UNIFORM, BLACK, lv.TEXT_ALIGN.LEFT), lv.PART.MAIN)
+
+        self._login_identity_line2 = lv.label(self._login_identity_box)
+        self._login_identity_line2.set_size(250, FONT_LOGIN_UNIFORM[1])
+        self._login_identity_line2.set_pos(15, 51)
+        self._login_identity_line2.set_text("")
+        self._login_identity_line2.add_style(self._get_style(
+            FONT_LOGIN_UNIFORM, BLACK), lv.PART.MAIN)
+
+        self._login_identity_cancel_button = self._login_button(
+            self._login_identity_box, 15, 110, 84, 35, "取消",
+            lambda obj: self._cancel_login_identity_prompt(),
+            RED, FONT_LOGIN_UNIFORM, click_page=page)
+        self._login_identity_confirm_button = self._login_button(
+            self._login_identity_box, 181, 110, 84, 35, "确认",
+            lambda obj: self._confirm_login_identity_prompt(),
+            LOGIN_CONFIRM_BG, FONT_LOGIN_UNIFORM, click_page=page)
+
+        def identity_cancel_clicked(event=None):
+            self._click_dispatched = True
+            self._cancel_login_identity_prompt()
+
+        def identity_confirm_clicked(event=None):
+            self._click_dispatched = True
+            self._confirm_login_identity_prompt()
+
+        try:
+            self._login_identity_cancel_button.add_event_cb(
+                identity_cancel_clicked, lv.EVENT.CLICKED, None)
+            self._login_identity_confirm_button.add_event_cb(
+                identity_confirm_clicked, lv.EVENT.CLICKED, None)
+        except Exception:
+            try:
+                self._login_identity_cancel_button.set_event_cb(
+                    identity_cancel_clicked, lv.EVENT.CLICKED, None)
+                self._login_identity_confirm_button.set_event_cb(
+                    identity_confirm_clicked, lv.EVENT.CLICKED, None)
+            except Exception:
+                pass
+        self._login_identity_blocker.add_flag(lv.obj.FLAG.HIDDEN)
         self._set_login_prefix(self._login_prefix)
         self._refresh_login_number()
 
@@ -3522,7 +3737,8 @@ class JingWuUI:
         # 登录页不显示顶部状态栏，登录控件使用完整屏幕宽度。
         page.set_pos(0, 0)
         page.set_size(LCD_WIDTH, LCD_HEIGHT)
-        for widget in (self._network_icon, self._battery_label):
+        for widget in (self._status_police_label, self._network_icon,
+                       self._battery_label):
             if widget is not None:
                 widget.add_flag(lv.obj.FLAG.HIDDEN)
         self.stack = []
