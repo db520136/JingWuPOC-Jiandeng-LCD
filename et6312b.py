@@ -46,6 +46,11 @@ ALL_CHANNELS_OFF_MODE = 0x00
 
 # imax_sel=0 时，0x4F 对应 10mA；可在创建驱动时传入其他 0x00~0xBF 值。
 DEFAULT_CURRENT_CODE = 0x4F
+CURRENT_LEVEL_COUNT = 192
+MIN_BRIGHTNESS_PERCENT = 5
+MAX_BRIGHTNESS_PERCENT = 100
+# 0x4F 是 192 档中的第 80 档，界面显示为 42%。
+DEFAULT_BRIGHTNESS_PERCENT = 42
 
 # 每组三个 LED 在 LEDXMD_RGBn 寄存器中的字段位置和掩码。
 LED_MODE_SHIFTS = (0, 2, 5)
@@ -111,6 +116,39 @@ class ET6312B:
     def _write_register(self, register, value):
         """写入一个 8 位寄存器。"""
         return self._write_registers(register, bytearray((value,)))
+
+    def set_brightness_percent(self, brightness_percent):
+        """把同一个 5%~100% 恒流亮度一次写入十二路通道。"""
+        try:
+            brightness_percent = int(brightness_percent)
+        except Exception:
+            raise ValueError("肩灯亮度必须是整数百分比")
+        if not MIN_BRIGHTNESS_PERCENT <= brightness_percent <= MAX_BRIGHTNESS_PERCENT:
+            raise ValueError("肩灯亮度必须在 5%~100% 范围内")
+
+        # LEDx_CURT 的 0x00~0xBF 对应 192 档。先向下取整再减一，
+        # 可保证 42% 仍为原来的 0x4F，100% 则为 0xBF。
+        current_code = (
+            brightness_percent * CURRENT_LEVEL_COUNT // 100) - 1
+        self._write_registers(
+            REG_LED_CURRENT_BASE,
+            bytearray((current_code,) * 12),
+        )
+        # 只有 I2C 写入成功后才更新缓存，失败时继续保留原亮度。
+        self.current_code = current_code
+        return brightness_percent
+
+    def get_brightness_percent(self):
+        """把当前十二路共用的恒流档位换算为界面百分比。"""
+        brightness_percent = (
+            ((self.current_code + 1) * 100 + CURRENT_LEVEL_COUNT // 2)
+            // CURRENT_LEVEL_COUNT
+        )
+        if brightness_percent < MIN_BRIGHTNESS_PERCENT:
+            return MIN_BRIGHTNESS_PERCENT
+        if brightness_percent > MAX_BRIGHTNESS_PERCENT:
+            return MAX_BRIGHTNESS_PERCENT
+        return brightness_percent
 
     def disable_autonomous(self):
         """Stop ET6312B internal thread timing while preserving LED current."""
@@ -358,6 +396,28 @@ class ShoulderLampController:
         finally:
             self._lock.release()
         return interval_ms
+
+    def set_brightness_percent(self, brightness_percent):
+        """线程安全地设置十二路肩灯的统一亮度。"""
+        self._lock.acquire()
+        try:
+            setter = getattr(self.driver, "set_brightness_percent", None)
+            if setter is None:
+                raise RuntimeError("ET6312B 驱动不支持亮度控制")
+            return setter(brightness_percent)
+        finally:
+            self._lock.release()
+
+    def get_brightness_percent(self):
+        """线程安全地返回 5%~100% 肩灯亮度。"""
+        self._lock.acquire()
+        try:
+            getter = getattr(self.driver, "get_brightness_percent", None)
+            if getter is None:
+                return DEFAULT_BRIGHTNESS_PERCENT
+            return getter()
+        finally:
+            self._lock.release()
 
     def set_mode(self, mode):
         """切换模式；即使已经是 off，也会清除当前跌倒报警。"""

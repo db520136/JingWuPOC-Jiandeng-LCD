@@ -256,6 +256,10 @@ LOGIN_IDENTITY_BG = 0xFFD400
 
 # 肩灯每个亮灭阶段的默认持续时间，单位毫秒；运行时可通过公开方法调整。
 SHOULDER_FLASH_INTERVAL_MS = 500
+# 十二路肩灯统一使用 5%~100% 恒流亮度；42% 对应现有约 10mA 默认值。
+SHOULDER_BRIGHTNESS_MIN = 5
+SHOULDER_BRIGHTNESS_MAX = 100
+SHOULDER_BRIGHTNESS_DEFAULT = 42
 
 BLACK = 0x000000
 WHITE = 0xFFFFFF
@@ -575,6 +579,10 @@ class JingWuUI:
         self._shoulder_error_reported = False
         self._motion_service = None
         self._shoulder_refresh_pending = False
+        self.shoulder_brightness = SHOULDER_BRIGHTNESS_DEFAULT
+        self._shoulder_brightness_slider = None
+        self._shoulder_brightness_value_label = None
+        self._restoring_shoulder_brightness = False
         # 息屏时间开机默认 30 秒；None 表示“永不息屏”。
         self.sleep_timeout_seconds = SLEEP_DEFAULT_SECONDS
         self._sleep_rows = {}
@@ -4149,7 +4157,9 @@ class JingWuUI:
                 page, STATUS_HEIGHT, PAGE_HEIGHT)
             items = (
                 ("U:/settings_device.png", "设备信息", self.show_device),
-                ("U:/settings_brightness.png", "亮度", self.show_brightness),
+                ("U:/settings_brightness.png", "屏幕亮度", self.show_brightness),
+                ("U:/settings_shoulder_brightness.png", "肩灯亮度",
+                 self.show_shoulder_brightness),
                 ("U:/settings_volume.png", "音量", self.show_volume),
                 ("U:/settings_sleep.png", "息屏时间", self.show_sleep),
                 ("U:/settings_network.png", "网络状态", self.show_network),
@@ -4404,6 +4414,198 @@ class JingWuUI:
                 self._brightness_value_label.set_text(
                     "{}%".format(self.brightness))
         self._load("brightness", page)
+
+    def set_shoulder_brightness(self, value):
+        """设置十二路肩灯的统一恒流亮度百分比，不改变肩灯开关模式。"""
+        try:
+            value = int(value)
+        except Exception:
+            value = SHOULDER_BRIGHTNESS_DEFAULT
+        value = max(SHOULDER_BRIGHTNESS_MIN,
+                    min(SHOULDER_BRIGHTNESS_MAX, value))
+        old_value = self.shoulder_brightness
+
+        if self._shoulder_controller is not None:
+            try:
+                value = int(
+                    self._shoulder_controller.set_brightness_percent(value))
+                self._shoulder_error_reported = False
+            except Exception as error:
+                if not self._shoulder_error_reported:
+                    print("[肩灯] 亮度设置失败：{}".format(error))
+                self._shoulder_error_reported = True
+                value = old_value
+
+        self.shoulder_brightness = value
+        if self._shoulder_brightness_slider is not None:
+            try:
+                if self._shoulder_brightness_slider.get_value() != value:
+                    self._restoring_shoulder_brightness = True
+                    try:
+                        self._shoulder_brightness_slider.set_value(
+                            value, lv.ANIM.OFF)
+                    finally:
+                        self._restoring_shoulder_brightness = False
+            except Exception:
+                pass
+        if self._shoulder_brightness_value_label is not None:
+            self._shoulder_brightness_value_label.set_text(
+                "{}%".format(value))
+        return value
+
+    def get_shoulder_brightness(self):
+        """返回当前肩灯恒流亮度百分比。"""
+        if self._shoulder_controller is not None:
+            try:
+                self.shoulder_brightness = int(
+                    self._shoulder_controller.get_brightness_percent())
+            except Exception:
+                pass
+        return self.shoulder_brightness
+
+    def _shoulder_brightness_slider_changed(self, *args):
+        """处理肩灯亮度滑块；唤醒屏幕的首次触摸只唤醒、不调光。"""
+        event = args[-1] if args else None
+        slider = self._shoulder_brightness_slider
+        try:
+            slider = event.get_target()
+        except Exception:
+            pass
+        if slider is None:
+            return
+        try:
+            code = event.get_code()
+        except Exception:
+            code = event
+
+        if self._consume_touch_event(code):
+            if code == lv.EVENT.VALUE_CHANGED:
+                # LVGL 可能先改变 slider 数值再进入回调；唤醒触摸必须恢复原值。
+                if not self._restoring_shoulder_brightness:
+                    self._restoring_shoulder_brightness = True
+                    try:
+                        slider.set_value(
+                            self.shoulder_brightness, lv.ANIM.OFF)
+                    except Exception:
+                        pass
+                    finally:
+                        self._restoring_shoulder_brightness = False
+            return
+        if code != lv.EVENT.VALUE_CHANGED:
+            return
+        if self._restoring_shoulder_brightness:
+            return
+        try:
+            self.set_shoulder_brightness(slider.get_value())
+        except Exception:
+            pass
+
+    def _create_shoulder_brightness_page(self, page):
+        """创建与屏幕亮度页一致的肩灯百分比调节页面。"""
+        page.set_size(LCD_WIDTH, PAGE_HEIGHT)
+        page.set_pos(0, STATUS_HEIGHT)
+        for state in (lv.STATE.DEFAULT, lv.STATE.PRESSED,
+                      lv.STATE.FOCUSED, lv.STATE.CHECKED):
+            page.set_style_bg_opa(255, lv.PART.MAIN | state)
+            page.set_style_bg_color(
+                lv.color_hex(_lv_color(BLACK)), lv.PART.MAIN | state)
+            page.set_style_border_width(0, lv.PART.MAIN | state)
+            page.set_style_outline_width(0, lv.PART.MAIN | state)
+            page.set_style_shadow_width(0, lv.PART.MAIN | state)
+            try:
+                page.set_style_pad_all(0, lv.PART.MAIN | state)
+            except Exception:
+                page.set_style_pad_top(0, lv.PART.MAIN | state)
+                page.set_style_pad_bottom(0, lv.PART.MAIN | state)
+                page.set_style_pad_left(0, lv.PART.MAIN | state)
+                page.set_style_pad_right(0, lv.PART.MAIN | state)
+
+        slider_width = 68
+        slider_height = 140
+        slider_x = (LCD_WIDTH - slider_width) // 2
+        slider_y = 16
+        slider_center_x = slider_x + slider_width // 2
+
+        top_symbol_size = 22
+        bottom_symbol_size = 24
+        self._brightness_symbol(
+            page, slider_center_x - top_symbol_size // 2,
+            0, top_symbol_size, BRIGHTNESS_TRACK_COLOR)
+        self._brightness_symbol(
+            page, slider_center_x - bottom_symbol_size // 2,
+            160, bottom_symbol_size, BRIGHTNESS_DIM_COLOR)
+
+        slider = lv.slider(page)
+        slider.set_size(slider_width, slider_height)
+        slider.set_pos(slider_x, slider_y)
+        _fix_position(slider)
+        slider.set_range(SHOULDER_BRIGHTNESS_MIN, SHOULDER_BRIGHTNESS_MAX)
+        slider.set_value(self.shoulder_brightness, lv.ANIM.OFF)
+
+        for state in (lv.STATE.DEFAULT, lv.STATE.PRESSED,
+                      lv.STATE.FOCUSED, lv.STATE.CHECKED):
+            slider.set_style_bg_opa(255, lv.PART.MAIN | state)
+            slider.set_style_bg_color(
+                lv.color_hex(_lv_color(BRIGHTNESS_TRACK_BG)),
+                lv.PART.MAIN | state)
+            slider.set_style_border_width(2, lv.PART.MAIN | state)
+            slider.set_style_border_color(
+                lv.color_hex(_lv_color(BRIGHTNESS_ACCENT_COLOR)),
+                lv.PART.MAIN | state)
+            slider.set_style_outline_width(0, lv.PART.MAIN | state)
+            slider.set_style_shadow_width(0, lv.PART.MAIN | state)
+            slider.set_style_radius(34, lv.PART.MAIN | state)
+            slider.set_style_bg_opa(255, lv.PART.INDICATOR | state)
+            slider.set_style_bg_color(
+                lv.color_hex(_lv_color(BRIGHTNESS_TRACK_COLOR)),
+                lv.PART.INDICATOR | state)
+            slider.set_style_radius(34, lv.PART.INDICATOR | state)
+            slider.set_style_bg_opa(0, lv.PART.KNOB | state)
+            slider.set_style_border_width(0, lv.PART.KNOB | state)
+            slider.set_style_shadow_width(0, lv.PART.KNOB | state)
+
+        value_label = lv.label(page)
+        value_label.set_size(82, FONT_MAIN[1])
+        value_label.set_pos(
+            slider_x + slider_width + 16,
+            slider_y + (slider_height - FONT_MAIN[1]) // 2)
+        value_label.add_style(self._get_style(
+            FONT_MAIN, BRIGHTNESS_TRACK_COLOR, lv.TEXT_ALIGN.LEFT),
+            lv.PART.MAIN)
+        value_label.set_text("{}%".format(self.shoulder_brightness))
+
+        self._shoulder_brightness_slider = slider
+        self._shoulder_brightness_value_label = value_label
+        callback = self._shoulder_brightness_slider_changed
+        self._event_callbacks.append(callback)
+        try:
+            slider.add_event_cb(callback, lv.EVENT.ALL, None)
+        except Exception:
+            try:
+                wrapper = lambda target, event: callback(event)
+                self._event_callbacks.append(wrapper)
+                slider.set_event_cb(wrapper, lv.EVENT.ALL, None)
+            except Exception:
+                pass
+
+    def show_shoulder_brightness(self):
+        """三级页面：调节十二路肩灯的统一恒流亮度。"""
+        self.get_shoulder_brightness()
+        page, created = self._screen("shoulder_brightness", "")
+        if created:
+            self._create_shoulder_brightness_page(page)
+        else:
+            if self._shoulder_brightness_slider is not None:
+                self._restoring_shoulder_brightness = True
+                try:
+                    self._shoulder_brightness_slider.set_value(
+                        self.shoulder_brightness, lv.ANIM.OFF)
+                finally:
+                    self._restoring_shoulder_brightness = False
+            if self._shoulder_brightness_value_label is not None:
+                self._shoulder_brightness_value_label.set_text(
+                    "{}%".format(self.shoulder_brightness))
+        self._load("shoulder_brightness", page)
 
     def show_volume(self):
         """三级页面：复用亮度页竖向滑块布局，显示0~11音量等级。"""

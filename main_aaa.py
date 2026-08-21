@@ -13,10 +13,10 @@ import uos
 import checkNet
 from machine import WDT,Timer
 FIRMWARE_VER = modem.getDevFwVersion()  #获取到固件版本
-SOFTWARE_VER = "1.0.11"                  #软件版本
+SOFTWARE_VER = "1.0.13"                  #软件版本
 HARDWARE_VER = "1.0.0"                  #硬件版本
 # POC服务器参数集中放在启动入口，后续更换测试服务器无需修改业务模块。
-DEVICE_ID = "33030002002000000590"
+DEVICE_ID = "33030002002000000592"
 POC_TCP_HOST = "125.124.233.231"
 #POC_TCP_HOST = "68.95.0.31"
 
@@ -94,7 +94,7 @@ if __name__ == "__main__":
     rtp_audio = RTPAudioController(
         server_ip=POC_TCP_HOST,
         local_port=POC_RTP_LOCAL_PORT,
-        speaker_gpio=22,#27,
+        speaker_gpio=27,
         pcm_periodcnt=POC_PCM_PERIOD_COUNT,
         jitter_packets=POC_RTP_JITTER_PACKETS,
     )
@@ -116,7 +116,7 @@ if __name__ == "__main__":
     hardware_key_service = HardwareKeyService(
         rtp_audio,
         on_activity=ui.notify_activity,
-        ptt_gpio=29,
+        ptt_gpio=29,#22,#29,
         volume_up_gpio=30,
         volume_down_gpio=31,
     )
