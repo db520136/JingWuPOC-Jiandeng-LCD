@@ -13,12 +13,12 @@ import uos
 import checkNet
 from machine import WDT,Timer
 FIRMWARE_VER = modem.getDevFwVersion()  #获取到固件版本
-SOFTWARE_VER = "1.0.10"                  #软件版本
+SOFTWARE_VER = "1.0.11"                  #软件版本
 HARDWARE_VER = "1.0.0"                  #硬件版本
 # POC服务器参数集中放在启动入口，后续更换测试服务器无需修改业务模块。
 DEVICE_ID = "33030002002000000591"
-#POC_TCP_HOST = "125.124.233.231"
-POC_TCP_HOST = "68.95.0.31"
+POC_TCP_HOST = "125.124.233.231"
+#POC_TCP_HOST = "68.95.0.31"
 
 POC_TCP_PORT = 6060
 POC_RTP_LOCAL_PORT = DEFAULT_LOCAL_RTP_PORT
@@ -31,10 +31,10 @@ POC_TCP_RETRY_TIMEOUT_STEP_MS = 500
 # PCM使用4个底层周期缓冲；RTP接收先缓存5包（约100ms）再开始播放。
 POC_PCM_PERIOD_COUNT = 4
 POC_RTP_JITTER_PACKETS = 5
-#POC_HTTP_URL = (
-#    "http://125.124.233.231:18081/biz/deviceInfo/data?deviceId=" + DEVICE_ID)
 POC_HTTP_URL = (
-    "http://68.95.0.31:38080/biz/deviceInfo/data?deviceId=" + DEVICE_ID)
+    "http://125.124.233.231:18081/biz/deviceInfo/data?deviceId=" + DEVICE_ID)
+#POC_HTTP_URL = (
+#    "http://68.95.0.31:38080/biz/deviceInfo/data?deviceId=" + DEVICE_ID)
 def mount_external_flash():
     """在创建JingWuUI前挂载外置NOR Flash，供LVGL加载字体资源。"""
     try:
@@ -126,28 +126,3 @@ if __name__ == "__main__":
 
 
 
-ayload=
-{'data': 
-[
-    {
-         'groupUsers': 
-            [ {'deviceId': '33030002002000000591', 'policeCode': 'M100002', 'policeName': '潘三', 'online': True},
-            {'deviceId': '33030002002000000592', 'policeCode': 'M100001', 'policeName': '潘一', 'online': False},
-                {'deviceId': '33030002002000000590', 'policeCode': 'M100001', 'policeName': '潘一', 'online': True}
-            ],
-        'groupName': 
-            'POC肩灯测试组', 'groupId': '50001'
-    }, 
-    {
-        'groupUsers':
-          [ {'deviceId': '33030002002000000591', 'policeCode': 'M100002', 'policeName': '潘三', 'online': True}, 
-           {'deviceId': '33030002002000000592', 'policeCode': 'M100001', 'policeName': '潘一', 'online': False}, 
-           {'deviceId': '33030002002000000590', 'policeCode': 'M100001', 'policeName': '潘一', 'online': True}
-         ],
-        'groupName': 'POC肩灯测试组2', 'groupId': '50002'
-    }
-
-]
-
-
-}

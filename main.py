@@ -13,7 +13,7 @@ import uos
 import checkNet
 from machine import WDT,Timer
 FIRMWARE_VER = modem.getDevFwVersion()  #获取到固件版本
-SOFTWARE_VER = "1.0.10"                  #软件版本
+SOFTWARE_VER = "1.0.11"                  #软件版本
 HARDWARE_VER = "1.0.0"                  #硬件版本
 # POC服务器参数集中放在启动入口，后续更换测试服务器无需修改业务模块。
 DEVICE_ID = "33030002002000000591"

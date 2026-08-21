@@ -13,7 +13,7 @@
 
 业务控制接口：
     apply_mask(mask)           一次性更新 D1~D12
-    ShoulderLampController     肩灯关闭、交替闪和对角闪状态机
+    ShoulderLampController     肩灯关闭、交替闪和对角闪控制器
 """
 
 import _thread
@@ -30,12 +30,15 @@ ET6312B_I2C_ADDRESS = 0x48
 
 # 数据手册寄存器地址。
 REG_CHIP_CONTROL = 0x00
+REG_TIMING_BASE = 0x01
+REG_RF_SCALE = 0x15
 REG_LED_MODE_BASE = 0x16
 REG_LED_CURRENT_BASE = 0x1A
 REG_EXTERNAL_PWM = 0x26
 
 # CHIPCTR：关闭自主呼吸、使用内部时钟、退出软件关机、最大电流 24mA。
 CHIP_CONTROL_NORMAL = 0x10
+CHIP_CONTROL_AUTONOMOUS_MODE2 = CHIP_CONTROL_NORMAL | 0x80 | 0x01
 
 # LEDXMD_RGBn 中三个通道均设为 Always ON：001 001 01 = 0x25。
 ALL_CHANNELS_ON_MODE = 0x25
@@ -48,6 +51,16 @@ DEFAULT_CURRENT_CODE = 0x4F
 LED_MODE_SHIFTS = (0, 2, 5)
 LED_MODE_MASKS = (0x03, 0x1C, 0xE0)
 LED_MODE_ALWAYS_ON = 0x01
+# ET6312B 的每个 RGB 组共用一个呼吸周期。三路全部分配到
+# Thread1/Thread2 时，LEDXMD_RGBn 分别编码为 0x4A/0x6F。
+ALL_CHANNELS_THREAD1_MODE = 0x4A
+ALL_CHANNELS_THREAD2_MODE = 0x6F
+
+AUTONOMOUS_PERIOD_CODE = 0x87
+AUTONOMOUS_TON1 = 0x7F
+AUTONOMOUS_TON2 = 0x7F
+AUTONOMOUS_RAMP_RATE = 0x00
+AUTONOMOUS_RF_SCALE = 0x00
 
 # D1~D12 在 12 位输出掩码中的对应位；D1 使用最低位。
 ALL_LED_MASK = 0x0FFF
@@ -71,6 +84,7 @@ class ET6312B:
 
         # 保存四个 LEDXMD_RGBn 寄存器的状态，单灯操作时不会影响其他灯。
         self._mode_registers = bytearray(4)
+        self._autonomous_enabled = False
         self.initialize()
 
     def _set_mode_registers(self, values):
@@ -97,6 +111,40 @@ class ET6312B:
     def _write_register(self, register, value):
         """写入一个 8 位寄存器。"""
         return self._write_registers(register, bytearray((value,)))
+
+    def disable_autonomous(self):
+        """Stop ET6312B internal thread timing while preserving LED current."""
+        if self._autonomous_enabled:
+            self._write_register(REG_CHIP_CONTROL, CHIP_CONTROL_NORMAL)
+            self._autonomous_enabled = False
+        return True
+
+    def configure_autonomous(self, mode_registers):
+        """Configure Thread1/Thread2 timing once; the chip then runs alone."""
+        if len(mode_registers) != 4:
+            raise ValueError("自主模式必须提供 4 个 RGB 模式寄存器")
+
+        self._write_register(REG_CHIP_CONTROL, CHIP_CONTROL_NORMAL)
+        self._autonomous_enabled = False
+
+        # QuecPython 的 bytearray.extend() 要求传入 buffer 对象，不能直接
+        # 传入 tuple；预分配并逐项写入可兼容设备固件的实现。
+        timing = bytearray(20)
+        for group_index in range(4):
+            offset = group_index * 5
+            timing[offset] = AUTONOMOUS_PERIOD_CODE
+            timing[offset + 1] = AUTONOMOUS_TON1
+            timing[offset + 2] = AUTONOMOUS_TON2
+            timing[offset + 3] = AUTONOMOUS_RAMP_RATE
+            timing[offset + 4] = 0x00
+        self._write_registers(REG_TIMING_BASE, timing)
+        self._write_register(REG_RF_SCALE, AUTONOMOUS_RF_SCALE)
+        values = bytearray(mode_registers)
+        self._write_registers(REG_LED_MODE_BASE, values)
+        self._set_mode_registers(values)
+        self._write_register(REG_CHIP_CONTROL, CHIP_CONTROL_AUTONOMOUS_MODE2)
+        self._autonomous_enabled = True
+        return values
 
     def initialize(self):
         """初始化芯片，并确保上电后十二个通道均处于关闭状态。"""
@@ -129,6 +177,7 @@ class ET6312B:
             raise ValueError("LED 掩码必须是 0x000~0xFFF")
 
         # 每个 LEDXMD_RGBn 寄存器控制三个通道，组装后一次连续写入 0x16~0x19。
+        self.disable_autonomous()
         values = bytearray(4)
         for led_index in range(12):
             if mask & (1 << led_index):
@@ -153,6 +202,7 @@ class ET6312B:
         if state not in (True, False, 1, 0):
             raise ValueError("state 必须是 True/False 或 1/0")
 
+        self.disable_autonomous()
         led_index = number - 1
         group_index = led_index // 3
         channel_index = led_index % 3
@@ -200,7 +250,7 @@ def apply_mask(mask):
 
 
 class ShoulderLampController:
-    """肩灯业务控制器；普通闪烁由主循环 tick() 非阻塞驱动。
+    """肩灯业务控制器；普通闪烁由 ET6312B 芯片自主运行。
 
     传感器服务线程也会调用本类，因此模式、报警状态和每次 I2C 写入都
     使用同一把锁保护。跌倒报警优先于普通模式，只有选择 ``off`` 才会取消。
@@ -216,6 +266,23 @@ class ShoulderLampController:
     # D1~D6 为蓝灯，D7~D12 为红灯。
     ALTERNATE_MASKS = (0xFC0, 0x03F)
     DIAGONAL_MASKS = (0x1C7, 0xE38)
+
+    # RGB0..RGB3 map to D1..D3, D4..D6, D7..D9 and D10..D12.
+    # Thread1/Thread2 provide the two autonomous phases.
+    AUTONOMOUS_MODES = {
+        MODE_ALTERNATE: (
+            ALL_CHANNELS_THREAD2_MODE,
+            ALL_CHANNELS_THREAD2_MODE,
+            ALL_CHANNELS_THREAD1_MODE,
+            ALL_CHANNELS_THREAD1_MODE,
+        ),
+        MODE_DIAGONAL: (
+            ALL_CHANNELS_THREAD1_MODE,
+            ALL_CHANNELS_THREAD2_MODE,
+            ALL_CHANNELS_THREAD1_MODE,
+            ALL_CHANNELS_THREAD2_MODE,
+        ),
+    }
 
     def __init__(self, driver=None, interval_ms=500):
         self.driver = driver if driver is not None else _get_default_driver()
@@ -264,6 +331,16 @@ class ShoulderLampController:
         # 报警使用全亮/全灭两种完整掩码，避免逐通道产生中间状态。
         self.driver.apply_mask(ALL_LED_MASK if self._fall_alarm_phase else 0)
 
+    def _configure_autonomous_mode(self, mode):
+        """Configure one normal mode; ET6312B handles subsequent blinking."""
+        values = self.AUTONOMOUS_MODES.get(mode)
+        if values is None:
+            raise ValueError("自主模式不支持：{}".format(mode))
+        configure = getattr(self.driver, "configure_autonomous", None)
+        if configure is None:
+            raise RuntimeError("ET6312B 驱动不支持自主肩灯模式")
+        configure(values)
+
     def set_flash_interval(self, interval_ms):
         """设置普通模式闪烁半周期，单位毫秒。"""
         try:
@@ -275,9 +352,9 @@ class ShoulderLampController:
         self._lock.acquire()
         try:
             self.flash_interval_ms = interval_ms
-            if self.mode != self.MODE_OFF and not self._fall_alarm_active:
-                self._next_toggle_ms = self._ticks_add(
-                    self._now_ms(), self.flash_interval_ms)
+            # Normal flashing is generated by ET6312B. Keep this API for
+            # compatibility, but do not create a software timer or poll I2C.
+            self._next_toggle_ms = None
         finally:
             self._lock.release()
         return interval_ms
@@ -307,9 +384,8 @@ class ShoulderLampController:
                 self._next_toggle_ms = None
                 return was_changed
 
-            self._apply_phase()
-            self._next_toggle_ms = self._ticks_add(
-                self._now_ms(), self.flash_interval_ms)
+            self._configure_autonomous_mode(mode)
+            self._next_toggle_ms = None
             return was_changed
         finally:
             self._lock.release()
@@ -353,9 +429,8 @@ class ShoulderLampController:
                 self._next_toggle_ms = None
                 self.driver.apply_mask(0)
             else:
-                self._apply_phase()
-                self._next_toggle_ms = self._ticks_add(
-                    self._now_ms(), self.flash_interval_ms)
+                self._configure_autonomous_mode(self.mode)
+                self._next_toggle_ms = None
             return True
         finally:
             self._lock.release()
@@ -399,16 +474,9 @@ class ShoulderLampController:
                     now_ms, self.FALL_ALARM_INTERVAL_MS)
                 return True
 
-            if self.mode == self.MODE_OFF or self._next_toggle_ms is None:
-                return False
-            if self._ticks_diff(now_ms, self._next_toggle_ms) < 0:
-                return False
-            self.phase = 1 - self.phase
-            self._apply_phase()
-            # 使用当前时间重算，避免主循环偶发延迟时连续补写多次 I2C。
-            self._next_toggle_ms = self._ticks_add(
-                now_ms, self.flash_interval_ms)
-            return True
+            # Normal modes run entirely inside ET6312B. Keep tick() for API
+            # compatibility and UI synchronization, but never poll/write I2C.
+            return False
         finally:
             self._lock.release()
 
