@@ -64,6 +64,7 @@ RTP_RX_UI_READY_TIMEOUT_MS = 450
 # 远端占麦后主动建立蜂窝UDP映射；收到首个有效语音包即停止后续重试。
 RTP_RX_PROBE_DELAYS_MS = (0, 100, 300)
 RTP_RX_FIRST_PACKET_WARN_MS = 500
+RTP_FLOOR_PROBE_QUEUE_MAX = 16
 DEFAULT_JITTER_PACKETS = 5
 DEFAULT_LOCAL_RTP_PORT = 4001
 DEFAULT_SSRC = 0x13572468
@@ -196,6 +197,9 @@ class RTPAudioController:
         self._rx_probe_group_id = None
         self._rx_probe_attempt = 0
         self._rx_probe_next_ms = None
+        # 未被选作当前播放源的0x0B也必须发UDP首包。单独排队并保存
+        # 目标端口，避免覆盖当前通话的server_port和接收状态。
+        self._floor_probe_queue = []
         self._rx_no_packet_warned = False
         self._stats_started_ms = _ticks_ms()
         self._stats = self._new_stats()
@@ -504,6 +508,31 @@ class RTPAudioController:
         self._rx_probe_next_ms = _ticks_add(
             self._rx_announced_ms, RTP_RX_PROBE_DELAYS_MS[attempt])
 
+    def _process_floor_occupied_probes(self, now_ms):
+        """发送不切换音频源的0x0B首包；每条通知独立重试。"""
+        if self.socket is None:
+            return
+        count = len(self._floor_probe_queue)
+        for _index in range(count):
+            try:
+                item = self._floor_probe_queue.pop(0)
+            except Exception:
+                return
+            if _ticks_diff(now_ms, item[4]) < 0:
+                self._floor_probe_queue.append(item)
+                continue
+            attempt = item[3]
+            total = len(RTP_RX_PROBE_DELAYS_MS)
+            self._send_probe_to_port(
+                item[1], "接收首包{}/{} group_id={}".format(
+                    attempt + 1, total, item[0]))
+            attempt += 1
+            if attempt < total:
+                item[3] = attempt
+                item[4] = _ticks_add(
+                    item[2], RTP_RX_PROBE_DELAYS_MS[attempt])
+                self._floor_probe_queue.append(item)
+
     def _check_receive_start_timeout(self, now_ms):
         if (self._rx_group_id is None or self._last_rx_ms is not None or
                 self._rx_announced_ms is None or
@@ -575,6 +604,8 @@ class RTPAudioController:
 
     def on_floor_released(self, group_id=None):
         self._stop_tx()
+        if group_id is None:
+            self._floor_probe_queue = []
         if group_id is None or self._rx_group_id == int(group_id):
             self._report_stats(force=True)
             self._rx_group_id = None
@@ -605,6 +636,29 @@ class RTPAudioController:
         print("[RTP] 远端讲话准备接收：group_id={}，本地端口={}，目标={}:{}".format(
             self._rx_group_id, self.local_port,
             self.server_ip, self.server_port))
+
+    def on_floor_occupied_probe(self, group_id, udp_port):
+        """排队发送0x0B首包，不改变当前音频收发或播放状态。"""
+        try:
+            group_id = int(group_id) & 0xFFFFFFFF
+            udp_port = int(udp_port)
+        except Exception as error:
+            print("[RTP] 0x0B首包参数无效：{}".format(error))
+            return False
+        if udp_port <= 0 or udp_port > 65535:
+            print("[RTP] 0x0B首包端口无效：group_id={}，udp_port={}".format(
+                group_id, udp_port))
+            return False
+        now_ms = _ticks_ms()
+        if len(self._floor_probe_queue) >= RTP_FLOOR_PROBE_QUEUE_MAX:
+            dropped = self._floor_probe_queue.pop(0)
+            print("[RTP] 0x0B首包队列已满，丢弃最旧任务：group_id={}".format(
+                dropped[0]))
+        self._floor_probe_queue.append(
+            [group_id, udp_port, now_ms, 0, now_ms])
+        print("[RTP] 已安排0x0B UDP首包：group_id={}，目标={}:{}".format(
+            group_id, self.server_ip, udp_port))
+        return True
 
     def on_floor_idle(self, group_id):
         if self._rx_group_id == int(group_id):
@@ -645,23 +699,30 @@ class RTPAudioController:
         print("[RTP] 开始发送语音：group_id={}".format(self._tx_group_id))
         return True
 
-    def _send_probe(self, reason="心跳"):
-        """发送 12 字节 RTP 头加 1 字节 0x00 的 UDP 探测包。"""
-        if self.socket is None or self.server_port is None:
+    def _send_probe_to_port(self, target_port, reason="心跳",
+                            track_heartbeat=False):
+        """向指定端口发送RTP头加0x00，不改变当前音频目标端口。"""
+        if self.socket is None or target_port is None:
             return False
-        # 记录发送尝试时间，失败时也避免主循环每1ms重复发送普通心跳。
-        self._last_probe_ms = _ticks_ms()
+        if track_heartbeat:
+            # 失败时也记录尝试时间，避免主循环每1ms重复发送普通心跳。
+            self._last_probe_ms = _ticks_ms()
         packet = build_rtp_packet(
             self._sequence, self._timestamp, self.ssrc, b"\x00")
         try:
-            self.socket.sendto(packet, (self.server_ip, self.server_port))
+            self.socket.sendto(packet, (self.server_ip, int(target_port)))
             self._sequence = (self._sequence + 1) & 0xFFFF
             print("[RTP] 已发送UDP{}：{}:{}".format(
-                reason, self.server_ip, self.server_port))
+                reason, self.server_ip, target_port))
             return True
         except Exception as error:
             print("[RTP] UDP{}发送失败：{}".format(reason, error))
             return False
+
+    def _send_probe(self, reason="心跳"):
+        """向当前音频端口发送12字节RTP头加1字节0x00探测包。"""
+        return self._send_probe_to_port(
+            self.server_port, reason, track_heartbeat=True)
 
     def _send_audio_packet(self, payload):
         if len(payload) != RTP_PAYLOAD_SIZE:
@@ -1014,6 +1075,7 @@ class RTPAudioController:
                 self._receive_available(1)
             now = _ticks_ms()
             self._process_receive_probe(now)
+            self._process_floor_occupied_probes(now)
             self._check_receive_start_timeout(now)
             if self._start_tx_pending and self._ptt_pressed:
                 ui_ready, ui_timed_out = self._ui_gate_state(

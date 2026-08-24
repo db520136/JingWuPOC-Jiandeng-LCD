@@ -2401,8 +2401,10 @@ class POCClient:
             "remote_occupied", group_id, notice["police_name"])
         if group_id == self.confirmed_group_id:
             self._preempt_single_floor()
+        audio_selected = False
         if group_id in (self.confirmed_group_id, self.single_call_group_id):
             current_is_group = (
+                self.confirmed_group_id is not None and
                 self.active_audio_group_id == self.confirmed_group_id)
             incoming_is_group = (group_id == self.confirmed_group_id)
             # 组呼正在播放时忽略单呼音频；组呼到来则立即抢占单呼播放。
@@ -2411,6 +2413,12 @@ class POCClient:
                 self.floor_udp_port = notice["udp_port"]
                 self._audio_notify("on_floor_occupied", group_id,
                                    notice["udp_port"], event_revision)
+                audio_selected = True
+        if not audio_selected:
+            # 即使该通知不属于当前选中的音频组，也必须向通知携带的
+            # UDP端口发送首包；只做打洞，不改变现有收发和播放状态。
+            self._audio_notify("on_floor_occupied_probe", group_id,
+                               notice["udp_port"])
         self._send_server_ack(
             MSG_FLOOR_OCCUPIED_ACK, frame["request_cnt"],
             build_device_payload(self.device_id))
