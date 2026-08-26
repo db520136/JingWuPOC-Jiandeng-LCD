@@ -13,7 +13,7 @@ import uos
 import checkNet
 from machine import WDT,Timer
 FIRMWARE_VER = modem.getDevFwVersion()  #获取到固件版本
-SOFTWARE_VER = "1.0.13"                  #软件版本
+SOFTWARE_VER = "1.0.15"                  #软件版本
 HARDWARE_VER = "1.0.0"                  #硬件版本
 # POC服务器参数集中放在启动入口，后续更换测试服务器无需修改业务模块。
 DEVICE_ID = "33030002002000000592"
@@ -23,7 +23,7 @@ POC_TCP_HOST = "125.124.233.231"
 POC_TCP_PORT = 6060
 POC_RTP_LOCAL_PORT = DEFAULT_LOCAL_RTP_PORT
 # GNSS定位信息上传周期，单位毫秒；后续可由设置页替换该参数。
-POC_GNSS_UPLOAD_INTERVAL_MS = 60000
+POC_GNSS_UPLOAD_INTERVAL_MS = 1000#60000
 # TCP请求重发参数：首次发送后最多重发3次，等待1秒起步、每次增加500ms。
 POC_TCP_MAX_RETRIES = 3
 POC_TCP_RETRY_INITIAL_TIMEOUT_MS = 1000
@@ -67,7 +67,8 @@ if __name__ == "__main__":
     mount_external_flash()
     print("开机原因1：",Power.powerOnReason())
     print("关机原因：",Power.powerDownReason())
-
+    
+    
     wdt = WDT(20)  # 启动看门狗，设置超时时间
     timer1 = Timer(Timer.Timer1)
     timer1.start(period=15000, mode=timer1.PERIODIC, callback=feed)  # 使用定时器喂狗
@@ -123,6 +124,6 @@ if __name__ == "__main__":
     if not hardware_key_service.start():
         print("[按键] 物理按键服务未能启动")
     ui.run()
-
+    
 
 

@@ -45,6 +45,8 @@ except Exception:
 RTP_HEADER_SIZE = 12
 RTP_PAYLOAD_TYPE_PCMA = 8
 RTP_PAYLOAD_SIZE = 160
+# 8 kHz G.711 A-law: 160 bytes is one 20 ms key acknowledgement tone.
+KEY_BEEP_G711_DATA = bytes((0xD5, 0xD5, 0x2A, 0x2A)) * 40
 RTP_PACKET_INTERVAL_MS = 20
 RTP_PROBE_INTERVAL_MS = 30000
 RTP_STATS_INTERVAL_MS = 5000
@@ -205,6 +207,7 @@ class RTPAudioController:
         self._stats = self._new_stats()
         self.volume = 11
         self.volume_revision = 0
+        self._key_beep_pending = False
         self.on_request_floor = None
         self.on_release_floor = None
 
@@ -565,6 +568,36 @@ class RTPAudioController:
 
     def change_volume(self, delta):
         return self.set_volume(self.volume + int(delta))
+
+    def request_key_beep(self):
+        """Request one short key tone without interrupting PTT/RTP audio."""
+        if (not self._running or self.g711 is None or
+                self.is_audio_priority_active()):
+            return False
+        self._key_beep_pending = True
+        return True
+
+    def _play_pending_key_beep(self):
+        if not self._key_beep_pending or self.is_audio_priority_active():
+            self._key_beep_pending = False
+            return
+        self._key_beep_pending = False
+        try:
+            #print("[按键] 播放提示音")
+            self._set_speaker(True)
+            # A single 20 ms frame may not fill the PCM playback buffer.
+            # Feed at least the configured number of periods, one frame at a
+            # time, then allow the final buffered frame to drain.
+            frame_count = max(8, self.pcm_periodcnt)
+            for _ in range(frame_count):
+                self.g711.write(KEY_BEEP_G711_DATA, 0)
+                #utime.sleep_ms(RTP_PACKET_INTERVAL_MS)
+            utime.sleep_ms(RTP_PACKET_INTERVAL_MS*8 + 10)
+        except Exception as error:
+            print("[按键] 提示音播放失败：{}".format(error))
+        finally:
+            if not self.is_audio_priority_active():
+                self._set_speaker(False)
 
     def get_volume_snapshot(self):
         return {"value": self.volume, "revision": self.volume_revision}
@@ -1098,6 +1131,7 @@ class RTPAudioController:
             elif self._tx_active:
                 self._stop_tx()
             self._process_playout(now)
+            self._play_pending_key_beep()
             if (not self._start_tx_pending and
                     self.server_port is not None and
                     (self._last_probe_ms is None or
@@ -1183,6 +1217,7 @@ class HardwareKeyService:
         if self.on_activity is not None:
             self.on_activity()
         print("[音量键] 当前音量={}".format(value))
+        self.controller.request_key_beep()
 
     def _worker(self):
         while self._running:

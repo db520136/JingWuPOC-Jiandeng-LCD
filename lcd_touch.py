@@ -455,6 +455,10 @@ class JingWuUI:
         self._single_none_key = "__none__"
         self._single_group_id = None
         self._pending_person = None
+        self._selection_confirming = False
+        self._selection_pending = None
+        self._selection_popup = None
+        self._selection_popup_visible = False
         self._single_state_seen = None
         self._single_revision_seen = None
         # 版本信息由启动入口传入，避免 lcd_touch 反向导入 main 形成循环依赖。
@@ -535,6 +539,15 @@ class JingWuUI:
         self._login_message_until_ms = None
         self._force_login_prompt = False
         self._login_home_loaded = False
+        self._location_labels = {}
+        self.double_click_enabled = True
+        self._double_click_rows = {}
+        self._location_last_success = None
+        self._location_last_gga = b""
+        self._location_time_base = None
+        self._location_ticks_base = None
+        self._location_last_refresh_ms = None
+        self._pending_root_swipe = None
         self._pending_back = False
         self._touch_sequence_swipe = False
         self._pointer_point = None
@@ -1940,7 +1953,7 @@ class JingWuUI:
             elif state == "success" and not self._login_home_loaded:
                 self._hide_login_message()
                 self._login_home_loaded = True
-                self.show_home()
+                self.show_location()
 
             if (state == "success" and
                     snapshot.get("http_state") in ("success", "failed")):
@@ -2171,7 +2184,9 @@ class JingWuUI:
     def _is_root_page(self):
         """首页和登录页都没有上一级，禁止右滑返回。"""
         return (self.current is None or
-                self.current[0] in ("home", "login"))
+                self.current[0] in ("home", "login", "location",
+                                    "root_shoulder", "root_intercom",
+                                    "root_settings"))
 
     def _can_drag_back(self):
         """仅允许有上一级页面的非首页执行右滑返回。"""
@@ -2512,6 +2527,12 @@ class JingWuUI:
             except Exception:
                 code = event
 
+            # 设置确认框显示期间，业务页面保持模态，不响应滑动或点击。
+            if self._selection_popup_visible:
+                press_state[0] = None
+                press_state[1] = True
+                return
+
             if self._consume_touch_event(code):
                 press_state[0] = None
                 press_state[1] = True
@@ -2636,6 +2657,10 @@ class JingWuUI:
         except Exception:
             pass
         gesture = LANDSCAPE_GESTURE_MAP.get(raw_gesture, raw_gesture)
+        if self._selection_popup_visible:
+            # 确认框期间屏蔽硬件滑动手势，按钮点击仍由按钮事件处理。
+            self._touch_sequence_swipe = True
+            return
         names = {
             0: "右滑",
             1: "左滑",
@@ -2674,6 +2699,19 @@ class JingWuUI:
                     self._touch_point_warning_reported = True
                 self._pending_back = True
 
+        # 一级页面左右滑动切换；定位页右滑、设置页左滑保持原页面。
+        if self.current and self._is_root_page() and gesture in (0, 1):
+            next_key = {
+                ("location", 1): "root_shoulder",
+                ("root_shoulder", 0): "location",
+                ("root_shoulder", 1): "root_intercom",
+                ("root_intercom", 0): "root_shoulder",
+                ("root_intercom", 1): "root_settings",
+                ("root_settings", 0): "root_intercom",
+            }.get((self.current[0], gesture))
+            if next_key:
+                self._pending_root_swipe = next_key
+
     def _process_pending_back(self):
         """在主循环中执行右滑返回，避免在触摸回调内直接切屏。"""
         if self._pending_back:
@@ -2692,6 +2730,15 @@ class JingWuUI:
                   not self._back_animating and self.current and
                   not self._is_root_page()):
                 self._start_programmatic_back()
+        if self._pending_root_swipe:
+            key = self._pending_root_swipe
+            self._pending_root_swipe = None
+            callback = {"location": self.show_location,
+                        "root_shoulder": self.show_shoulder_root,
+                        "root_intercom": self.show_intercom_root,
+                        "root_settings": self.show_settings_root}.get(key)
+            if callback:
+                callback()
 
     def _set_page_visible(self, page, visible):
         """切换页面容器可见状态，兼容 LVGL MicroPython 的对象标志接口。"""
@@ -3122,6 +3169,67 @@ class JingWuUI:
             radio.add_state(lv.STATE.CHECKED)
         else:
             radio.clear_state(lv.STATE.CHECKED)
+
+    def _confirm_selection(self, callback):
+        """显示统一设置确认框；确认后执行原选择逻辑。"""
+        if self._selection_popup is None:
+            popup = lv.obj(self._root_screen)
+            popup.set_size(270, 150)
+            popup.set_pos((LCD_WIDTH - 270) // 2, (LCD_HEIGHT - 150) // 2)
+            _set_bg(popup, LOGIN_SELECTED_BG)
+            try:
+                popup.clear_flag(lv.obj.FLAG.SCROLLABLE)
+                popup.set_scroll_dir(lv.DIR.NONE)
+                popup.set_scrollbar_mode(lv.SCROLLBAR_MODE.OFF)
+            except Exception:
+                pass
+            title = lv.label(popup); title.set_size(270, 35); title.set_pos(0, 10)
+            title.set_text("确认修改?")
+            title.add_style(self._get_style(FONT_MAIN, WHITE), lv.PART.MAIN)
+            def button(x, text, color, cb):
+                btn = lv.btn(popup); btn.set_size(105, 45); btn.set_pos(x, 90); _set_bg(btn, color)
+                label = lv.label(btn); label.set_size(105, 45); label.set_pos(0, 0); label.set_text(text)
+                label.add_style(self._get_style(FONT_MAIN, WHITE), lv.PART.MAIN)
+                # 直接监听按钮 CLICKED，避免弹框首次创建页面与后续业务页面不同
+                # 时被统一坐标分发器按页面过滤掉。
+                def clicked(event=None):
+                    cb()
+                self._event_callbacks.append(clicked)
+                try:
+                    btn.add_event_cb(clicked, lv.EVENT.CLICKED, None)
+                except Exception:
+                    btn.set_event_cb(lambda target, event: cb(), lv.EVENT.CLICKED, None)
+            button(5, "取消", RED, self._cancel_selection)
+            button(150, "确认", LOGIN_CONFIRM_BG, self._accept_selection)
+            popup.add_flag(lv.obj.FLAG.HIDDEN)
+            self._selection_popup = popup
+        self._selection_pending = callback
+        self._selection_popup_visible = True
+        self._selection_popup.clear_flag(lv.obj.FLAG.HIDDEN)
+        self._selection_popup.move_foreground()
+
+    def _cancel_selection(self):
+        self._selection_pending = None
+        if self._selection_popup is not None:
+            self._selection_popup.add_flag(lv.obj.FLAG.HIDDEN)
+        self._selection_popup_visible = False
+        self._sync_intercom_selection_ui()
+        self._sync_shoulder_mode_ui()
+        for key, radio in self._sleep_rows.items():
+            self._set_radio_row_selected(radio, key == self.sleep_timeout_seconds)
+        for key, radio in self._fall_rows.items():
+            self._set_radio_row_selected(radio, key == self.fall_detection_enabled)
+
+    def _accept_selection(self):
+        callback = self._selection_pending
+        self._selection_pending = None
+        if self._selection_popup is not None:
+            self._selection_popup.add_flag(lv.obj.FLAG.HIDDEN)
+        self._selection_popup_visible = False
+        if callback:
+            self._selection_confirming = True
+            try: callback()
+            finally: self._selection_confirming = False
 
     def _set_mode_row_selected(self, parts, selected):
         """兼容旧调用名称，实际使用通用单选行状态更新。"""
@@ -3753,18 +3861,114 @@ class JingWuUI:
         self._switch_page("login", page, False)
 
     def show_home(self):
-        """一级页面：首页，三个入口在横屏内纵向排列。"""
-        page, created = self._screen("home", "")
+        """兼容旧入口：首页现在即定位一级页面。"""
+        self.show_location()
+
+    def show_location(self):
+        """定位一级页面；GNSS失败时保留最近一次有效数据。"""
+        page, created = self._screen("location", "")
         if created:
-            # 页面从状态栏下方 y=30 开始；首行紧贴内容区顶部，三行等距排列。
-            self._icon_row(page, 0, "U:/intercom.png", "对讲机", lambda obj: self.show_intercom())
-            self._icon_row(page, 64, "U:/shoulder_lamp.png", "肩灯", lambda obj: self.show_shoulder())
-            self._icon_row(page, 128, "U:/settings.png", "设置", lambda obj: self.show_settings())
+            image = lv.img(page)
+            image.set_size(92, 92); image.set_pos(192, 48); _fix_position(image)
+            try: image.set_src("U:/location_icon_92.png")
+            except Exception: pass
+            specs = (("address", 8, 0, 286, FONT_MAIN),
+                     ("longitude", 8, 34, 180, FONT_SMALL),
+                     ("latitude", 8, 68, 180, FONT_SMALL),
+                     ("altitude", 8, 102, 180, FONT_SMALL),
+                     ("satellites", 8, 136, 180, FONT_SMALL),
+                     ("time", 200, 140, 118, FONT_SMALL))
+            for key, x, y, width, font in specs:
+                label = lv.label(page); label.set_size(width, font[1] + 12); label.set_pos(x, y)
+                label.add_style(self._get_style(font, WHITE, lv.TEXT_ALIGN.LEFT), lv.PART.MAIN)
+                self._location_labels[key] = label
+            self._location_labels["address"].set_text("定位中...")
+            self._location_labels["longitude"].set_text("经度：...")
+            self._location_labels["latitude"].set_text("纬度：...")
+            self._location_labels["altitude"].set_text("海拔高度：...")
+            self._location_labels["satellites"].set_text("卫星数量：...")
+            self._location_labels["time"].set_text("时间：--:--:--")
+            weekday = lv.label(page)
+            weekday.set_size(118, FONT_SMALL[1])
+            weekday.set_pos(178, 164)
+            weekday.add_style(self._get_style(FONT_SMALL, WHITE, lv.TEXT_ALIGN.CENTER), lv.PART.MAIN)
+            weekday.set_text("星期一")
+            self._location_labels["weekday"] = weekday
         for widget in (self._network_icon, self._battery_label):
             if widget is not None:
                 widget.clear_flag(lv.obj.FLAG.HIDDEN)
         self.stack = []
-        self._switch_page("home", page, False)
+        self._switch_page("location", page, False)
+        self._location_resync_clock()
+        self._refresh_location_page()
+
+    def _location_resync_clock(self):
+        try:
+            self._location_time_base = utime.localtime()
+            self._location_ticks_base = utime.ticks_ms()
+        except Exception:
+            self._location_time_base = None
+            self._location_ticks_base = None
+
+    def _show_root_icon_page(self, key, icon_path, title, callback):
+        page, created = self._screen(key, "")
+        if created:
+            image = lv.img(page)
+            image.set_size(92, 92); image.set_pos(102, 34); _fix_position(image)
+            try: image.set_src(icon_path)
+            except Exception: pass
+            label = lv.label(page); label.set_size(LCD_WIDTH, FONT_MAIN[1] + 12); label.set_pos(0, 140)
+            label.set_text(title)
+            label.add_style(self._get_style(FONT_MAIN, WHITE), lv.PART.MAIN)
+            self._bind_click(page, image, lambda obj: callback())
+            self._bind_click(page, label, lambda obj: callback())
+        self.stack = []
+        self._switch_page(key, page, False)
+
+    def show_shoulder_root(self):
+        self._show_root_icon_page("root_shoulder", "U:/shoulder_lamp.png", "肩灯", self.show_shoulder_menu)
+
+    def show_intercom_root(self):
+        self._show_root_icon_page("root_intercom", "U:/intercom.png", "对讲机", self.show_intercom)
+
+    def show_settings_root(self):
+        self._show_root_icon_page("root_settings", "U:/settings.png", "设置", self.show_settings)
+
+    def _refresh_location_page(self):
+        labels = self._location_labels
+        if not labels or self.current is None or self.current[0] != "location":
+            return
+        service = getattr(self._poc_client, "gnss_service", None) if self._poc_client else None
+        gga = getattr(service, "last_gga", b"") if service else b""
+        if getattr(service, "last_success", False) and gga and gga != self._location_last_gga:
+            fields = str(gga.decode("ascii") if isinstance(gga, bytes) else gga).split(",")
+            if len(fields) >= 10:
+                def coord(raw, hemi):
+                    try:
+                        degree = int(float(raw) // 100); minute = float(raw) - degree * 100
+                        value = degree + minute / 60.0
+                        return ("-" if hemi in ("S", "W") else "") + "{:.4f}".format(value)
+                    except Exception: return "--"
+                self._location_last_success = (coord(fields[4], fields[5]), coord(fields[2], fields[3]), fields[9] or "--", fields[7] or "--")
+                self._location_last_gga = gga
+        if self._location_last_success:
+            lon, lat, alt, sats = self._location_last_success
+            labels["address"].set_text("定位成功")
+            labels["longitude"].set_text("经度：" + lon)
+            labels["latitude"].set_text("纬度：" + lat)
+            labels["altitude"].set_text("海拔高度：" + alt)
+            labels["satellites"].set_text("卫星数量：" + sats)
+        else:
+            labels["address"].set_text("                定位中...")
+        if self._location_time_base and self._location_ticks_base:
+            try:
+                elapsed = utime.ticks_diff(utime.ticks_ms(), self._location_ticks_base) // 1000
+                t = self._location_time_base
+                total = (t[3] * 3600 + t[4] * 60 + t[5] + elapsed) % 86400
+                weekdays = ("星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日")
+                labels["time"].set_text("{:02d}:{:02d}:{:02d}".format(total // 3600, (total % 3600) // 60, total % 60))
+                labels["weekday"].set_text(weekdays[int(t[6]) % 7])
+            except Exception: pass
 
     def show_intercom(self):
         """二级页面：按设置页风格进入组呼或单呼对象列表。"""
@@ -3938,6 +4142,9 @@ class JingWuUI:
 
     def select_group(self, group):
         """请求切换组呼；UI先显示待选组，最终以TCP 0x83应答为准。"""
+        if not self._selection_confirming and group != self.selected_group:
+            self._confirm_selection(lambda: self.select_group(group))
+            return
         valid = [str(item.get("raw_id", ""))
                  for item in self._intercom_groups]
         if group == "__none_group__":
@@ -3992,6 +4199,9 @@ class JingWuUI:
 
     def select_single(self, person):
         """选择或解散单呼；切换人员由客户端先解散旧组再邀请新人。"""
+        if not self._selection_confirming and person != (self.selected_person or self._single_none_key):
+            self._confirm_selection(lambda: self.select_single(person))
+            return
         valid = [self._person_key(item) for item in self._intercom_people]
         if person != self._single_none_key and person not in valid:
             return
@@ -4086,6 +4296,9 @@ class JingWuUI:
 
     def select_shoulder_mode(self, mode):
         """切换肩灯工作模式；重复点击当前模式时直接过滤。"""
+        if not self._selection_confirming and mode != self.shoulder_mode:
+            self._confirm_selection(lambda: self.select_shoulder_mode(mode))
+            return
         if mode not in ("off", "alternate", "diagonal"):
             return
         if self._shoulder_controller is not None:
@@ -4107,6 +4320,46 @@ class JingWuUI:
         value = self._shoulder_controller.set_flash_interval(interval_ms)
         self._shoulder_error_reported = False
         return value
+
+    def show_shoulder_menu(self):
+        page, created = self._screen("shoulder_menu", "")
+        if created:
+            self._settings_row(page, page, 6, "U:/shoulder_mode.png", "肩灯模式", lambda obj: self.show_shoulder_mode())
+            self._settings_row(page, page, 72, "U:/double_click_mode.png", "双击模式", lambda obj: self.show_double_click_mode())
+        self._load("shoulder_menu", page)
+
+    def show_shoulder_mode(self):
+        self.show_shoulder()
+
+    def show_double_click_mode(self):
+        page, created = self._screen("double_click", "")
+        if created:
+            self._radio_row(page, 6, "开启", True, self.double_click_enabled,
+                            self.select_double_click, self._double_click_rows, owner_page=page)
+            self._radio_row(page, 72, "关闭", False, not self.double_click_enabled,
+                            self.select_double_click, self._double_click_rows, owner_page=page)
+        else:
+            for key, radio in self._double_click_rows.items():
+                self._set_radio_row_selected(radio, key == self.double_click_enabled)
+        self._load("double_click", page)
+
+    def select_double_click(self, enabled):
+        enabled = bool(enabled)
+        if not self._selection_confirming and enabled != self.double_click_enabled:
+            self._confirm_selection(lambda: self.select_double_click(enabled))
+            return
+        self.double_click_enabled = enabled
+        for key, radio in self._double_click_rows.items():
+            self._set_radio_row_selected(radio, key == enabled)
+        service = getattr(self, "_motion_service", None)
+        method = (getattr(service, "set_double_click_enabled", None)
+                  if service is not None else None)
+        if method is not None:
+            try:
+                method(enabled)
+            except Exception as error:
+                print("[双击] 设置失败：{}".format(error))
+        self.notify_activity()
 
     def show_shoulder(self):
         """二级页面：肩灯三种工作模式。"""
@@ -4721,6 +4974,9 @@ class JingWuUI:
 
     def select_sleep_timeout(self, seconds):
         """切换息屏时间；重复选择当前值时不做状态切换。"""
+        if not self._selection_confirming and seconds != self.sleep_timeout_seconds:
+            self._confirm_selection(lambda: self.select_sleep_timeout(seconds))
+            return
         valid = False
         for _text, value in SLEEP_OPTIONS:
             if seconds == value:
@@ -4761,6 +5017,9 @@ class JingWuUI:
         self._load("sleep", page)
 
     def select_fall_detection(self, enabled):
+        if not self._selection_confirming and bool(enabled) != self.fall_detection_enabled:
+            self._confirm_selection(lambda: self.select_fall_detection(enabled))
+            return
         enabled = bool(enabled)
         self.fall_detection_enabled = enabled
         for key, radio in self._fall_rows.items():
@@ -5057,6 +5316,11 @@ class JingWuUI:
             self._process_network_monitor()
             self._process_audio_volume()
             self._process_login_message()
+            if (self.current is not None and self.current[0] == "location" and
+                    (self._location_last_refresh_ms is None or
+                     utime.ticks_diff(now, self._location_last_refresh_ms) >= 1000)):
+                self._location_last_refresh_ms = now
+                self._refresh_location_page()
             self._process_pending_back()
             self._process_pending_gc()
             self._process_auto_sleep()

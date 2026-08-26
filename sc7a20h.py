@@ -352,6 +352,7 @@ GPIO25（物理 Pin17）接 INT1，GPIO26（物理 Pin18）接 INT2。中断回�
         self._irq_objects = []
         self._sensor_error_reported = False
         self._last_double_click_ms = None
+        self.double_click_enabled = True
         self._freefall_started_ms = None
         self._fast_fall_until_ms = None
         self._hardware_impact = False
@@ -464,6 +465,12 @@ GPIO25（物理 Pin17）接 INT1，GPIO26（物理 Pin18）接 INT2。中断回�
         if not self.fall_detection_enabled:
             self._reset_fall_state()
 
+    def set_double_click_enabled(self, enabled):
+        """Enable or suppress existing hardware double-click handling."""
+        self.double_click_enabled = bool(enabled)
+        if not self.double_click_enabled:
+            self._last_double_click_ms = None
+
     def stop(self):
         """停止线程并禁用已注册的 GPIO 中断。"""
         self._running = False
@@ -485,7 +492,7 @@ GPIO25（物理 Pin17）接 INT1，GPIO26（物理 Pin18）接 INT2。中断回�
         try:
             if int1 or poll_all:
                 click_source = self.sensor.read_click_source()
-                if (click_source & 0x0F) == 2:
+                if self.double_click_enabled and (click_source & 0x0F) == 2:
                     if (self._last_double_click_ms is None or
                             self._ticks_diff(now_ms, self._last_double_click_ms) >=
                             self.DOUBLE_CLICK_GUARD_MS):
