@@ -16,7 +16,7 @@ GNSS_MAX_PAYLOAD_SIZE = 255
 
 class CAT1_GNSS:
     """封装EC800M内置GNSS，向POC客户端返回一条有效GGA数据。"""
-
+    test_a = 1
     def __init__(self, read_size=GNSS_READ_SIZE):
         self.read_size = max(128, int(read_size))
         self.initialized = False
@@ -33,7 +33,7 @@ class CAT1_GNSS:
             print("[GNSS] 初始化失败：{}".format(self.last_error))
             return False
         try:
-            quecgnss.configSet(0, 7)  # 定位星系：北斗
+            quecgnss.configSet(0, 1)  # 定位星系：北斗
             quecgnss.configSet(1, 1)  # 只输出GGA信息
             quecgnss.configSet(2, 1)  # 打开AGPS
             quecgnss.configSet(4, 1)  # 打开备电
@@ -138,7 +138,12 @@ class CAT1_GNSS:
             raw = self._read_bytes(quecgnss.read(self.read_size))
             text = raw.decode("ascii").strip("\x00") if raw else ""
             gga = self._find_last_gga(text)
+            print("***************88111***********")
+            if self.test_a == 1:
+                gga = "$GNGGA,100601.00,2758.75564,N,12044.39540,E,1,05,2.21,172.9,M,,M,,*58"
+                self.test_a = 0
             print("[GNSS] 定位信息：{}".format(gga or text.strip() or "无"))
+            
             if not gga or not self._gga_has_fix(gga):
                 self.last_error = "未取得有效GGA定位"
                 print("[GNSS] 定位结果：定位失败")

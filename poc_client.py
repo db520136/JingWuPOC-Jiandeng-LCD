@@ -1,7 +1,12 @@
 # -*- coding: utf-8 -*-
 """POC 登录、TCP控制连接和HTTP名单查询后台客户端。"""
 
+import math
 import utime
+try:
+    import uos
+except Exception:
+    import os as uos
 try:
     import ubinascii
 except Exception:
@@ -173,6 +178,7 @@ class POCClient:
     def __init__(self, device_id="33030002002000000590",
                  tcp_host="125.124.233.231", tcp_port=6060,
                  http_url=None, network_monitor=None,
+                 location_map_url=None, location_address_url=None,
                  audio_controller=None, gnss_service=None,
                  gnss_upload_interval_ms=60000, tcp_max_retries=3,
                  tcp_retry_initial_timeout_ms=1000,
@@ -184,6 +190,8 @@ class POCClient:
         self.http_url = (http_url or
                          "http://125.124.233.231:18081/biz/deviceInfo/data?"
                          "deviceId=" + self.device_id)
+        self.location_map_url = location_map_url
+        self.location_address_url = location_address_url
         self.network_monitor = network_monitor
         # max_retries不包含首次发送。默认总共最多发送4次：首次+3次重发。
         self.tcp_max_retries = max(0, int(tcp_max_retries))
@@ -270,6 +278,30 @@ class POCClient:
         self._gnss_sent_ms = None
         self._gnss_packet = None
         self._gnss_retry_count = 0
+        # 只有通过5米阈值过滤的有效GGA才成为业务定位基准；原始GNSS服务
+        # 的last_gga会被每次采样覆盖，不能直接供LCD或后续比较使用。
+        self._location_accepted_gga = b""
+        self._location_accepted_fix = None
+        self._location_fix_revision = 0
+        self._location_manual_pending = False
+        self._location_manual_map_pending = False
+        self._location_refresh_state = "idle"
+        self._location_refresh_revision = 0
+        self._location_result_revision = 0
+        self._location_address_pending = None
+        self._location_map_pending = None
+        self._location_http_worker_running = False
+        self._location_address = ""
+        self._location_name = ""
+        self._location_map_paths = {}
+        self._location_map_path_revisions = {}
+        self._location_map_loading_levels = []
+        self._location_map_level = 17
+        self._location_map_out_of_range = False
+        self._location_map_fix_revision = -1
+        self._location_map_request_revision = None
+        self._location_detail_active = False
+        self._location_last_coordinates = None
         self.join_state = "idle"
         self.join_error = None
         # 每次入组状态变化都递增，防止连续两次success/failed被UI漏判。
@@ -610,6 +642,762 @@ class POCClient:
         self._gnss_packet = None
         self._gnss_retry_count = 0
 
+    @staticmethod
+    def _gga_fix(gga):
+        """Return decimal latitude, longitude and altitude for valid GGA."""
+        try:
+            text = gga.decode("ascii") if isinstance(gga, bytes) else str(gga)
+            fields = text.split(",")
+            if (len(fields) < 10 or not fields[2] or not fields[4] or
+                    not fields[9] or int(fields[6]) <= 0):
+                return None
+
+            def decimal(raw, hemisphere):
+                value = float(raw)
+                degrees = int(value // 100)
+                result = degrees + (value - degrees * 100) / 60.0
+                return -result if hemisphere in ("S", "W") else result
+
+            return (decimal(fields[2], fields[3]),
+                    decimal(fields[4], fields[5]), float(fields[9]))
+        except Exception:
+            return None
+
+    @staticmethod
+    def _gga_coordinates(gga):
+        """Return decimal (latitude, longitude) for a valid GGA frame."""
+        fix = POCClient._gga_fix(gga)
+        return (fix[0], fix[1]) if fix is not None else None
+
+    @staticmethod
+    def _location_distance_m(first, second):
+        """Calculate short WGS84 GNSS point distance with Haversine."""
+        radius_m = 6371000.0
+        lat1 = math.radians(first[0])
+        lon1 = math.radians(first[1])
+        lat2 = math.radians(second[0])
+        lon2 = math.radians(second[1])
+        dlat = lat2 - lat1
+        dlon = lon2 - lon1
+        value = (math.sin(dlat / 2.0) ** 2 +
+                 math.cos(lat1) * math.cos(lat2) *
+                 math.sin(dlon / 2.0) ** 2)
+        value = min(1.0, max(0.0, value))
+        return radius_m * 2.0 * math.atan2(
+            math.sqrt(value), math.sqrt(1.0 - value))
+
+    def _accept_location_gga(self, gga):
+        """Decide whether a fix exceeds either five-metre threshold."""
+        fix = self._gga_fix(gga)
+        if fix is None:
+            return False, None
+        previous = self._location_accepted_fix
+        if previous is not None:
+            distance = self._location_distance_m(previous, fix)
+            altitude_delta = abs(fix[2] - previous[2])
+            print("[GNSS] 定位变化：水平={:.2f}米，海拔={:.2f}米".format(
+                distance, altitude_delta))
+            if distance <= 5.0 and altitude_delta <= 5.0:
+                print("[GNSS] 新定位在双5米阈值内，已丢弃，不上报")
+                return False, fix
+        return True, fix
+
+    def _commit_location_gga(self, gga, fix):
+        """Publish a fix only after its initial 0x0D send has succeeded."""
+        self._lock_acquire()
+        try:
+            self._location_accepted_gga = bytes(gga)
+            self._location_accepted_fix = fix
+            self._location_fix_revision += 1
+            self._location_address = ""
+            self._location_name = ""
+            self._location_result_revision += 1
+            self._changed()
+            revision = self._location_fix_revision
+        finally:
+            self._lock_release()
+        print("[GNSS] 接受新定位：revision={}，lat={:.6f}，lon={:.6f}，"
+              "alt={:.1f}".format(
+                  revision, fix[0], fix[1], fix[2]))
+        return revision
+
+    def request_location_refresh(self):
+        """Request one GNSS sample; repeated requests are filtered until done."""
+        if (not self._running or self._socket is None or
+                self.login_state != "success" or
+                self._location_refresh_state == "refreshing"):
+            return False
+        self._lock_acquire()
+        try:
+            self._location_manual_pending = True
+            self._location_manual_map_pending = True
+            self._location_refresh_state = "refreshing"
+            self._location_refresh_revision += 1
+            self._changed()
+        finally:
+            self._lock_release()
+        return True
+
+    def _finish_location_refresh(self, state):
+        self._lock_acquire()
+        try:
+            self._location_refresh_state = state
+            self._location_refresh_revision += 1
+            self._changed()
+        finally:
+            self._lock_release()
+
+    def _set_location_map_loading(self, levels):
+        """Publish map levels still downloading without discarding old maps."""
+        normalized = []
+        for level in levels:
+            level = int(level)
+            if level in (16, 17, 18) and level not in normalized:
+                normalized.append(level)
+        self._lock_acquire()
+        try:
+            self._location_map_loading_levels = normalized
+            self._location_result_revision += 1
+            self._changed()
+        finally:
+            self._lock_release()
+        print("[Location][Map] loading levels: {}".format(normalized))
+
+    def _publish_location_map_level(self, level, lvgl_path,
+                                    latitude, longitude, fix_revision):
+        """Publish one completed zoom level immediately to the LCD thread."""
+        level = int(level)
+        self._lock_acquire()
+        try:
+            if int(fix_revision) != self._location_fix_revision:
+                return False
+            paths = dict(self._location_map_paths)
+            paths[level] = lvgl_path
+            self._location_map_paths = paths
+            path_revisions = dict(self._location_map_path_revisions)
+            path_revisions[level] = int(fix_revision)
+            self._location_map_path_revisions = path_revisions
+            self._location_map_loading_levels = [
+                item for item in self._location_map_loading_levels
+                if item != level]
+            self._location_map_level = 17
+            self._location_map_out_of_range = False
+            self._location_last_coordinates = (latitude, longitude)
+            self._location_result_revision += 1
+            self._changed()
+            revision = self._location_result_revision
+            loading = list(self._location_map_loading_levels)
+        finally:
+            self._lock_release()
+        print("[Location][Map] level published: revision={}, level={}, "
+              "path={}, loading={}".format(
+                  revision, level, lvgl_path, loading))
+        return True
+
+    def _finish_location_map_loading_failed(self, fix_revision=None):
+        """Stop pending zoom indicators while retaining successfully loaded maps."""
+        self._lock_acquire()
+        try:
+            if (fix_revision is not None and
+                    self._location_map_request_revision !=
+                    int(fix_revision)):
+                return
+            if (not self._location_map_loading_levels and
+                    self._location_map_request_revision is None):
+                return
+            self._location_map_loading_levels = []
+            self._location_map_request_revision = None
+            self._location_result_revision += 1
+            self._changed()
+        finally:
+            self._lock_release()
+        print("[Location][Map] remaining zoom downloads stopped")
+
+    @staticmethod
+    def _response_json(response):
+        reader = getattr(response, "json", None)
+        if reader is not None:
+            return reader()
+        if _json is None:
+            raise RuntimeError("HTTP JSON parser unavailable")
+        body = getattr(response, "text", "")
+        if isinstance(body, bytes):
+            body = body.decode("utf-8")
+        return _json.loads(body)
+
+    @staticmethod
+    def _binary_chunk(data):
+        """Normalize one non-container HTTP body chunk to bytes-like data."""
+        if isinstance(data, (bytes, bytearray)):
+            return data
+        if isinstance(data, str):
+            binary = bytearray(len(data))
+            for index in range(len(data)):
+                value = ord(data[index])
+                if value > 255:
+                    raise RuntimeError(
+                        "binary response contains non-byte character")
+                binary[index] = value
+            return binary
+        if isinstance(data, int):
+            if data < 0 or data > 255:
+                raise RuntimeError("binary byte value out of range")
+            return bytearray((data,))
+        try:
+            return bytes(data)
+        except Exception as error:
+            raise RuntimeError(
+                "unsupported binary body type {}: {}".format(
+                    type(data), error))
+
+    @staticmethod
+    def _binary_value_chunks(data):
+        """Flatten bytes, text, containers, or generator body fragments."""
+        if isinstance(data, (list, tuple)):
+            if not data:
+                return
+            all_integers = True
+            for item in data:
+                if not isinstance(item, int):
+                    all_integers = False
+                    break
+            if all_integers:
+                yield POCClient._binary_chunk(data)
+                return
+            for item in data:
+                for chunk in POCClient._binary_value_chunks(item):
+                    if chunk:
+                        yield chunk
+            return
+        # QuecPython request may expose response.content as a generator whose
+        # items are str/bytes fragments. Some MicroPython generators support
+        # iter()/for but do not expose a Python-visible __iter__ attribute, so
+        # capability checks via getattr(data, "__iter__") are not reliable.
+        if not isinstance(data, (bytes, bytearray, str, int)):
+            try:
+                iterator = iter(data)
+            except TypeError:
+                iterator = None
+            if iterator is not None:
+                for item in iterator:
+                    for chunk in POCClient._binary_value_chunks(item):
+                        if chunk:
+                            yield chunk
+                return
+        chunk = POCClient._binary_chunk(data)
+        if chunk:
+            yield chunk
+
+    @staticmethod
+    def _body_type_description(data):
+        """Describe a binary body without printing its potentially huge data."""
+        try:
+            length = len(data)
+        except Exception:
+            length = None
+        first_type = None
+        if isinstance(data, (list, tuple)) and data:
+            first_type = type(data[0])
+        return "type={}, length={}, first_type={}".format(
+            type(data), length, first_type)
+
+    @staticmethod
+    def _response_binary_chunks(response):
+        """Yield the complete binary body across QuecPython request variants."""
+        # QuecPython request.response.content normally owns the complete body,
+        # but some firmware exposes it as str even for image/png. Prefer it and
+        # restore one character to one byte; reading response.raw first can
+        # otherwise get one 256-byte block and then raise ENOTCONN at EOF.
+        try:
+            content = getattr(response, "content", None)
+        except Exception as error:
+            content = None
+            print("[Location][Map PNG HTTP] content read failed: {}".format(
+                error))
+        if content is not None and content != b"" and content != "":
+            print("[Location][Map PNG HTTP] body source=content, {}".format(
+                POCClient._body_type_description(content)))
+            read_any = False
+            chunk_count = 0
+            try:
+                for data in POCClient._binary_value_chunks(content):
+                    read_any = True
+                    chunk_count += 1
+                    yield data
+            except Exception as error:
+                message = str(error)
+                arguments = getattr(error, "args", ())
+                error_number = arguments[0] if arguments else None
+                if (read_any and
+                        (error_number == 107 or "ENOTCONN" in message)):
+                    print("[Location][Map PNG HTTP] content stream closed "
+                          "after {} chunks: {}".format(chunk_count, error))
+                else:
+                    print("[Location][Map PNG HTTP] content stream failed "
+                          "after {} chunks: {}".format(chunk_count, error))
+                    raise
+            if read_any:
+                return
+
+        # Compatibility fallback for response objects without content.
+        raw = getattr(response, "raw", None)
+        reader = getattr(raw, "read", None) if raw is not None else None
+        if reader is not None:
+            read_any = False
+            chunk_count = 0
+            try:
+                while True:
+                    data = reader()
+                    if data is None or data == b"" or data == "":
+                        break
+                    for chunk in POCClient._binary_value_chunks(data):
+                        read_any = True
+                        chunk_count += 1
+                        yield chunk
+            except Exception as error:
+                message = str(error)
+                arguments = getattr(error, "args", ())
+                error_number = arguments[0] if arguments else None
+                if (read_any and
+                        (error_number == 107 or "ENOTCONN" in message)):
+                    print("[Location][Map PNG HTTP] raw stream closed after "
+                          "{} chunks: {}".format(chunk_count, error))
+                else:
+                    print("[Location][Map PNG HTTP] raw read failed: {}".format(
+                        error))
+                    raise
+            if read_any:
+                return
+        raise RuntimeError("HTTP response has no binary body")
+
+    @staticmethod
+    def _response_content_length(response):
+        """Return Content-Length when exposed by the device HTTP library."""
+        headers = getattr(response, "headers", None)
+        if not isinstance(headers, dict):
+            return None
+        for key, value in headers.items():
+            if isinstance(key, bytes):
+                try:
+                    key = key.decode("ascii")
+                except Exception:
+                    continue
+            if str(key).lower() != "content-length":
+                continue
+            try:
+                length = int(value)
+                return length if length >= 0 else None
+            except Exception:
+                return None
+        return None
+
+    @staticmethod
+    def _response_bytes(response):
+        """Compatibility helper for callers that need the complete body."""
+        chunks = []
+        for chunk in POCClient._response_binary_chunks(response):
+            chunks.append(bytes(chunk))
+        return b"".join(chunks)
+
+    def _location_get(self, url, accept):
+        while self._running and self._gnss_pause_active():
+            utime.sleep_ms(100)
+        response = request.get(url, headers={"Accept": accept})
+        status = getattr(response, "status_code", 0)
+        print("[Location][HTTP] response received: accept={}, "
+              "response_type={}, status_type={}, status={}".format(
+                  accept, type(response), type(status), status))
+        try:
+            status_number = int(status)
+        except Exception as error:
+            try:
+                response.close()
+            except Exception:
+                pass
+            raise RuntimeError(
+                "invalid HTTP status type {} value {}: {}".format(
+                    type(status), status, error))
+        if status_number != 200:
+            try:
+                response.close()
+            except Exception:
+                pass
+            raise RuntimeError("HTTP status={}".format(status))
+        return response
+
+    def _start_location_http_worker(self):
+        """Start the shared address/map HTTP worker when needed."""
+        start_worker = False
+        self._lock_acquire()
+        try:
+            if not self._location_http_worker_running:
+                self._location_http_worker_running = True
+                start_worker = True
+        finally:
+            self._lock_release()
+        if not start_worker:
+            return True
+        try:
+            _thread.start_new_thread(self._location_http_worker, ())
+            return True
+        except Exception as error:
+            self._lock_acquire()
+            try:
+                self._location_http_worker_running = False
+            finally:
+                self._lock_release()
+            print("[Location] HTTP worker start failed: {}".format(error))
+            return False
+
+    def _queue_location_address(self, latitude, longitude, fix_revision):
+        """Queue reverse geocoding for each newly accepted position."""
+        if (_thread is None or request is None or
+                not self.location_address_url):
+            return False
+        self._lock_acquire()
+        try:
+            self._location_address_pending = (
+                float(latitude), float(longitude), int(fix_revision))
+        finally:
+            self._lock_release()
+        return self._start_location_http_worker()
+
+    def _queue_location_map(self, latitude, longitude, fix_revision,
+                            manual=False):
+        """Queue maps only after the detail page has requested them."""
+        if (_thread is None or request is None or not self.location_map_url):
+            if manual:
+                self._finish_location_refresh("failed")
+            return False
+        revision = int(fix_revision)
+        self._lock_acquire()
+        try:
+            if (self._location_map_fix_revision == revision or
+                    self._location_map_request_revision == revision):
+                already_ready = self._location_map_fix_revision == revision
+                already_loading = (
+                    self._location_map_request_revision == revision)
+                if already_ready:
+                    if manual:
+                        self._location_manual_map_pending = False
+                        self._location_refresh_state = "success"
+                        self._location_refresh_revision += 1
+                        self._changed()
+                    return True
+                if already_loading:
+                    if manual and self._location_map_pending is not None:
+                        pending = self._location_map_pending
+                        self._location_map_pending = (
+                            pending[0], pending[1], pending[2], True)
+                    return True
+            self._location_map_pending = (
+                float(latitude), float(longitude), revision,
+                bool(manual))
+            self._location_map_request_revision = revision
+        finally:
+            self._lock_release()
+        self._set_location_map_loading((17, 16, 18))
+        return self._start_location_http_worker()
+
+    def set_location_detail_active(self, active):
+        """Track map-page visibility and lazily request its latest map."""
+        active = bool(active)
+        self._lock_acquire()
+        try:
+            self._location_detail_active = active
+            fix = self._location_accepted_fix
+            revision = self._location_fix_revision
+            manual = self._location_manual_map_pending
+        finally:
+            self._lock_release()
+        if active and fix is not None:
+            return self._queue_location_map(
+                fix[0], fix[1], revision, manual)
+        return False
+
+    def _download_location_png(self, url, path):
+        response = None
+        temp_path = path + ".tmp"
+        try:
+            print("-----------------------------HTTP获取照片{}-----------------------".format(temp_path))
+            print("[Location][Map PNG HTTP] request: {}".format(url))
+            response = self._location_get(url, "image/png")
+            total = 0
+            chunk_count = 0
+            header = bytearray()
+            tail = bytearray()
+            expected_length = self._response_content_length(response)
+            print("-----------------------------HTTP获取照片结束，开始下载到FLASH{}-----------------------".format(temp_path))
+            with open(temp_path, "wb") as output:
+                for data in self._response_binary_chunks(response):
+                    if len(header) < 8:
+                        remaining = 8 - len(header)
+                        header.extend(data[:remaining])
+                    tail.extend(data)
+                    if len(tail) > 12:
+                        tail = tail[-12:]
+                    output.write(data)
+                    total += len(data)
+                    chunk_count += 1
+            print("[Location][Map PNG HTTP] response: status={}, chunks={}, "
+                  "length={}, expected={}".format(
+                      getattr(response, "status_code", 0), chunk_count,
+                      total, expected_length))
+            if total <= 0:
+                raise RuntimeError("empty PNG response")
+            if bytes(header) != b"\x89PNG\r\n\x1a\n":
+                raise RuntimeError("response is not PNG")
+            if expected_length is not None and total != expected_length:
+                raise RuntimeError(
+                    "incomplete PNG: expected {}, got {}".format(
+                        expected_length, total))
+            if bytes(tail) != b"\x00\x00\x00\x00IEND\xaeB\x60\x82":
+                raise RuntimeError(
+                    "incomplete PNG: IEND marker missing, length={}".format(
+                        total))
+            print("-----------------------------下载FLASH结束，移除旧空间{}-----------------------".format(temp_path))
+            try:
+                uos.remove(path)
+            except Exception:
+                pass
+            uos.rename(temp_path, path)
+            try:
+                saved_size = int(uos.stat(path)[6])
+            except Exception as error:
+                raise RuntimeError(
+                    "saved PNG stat failed for {}: {}".format(path, error))
+            if saved_size != total:
+                raise RuntimeError(
+                    "saved PNG size mismatch: downloaded {}, file {}".format(
+                        total, saved_size))
+            print("[Location][Map PNG HTTP] saved: {}, length={}".format(
+                path, saved_size))
+        except Exception:
+            try:
+                uos.remove(temp_path)
+            except Exception:
+                pass
+            raise
+        finally:
+            if response is not None:
+                try:
+                    response.close()
+                    print("-----------------------------整个过程完成{}-----------------------".format(temp_path))
+                except Exception:
+                    pass
+
+    def _next_location_map_file(self, level):
+        """Choose the inactive file of one zoom level for atomic replacement."""
+        level = int(level)
+        self._lock_acquire()
+        try:
+            current = str(self._location_map_paths.get(level) or "")
+        finally:
+            self._lock_release()
+        bank = 1 if current.endswith("_0.png") else 0
+        filename = "location_map_{}_{}.png".format(level, bank)
+        return "/ext/" + filename, "E:/" + filename
+
+    @staticmethod
+    def _cleanup_old_location_map_level(level, keep_lvgl_path):
+        """Keep only the newly published formal file for one zoom level."""
+        keep_name = str(keep_lvgl_path).split("/")[-1]
+        for bank in (0, 1):
+            filename = "location_map_{}_{}.png".format(int(level), bank)
+            if filename == keep_name:
+                continue
+            path = "/ext/" + filename
+            try:
+                uos.remove(path)
+                print("[Location][Map] removed old file: {}".format(path))
+            except Exception:
+                pass
+
+    def _fetch_location_address(self, latitude, longitude, fix_revision):
+        """Fetch and publish address only for the still-current fix."""
+        lat = "{:.6f}".format(latitude)
+        lon = "{:.6f}".format(longitude)
+        address = None
+        name = None
+        if self.location_address_url:
+            response = None
+            try:
+                url = self.location_address_url.format(lat=lat, lon=lon)
+                print("[Location][Address HTTP] request: {}".format(url))
+                response = self._location_get(url, "application/json")
+                payload = self._response_json(response)
+                print("[Location][Address HTTP] response: {}".format(payload))
+                if isinstance(payload, dict):
+                    address = str(payload.get("address") or "")
+                    name = str(payload.get("name") or "")
+                    if not address and not name:
+                        raise ValueError("address response has no content")
+            except Exception as error:
+                print("[Location] address request failed: {}".format(error))
+            finally:
+                if response is not None:
+                    try:
+                        response.close()
+                    except Exception:
+                        pass
+
+        if address is not None:
+            self._lock_acquire()
+            try:
+                if int(fix_revision) == self._location_fix_revision:
+                    self._location_address = address
+                    self._location_name = name or ""
+                    self._location_result_revision += 1
+                    self._changed()
+            finally:
+                self._lock_release()
+
+    def _fetch_location_map(self, latitude, longitude, fix_revision):
+        """Download maps for a fix requested by the location detail page."""
+        lat = "{:.6f}".format(latitude)
+        lon = "{:.6f}".format(longitude)
+        response = None
+        map_paths = None
+        out_of_range = None
+        try:
+            url = self.location_map_url.format(lat=lat, lon=lon)
+            print("[Location][Map HTTP] request: {}".format(url))
+            response = self._location_get(url, "application/json")
+            payload = self._response_json(response)
+            print("[Location][Map HTTP] response: {}".format(payload))
+            code = int(payload.get("code", -2)) if isinstance(payload, dict) else -2
+            if code == -1:
+                out_of_range = True
+                map_paths = {}
+            elif code == 0:
+                tiles = ((payload.get("data") or {}).get("tiles") or [])
+                urls = {}
+                for tile in tiles:
+                    level = int(tile.get("z", 0))
+                    if level in (16, 17, 18) and tile.get("urlWithMarker"):
+                        urls[level] = tile.get("urlWithMarker")
+                if len(urls) != 3:
+                    raise ValueError("map response missing zoom levels")
+                # Default level 17 is downloaded and published first so the
+                # detail page can display quickly; 16 and 18 continue in the
+                # same background worker and are published independently.
+                for level in (17, 16, 18):
+                    file_path, lvgl_path = self._next_location_map_file(level)
+                    self._download_location_png(urls[level], file_path)
+                    if not self._publish_location_map_level(
+                            level, lvgl_path, latitude, longitude,
+                            fix_revision):
+                        print("[Location][Map] newer fix arrived, stop old "
+                              "map publication: revision={}".format(
+                                  fix_revision))
+                        return False
+                self._lock_acquire()
+                try:
+                    map_paths = dict(self._location_map_paths)
+                finally:
+                    self._lock_release()
+                # Delete the previous three formal files only after all new
+                # levels are ready. This avoids deleting a file still used by
+                # the LCD main loop while it is busy with audio or navigation.
+                for level in (17, 16, 18):
+                    self._cleanup_old_location_map_level(
+                        level, map_paths[level])
+                self._lock_acquire()
+                try:
+                    if int(fix_revision) == self._location_fix_revision:
+                        self._location_map_fix_revision = int(fix_revision)
+                finally:
+                    self._lock_release()
+                out_of_range = False
+                print("[Location][Map] all zoom levels ready: paths={}".format(
+                    map_paths))
+            else:
+                raise ValueError("map response code={}".format(code))
+        finally:
+            if response is not None:
+                try:
+                    response.close()
+                except Exception:
+                    pass
+
+        # Successful in-range downloads were already published one level at a
+        # time. Only out-of-range results need a final standalone publication.
+        if out_of_range:
+            self._lock_acquire()
+            try:
+                if int(fix_revision) != self._location_fix_revision:
+                    return False
+                self._location_map_paths = map_paths
+                self._location_map_path_revisions = {}
+                self._location_map_loading_levels = []
+                self._location_map_level = 17
+                self._location_map_out_of_range = True
+                self._location_map_fix_revision = int(fix_revision)
+                self._location_last_coordinates = (latitude, longitude)
+                self._location_result_revision += 1
+                self._changed()
+                revision = self._location_result_revision
+            finally:
+                self._lock_release()
+            print("[Location][Map] out of range published: revision={}".format(
+                revision))
+        return True
+
+    def _location_http_worker(self):
+        while self._running:
+            try:
+                self._lock_acquire()
+                try:
+                    address_work = self._location_address_pending
+                    self._location_address_pending = None
+                    map_work = self._location_map_pending
+                    self._location_map_pending = None
+                    if address_work is None and map_work is None:
+                        self._location_http_worker_running = False
+                finally:
+                    self._lock_release()
+                if address_work is None and map_work is None:
+                    return
+                while self._running and self._gnss_pause_active():
+                    utime.sleep_ms(100)
+                if address_work is not None:
+                    try:
+                        self._fetch_location_address(*address_work)
+                    except Exception as error:
+                        print("[Location] address worker failed: {}".format(
+                            error))
+                if map_work is not None:
+                    latitude, longitude, fix_revision, manual = map_work
+                    success = False
+                    try:
+                        success = bool(self._fetch_location_map(
+                            latitude, longitude, fix_revision))
+                    except Exception as error:
+                        print("[Location] map request failed: {}".format(error))
+                        self._finish_location_map_loading_failed(fix_revision)
+                    self._lock_acquire()
+                    try:
+                        current_request = (
+                            self._location_map_request_revision ==
+                            fix_revision)
+                        if current_request:
+                            self._location_map_request_revision = None
+                        if manual and current_request:
+                            self._location_manual_map_pending = False
+                    finally:
+                        self._lock_release()
+                    if manual and current_request:
+                        self._finish_location_refresh(
+                            "success" if success else "failed")
+            except Exception as error:
+                print("[Location] HTTP worker failed: {}".format(error))
+                self._lock_acquire()
+                try:
+                    self._location_http_worker_running = False
+                finally:
+                    self._lock_release()
+                return
+
     def _send_gnss_if_due(self):
         """登录后首次及周期上报定位；过期期间只保留一次待发送。"""
         if (self._socket is None or self.login_state != "success" or
@@ -617,7 +1405,10 @@ class POCClient:
                 self._gnss_pause_active()):
             return
         now_ms = utime.ticks_ms()
-        if self._gnss_first_upload_pending:
+        manual_refresh = self._location_manual_pending
+        if manual_refresh:
+            pass
+        elif self._gnss_first_upload_pending:
             if not self._gnss_startup_ready():
                 return
         elif (self._gnss_next_upload_ms is None or
@@ -645,6 +1436,21 @@ class POCClient:
             print("[GNSS] 定位信息：无")
             print("[GNSS] 定位结果：定位失败（GNSS尚未初始化）")
 
+        # Keep the original invalid-GGA upload behaviour. Only a valid new fix
+        # inside both five-metre thresholds is discarded without a 0x0D frame.
+        fix = None
+        if gnss_data:
+            accepted, fix = self._accept_location_gga(gnss_data)
+            if not accepted:
+                self._gnss_first_upload_pending = False
+                self._location_manual_pending = False
+                self._location_manual_map_pending = False
+                self._gnss_next_upload_ms = self._add_ms(
+                    now_ms, self.gnss_upload_interval_ms)
+                if manual_refresh:
+                    self._finish_location_refresh("success")
+                return
+
         request_cnt = self._next_request_cnt()
         packet = build_frame(
             MSG_GNSS_UPLOAD, request_cnt,
@@ -655,10 +1461,29 @@ class POCClient:
         self._gnss_retry_count = 0
         self._gnss_sent_ms = utime.ticks_ms()
         self._gnss_first_upload_pending = False
+        self._location_manual_pending = False
         self._gnss_next_upload_ms = self._add_ms(
             self._gnss_sent_ms, self.gnss_upload_interval_ms)
         print("[GNSS] 已发送定位信息上报：gnss_len={}，frame={}".format(
             len(gnss_data), self._hex(packet)))
+        revision = self._location_fix_revision
+        if fix is not None:
+            revision = self._commit_location_gga(gnss_data, fix)
+            self._queue_location_address(fix[0], fix[1], revision)
+        if fix is not None and self._location_detail_active:
+            if not self._queue_location_map(
+                    fix[0], fix[1], revision, manual_refresh):
+                if manual_refresh:
+                    self._finish_location_refresh("failed")
+        elif manual_refresh and fix is not None:
+            # Normally manual refresh originates from the detail page. If the
+            # user leaves during GNSS sampling, finish the visible event now;
+            # the newly accepted map remains lazy until the next page entry.
+            self._location_manual_map_pending = False
+            self._finish_location_refresh("success")
+        elif manual_refresh:
+            self._location_manual_map_pending = False
+            self._finish_location_refresh("failed")
 
     def request_http_refresh(self, reason="页面", auto_join_first=False,
                              allow_before_login=False):
@@ -1013,6 +1838,12 @@ class POCClient:
             self._clear_gnss_request()
             self._gnss_first_upload_pending = False
             self._gnss_next_upload_ms = None
+            self._location_manual_pending = False
+            self._location_manual_map_pending = False
+            if self._location_refresh_state == "refreshing":
+                self._location_refresh_state = "failed"
+                self._location_refresh_revision += 1
+                self._changed()
             self._request_cnt_history = []
             self._request_cnt_history_set = {}
             self._server_request_cache = {}
@@ -2963,6 +3794,20 @@ class POCClient:
                     "logout_state": self.logout_state,
                     "logout_error": self.logout_error,
                     "http_state": self.http_state,
+                    "location_refresh_revision": self._location_refresh_revision,
+                    "location_refresh_state": self._location_refresh_state,
+                    "location_result_revision": self._location_result_revision,
+                    "location_fix_revision": self._location_fix_revision,
+                    "location_accepted_gga": self._location_accepted_gga,
+                    "location_address": self._location_address,
+                    "location_name": self._location_name,
+                    "location_map_paths": dict(self._location_map_paths),
+                    "location_map_path_revisions": dict(
+                        self._location_map_path_revisions),
+                    "location_map_loading_levels": list(
+                        self._location_map_loading_levels),
+                    "location_map_level": self._location_map_level,
+                    "location_map_out_of_range": self._location_map_out_of_range,
                     "join_revision": self._join_revision,
                     "join_state": self.join_state,
                     "join_error": self.join_error,
@@ -3011,6 +3856,20 @@ class POCClient:
                         "logout_state": self.logout_state,
                         "logout_error": self.logout_error,
                         "http_state": self.http_state,
+                        "location_refresh_revision": self._location_refresh_revision,
+                        "location_refresh_state": self._location_refresh_state,
+                        "location_result_revision": self._location_result_revision,
+                        "location_fix_revision": self._location_fix_revision,
+                        "location_accepted_gga": self._location_accepted_gga,
+                        "location_address": self._location_address,
+                        "location_name": self._location_name,
+                        "location_map_paths": dict(self._location_map_paths),
+                        "location_map_path_revisions": dict(
+                            self._location_map_path_revisions),
+                        "location_map_loading_levels": list(
+                            self._location_map_loading_levels),
+                        "location_map_level": self._location_map_level,
+                        "location_map_out_of_range": self._location_map_out_of_range,
                         "join_revision": self._join_revision,
                         "join_state": self.join_state,
                         "join_error": self.join_error,

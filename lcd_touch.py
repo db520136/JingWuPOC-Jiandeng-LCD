@@ -151,12 +151,12 @@ NETWORK_ICON_GAP = 10
 NETWORK_ICON_X = LCD_WIDTH // 2 - NETWORK_ICON_SIZE - NETWORK_ICON_GAP + 50
 NETWORK_ICON_Y = 0
 NETWORK_ICON_PATHS = {
-    None: "U:/wifi_0.png",
-    "极弱": "U:/wifi_1.png",
-    "弱": "U:/wifi_2.png",
-    "一般": "U:/wifi_3.png",
-    "强": "U:/wifi_4.png",
-    "极好": "U:/wifi_5.png",
+    None: "E:/wifi_0.png",
+    "极弱": "E:/wifi_1.png",
+    "弱": "E:/wifi_2.png",
+    "一般": "E:/wifi_3.png",
+    "强": "E:/wifi_4.png",
+    "极好": "E:/wifi_5.png",
 }
 # 设置页按钮与对讲机模式按钮保持相同高度；内容超出后纵向滚动。
 SETTINGS_ROW_HEIGHT = 58
@@ -547,6 +547,21 @@ class JingWuUI:
         self._location_time_base = None
         self._location_ticks_base = None
         self._location_last_refresh_ms = None
+        self._location_result_revision_seen = -1
+        self._location_refresh_revision_seen = -1
+        self._location_address = ""
+        self._location_name = ""
+        self._location_fix_revision = 0
+        self._location_map_paths = {}
+        self._location_map_path_revisions = {}
+        self._location_map_loading_levels = []
+        self._location_map_level = 17
+        self._location_map_out_of_range = False
+        self._location_map_image = None
+        self._location_map_displayed_level = None
+        self._location_map_displayed_path = None
+        self._location_map_message = None
+        self._location_refresh_overlay = None
         self._pending_root_swipe = None
         self._pending_back = False
         self._touch_sequence_swipe = False
@@ -956,12 +971,21 @@ class JingWuUI:
         if ShoulderLampController is None:
             print("[肩灯] 未找到 ET6312B 控制器")
             return
-        try:
-            self._shoulder_controller = ShoulderLampController(
-                interval_ms=SHOULDER_FLASH_INTERVAL_MS)
-        except Exception as error:
-            self._shoulder_controller = None
-            print("[肩灯] ET6312B 初始化失败：{}".format(error))
+        max_attempts = 5
+        for attempt in range(1, max_attempts + 1):
+            try:
+                self._shoulder_controller = ShoulderLampController(
+                    interval_ms=SHOULDER_FLASH_INTERVAL_MS)
+                print("[肩灯] 第{}/{}次初始化成功".format(
+                    attempt, max_attempts))
+                return
+            except Exception as error:
+                self._shoulder_controller = None
+                print("[肩灯] 第{}/{}次初始化失败：{}".format(
+                    attempt, max_attempts, error))
+                if attempt < max_attempts:
+                    utime.sleep_ms(100)
+        print("[肩灯] 连续5次初始化失败，无法初始化成功，已跳过")
 
     def _init_motion_service(self):
         """启动独立加速度服务；失败时不阻断 LCD 主界面。"""
@@ -1960,6 +1984,7 @@ class JingWuUI:
                 groups = snapshot.get("groups") or []
                 people = snapshot.get("people") or []
                 self._queue_intercom_data(groups, people)
+            self._apply_location_snapshot(snapshot)
             self._apply_join_snapshot(snapshot)
             self._apply_single_snapshot(snapshot)
             self._process_pending_intercom_data()
@@ -2467,6 +2492,14 @@ class JingWuUI:
             if self.stack and self.stack[-1][1] is previous[1]:
                 self.stack.pop()
             self.current = previous
+            if self._poc_client is not None:
+                setter = getattr(
+                    self._poc_client, "set_location_detail_active", None)
+                if setter is not None:
+                    try:
+                        setter(previous[0] == "location_detail")
+                    except Exception as error:
+                        print("[定位] 地图页面状态同步失败：{}".format(error))
             self._sync_police_status_visibility(previous[0])
             # 页面对象是长期复用的，返回过程没有新分配对象；不在收尾帧
             # 立即执行 gc.collect()，避免回收停顿造成偶发卡顿。
@@ -2779,6 +2812,14 @@ class JingWuUI:
         page.set_x(0)
         self._set_page_visible(page, True)
         self.current = (key, page)
+        if self._poc_client is not None:
+            setter = getattr(
+                self._poc_client, "set_location_detail_active", None)
+            if setter is not None:
+                try:
+                    setter(key == "location_detail")
+                except Exception as error:
+                    print("[定位] 地图页面状态同步失败：{}".format(error))
         self._sync_police_status_visibility(key)
         # 页面容器切到前景后，重新把全局弹框放到最上层；登录页保持隐藏。
         if getattr(self, "_poc_popup", None) is not None:
@@ -3870,18 +3911,29 @@ class JingWuUI:
         if created:
             image = lv.img(page)
             image.set_size(92, 92); image.set_pos(192, 48); _fix_position(image)
-            try: image.set_src("U:/location_icon_92.png")
+            try: image.set_src("E:/location_icon_92.png")
             except Exception: pass
-            specs = (("address", 8, 0, 286, FONT_MAIN),
-                     ("longitude", 8, 34, 180, FONT_SMALL),
-                     ("latitude", 8, 68, 180, FONT_SMALL),
-                     ("altitude", 8, 102, 180, FONT_SMALL),
-                     ("satellites", 8, 136, 180, FONT_SMALL),
+            self._bind_click(
+                page, image, lambda obj: self.show_location_detail())
+            specs = (("address", 8, 0, 280, FONT_MAIN),
+                     ("name", 8, 34, 180, FONT_MAIN),
+                     ("longitude", 8, 68, 180, FONT_SMALL),
+                     ("latitude", 8, 94, 180, FONT_SMALL),
+                     ("altitude", 8, 120, 180, FONT_SMALL),
+                     ("satellites", 8, 146, 180, FONT_SMALL),
                      ("time", 200, 140, 118, FONT_SMALL))
             for key, x, y, width, font in specs:
                 label = lv.label(page); label.set_size(width, font[1] + 12); label.set_pos(x, y)
                 label.add_style(self._get_style(font, WHITE, lv.TEXT_ALIGN.LEFT), lv.PART.MAIN)
                 self._location_labels[key] = label
+            try:
+                self._location_labels["address"].set_long_mode(
+                    lv.label.LONG.SCROLL_CIRCULAR)
+                self._location_labels["name"].set_long_mode(
+                    lv.label.LONG.SCROLL_CIRCULAR)
+            except Exception:
+                pass
+            self._location_labels["name"].set_text("")
             self._location_labels["address"].set_text("定位中...")
             self._location_labels["longitude"].set_text("经度：...")
             self._location_labels["latitude"].set_text("纬度：...")
@@ -3901,6 +3953,275 @@ class JingWuUI:
         self._switch_page("location", page, False)
         self._location_resync_clock()
         self._refresh_location_page()
+
+    def _apply_location_snapshot(self, snapshot):
+        result_revision = int(snapshot.get("location_result_revision") or 0)
+        if result_revision != self._location_result_revision_seen:
+            self._location_result_revision_seen = result_revision
+            self._location_address = str(snapshot.get("location_address") or "")
+            self._location_name = str(snapshot.get("location_name") or "")
+            self._location_fix_revision = int(
+                snapshot.get("location_fix_revision") or 0)
+            previous_loading = list(self._location_map_loading_levels)
+            self._location_map_paths = dict(
+                snapshot.get("location_map_paths") or {})
+            self._location_map_path_revisions = dict(
+                snapshot.get("location_map_path_revisions") or {})
+            self._location_map_loading_levels = list(
+                snapshot.get("location_map_loading_levels") or [])
+            # A new map acquisition always starts from default zoom 17. Keep
+            # the locally selected/pending zoom during partial publications.
+            if (not previous_loading and
+                    self._location_map_loading_levels):
+                self._location_map_level = 17
+            elif not self._location_map_paths:
+                self._location_map_level = int(
+                    snapshot.get("location_map_level") or 17)
+            self._location_map_out_of_range = bool(
+                snapshot.get("location_map_out_of_range"))
+            print("[定位][LCD] 地图快照：revision={} level={} paths={} "
+                  "loading={} out_of_range={}".format(
+                      result_revision, self._location_map_level,
+                      self._location_map_paths,
+                      self._location_map_loading_levels,
+                      self._location_map_out_of_range))
+            if self.current is not None:
+                if self.current[0] == "location":
+                    self._refresh_location_page()
+                elif self.current[0] == "location_detail":
+                    self._refresh_location_map()
+        refresh_revision = int(snapshot.get("location_refresh_revision") or 0)
+        if refresh_revision != self._location_refresh_revision_seen:
+            self._location_refresh_revision_seen = refresh_revision
+            self._sync_location_loading_overlay()
+
+    def _location_level_loading(self):
+        return self._location_map_level in self._location_map_loading_levels
+
+    def _sync_location_loading_overlay(self):
+        if self._location_refresh_overlay is None:
+            return
+        manual_refreshing = ((self._poc_snapshot or {}).get(
+            "location_refresh_state") == "refreshing")
+        visible = (self.current is not None and
+                   self.current[0] == "location_detail" and
+                   (manual_refreshing or self._location_level_loading()))
+        if visible:
+            self._location_refresh_overlay.clear_flag(lv.obj.FLAG.HIDDEN)
+            try:
+                self._location_refresh_overlay.move_foreground()
+            except Exception:
+                pass
+        else:
+            self._location_refresh_overlay.add_flag(lv.obj.FLAG.HIDDEN)
+
+    def _location_zoom_icon(self, page, y, path, callback):
+        icon = lv.img(page)
+        icon.set_size(44, 44)
+        icon.set_pos(245, y)
+        _fix_position(icon)
+        icon.add_flag(lv.obj.FLAG.CLICKABLE)
+        try:
+            icon.set_src(path)
+        except Exception as error:
+            print("[定位] 缩放图标加载失败：{}".format(error))
+        self._bind_click(page, icon, callback)
+        return icon
+
+    def _location_refresh_control(self, page, callback, y=110):
+        control = lv.obj(page)
+        control.set_size(44, 94)
+        control.set_pos(245, y)
+        _fix_position(control)
+        _set_bg(control, 0x168AD8)
+        try:
+            control.set_style_pad_all(0, lv.PART.MAIN)
+            control.set_style_radius(6, lv.PART.MAIN)
+            control.add_flag(lv.obj.FLAG.CLICKABLE)
+        except Exception:
+            pass
+        label = lv.label(control)
+        label.set_size(44, 72)
+        label.set_pos(0, 11)
+        label.set_text("刷\n新")
+        label.add_style(
+            self._get_style(FONT_MAIN, WHITE, lv.TEXT_ALIGN.CENTER),
+            lv.PART.MAIN)
+        self._bind_click(page, control, callback)
+        self._bind_click(page, label, callback)
+        return control
+
+    def show_location_detail(self):
+        page, created = self._screen("location_detail", "")
+        if created:
+            # Only the map moves 10px upward into the status area. Enlarge and
+            # move the page, then compensate every non-map control by +10px so
+            # its physical screen position remains unchanged.
+            page.set_size(LCD_WIDTH, PAGE_HEIGHT + 10)
+            page.set_pos(0, STATUS_HEIGHT - 10)
+            self._location_map_image = lv.img(page)
+            self._location_map_image.set_size(252, 210)
+            self._location_map_image.set_pos(0, 0)
+            _fix_position(self._location_map_image)
+            self._location_map_message = lv.label(page)
+            self._location_map_message.set_size(252, FONT_MAIN[1] + 12)
+            self._location_map_message.set_pos(0, 96)
+            self._location_map_message.add_style(
+                self._get_style(FONT_MAIN, WHITE), lv.PART.MAIN)
+            self._location_map_message.add_flag(lv.obj.FLAG.HIDDEN)
+            # Keep the map and the right-side controls in fixed page coordinates.
+            try:
+                page.set_scroll_dir(lv.DIR.NONE)
+                page.set_scrollbar_mode(lv.SCROLLBAR_MODE.OFF)
+            except Exception:
+                pass
+            self._location_zoom_icon(
+                page, 10, "E:/location_zoom_in.png",
+                lambda obj: self._change_location_zoom(1))
+            self._location_zoom_icon(
+                page, 68, "E:/location_zoom_out.png",
+                lambda obj: self._change_location_zoom(-1))
+            self._location_refresh_control(
+                page, lambda obj: self._request_location_refresh(), 120)
+            overlay = lv.obj(page)
+            overlay.set_size(82, 82)
+            overlay.set_pos(85, 74)
+            _fix_position(overlay)
+            try:
+                overlay.set_style_bg_opa(lv.OPA.TRANSP, lv.PART.MAIN)
+                overlay.set_style_border_width(0, lv.PART.MAIN)
+            except Exception:
+                pass
+            try:
+                indicator = lv.spinner(overlay, 900, 70)
+                indicator.set_size(64, 64)
+                indicator.set_pos(9, 9)
+            except Exception:
+                indicator = lv.label(overlay)
+                indicator.set_size(78, FONT_MAIN[1] + 12)
+                indicator.set_pos(0, 23)
+                indicator.set_text("刷新")
+                indicator.add_style(
+                    self._get_style(FONT_MAIN, WHITE), lv.PART.MAIN)
+            overlay.add_flag(lv.obj.FLAG.HIDDEN)
+            self._location_refresh_overlay = overlay
+        self._load("location_detail", page)
+        # The map extends 10px into the status area; keep shared status widgets
+        # above it so only the map area moves and status text remains readable.
+        for widget in (self._status_police_label, self._network_icon,
+                       self._battery_label):
+            if widget is not None:
+                try:
+                    widget.move_foreground()
+                except Exception:
+                    pass
+        self._refresh_location_map()
+        self._sync_location_loading_overlay()
+
+    def _refresh_location_map(self):
+        if (self.current is None or self.current[0] != "location_detail" or
+                self._location_map_image is None):
+            return
+        if self._location_map_out_of_range:
+            if self._location_map_displayed_path is None:
+                self._location_map_image.add_flag(lv.obj.FLAG.HIDDEN)
+                self._location_map_message.set_text("定位不在温州范围")
+                self._location_map_message.clear_flag(lv.obj.FLAG.HIDDEN)
+            self._sync_location_loading_overlay()
+            return
+        if self._location_level_loading():
+            print("[定位][LCD] 地图级别加载中：level={}".format(
+                self._location_map_level))
+            # Keep the last usable map visible below the spinner until the
+            # requested zoom/refresh map becomes available.
+            if self._location_map_displayed_path is None:
+                self._location_map_image.add_flag(lv.obj.FLAG.HIDDEN)
+            self._location_map_message.add_flag(lv.obj.FLAG.HIDDEN)
+            self._sync_location_loading_overlay()
+            return
+        path = self._location_map_paths.get(self._location_map_level)
+        path_revision = self._location_map_path_revisions.get(
+            self._location_map_level)
+        if (path is None or
+                int(path_revision if path_revision is not None else -1) !=
+                self._location_fix_revision):
+            print("[定位][LCD] 暂无地图路径：level={} paths={}".format(
+                self._location_map_level, self._location_map_paths))
+            if self._location_map_displayed_path is None:
+                self._location_map_image.add_flag(lv.obj.FLAG.HIDDEN)
+                self._location_map_message.set_text("暂无地图")
+                self._location_map_message.clear_flag(lv.obj.FLAG.HIDDEN)
+            else:
+                self._location_map_message.add_flag(lv.obj.FLAG.HIDDEN)
+            self._sync_location_loading_overlay()
+            return
+        try:
+            print("[定位][LCD] 加载地图：level={} path={}".format(
+                self._location_map_level, path))
+            # 双文件组会循环复用相同路径；先清理LVGL图片缓存，避免第三次
+            # 刷新时继续显示该路径上一次解码的旧图。不同固件接口名不同。
+            try:
+                lv.img.cache_invalidate_src(path)
+            except Exception:
+                try:
+                    lv.img_cache_invalidate_src(path)
+                except Exception:
+                    pass
+            self._location_map_image.set_src(path)
+            self._location_map_image.clear_flag(lv.obj.FLAG.HIDDEN)
+            self._location_map_displayed_level = self._location_map_level
+            self._location_map_displayed_path = path
+            self._location_map_message.add_flag(lv.obj.FLAG.HIDDEN)
+            try:
+                self._location_map_image.invalidate()
+            except Exception:
+                pass
+            try:
+                self.current[1].invalidate()
+            except Exception:
+                pass
+            try:
+                actual_source = self._location_map_image.get_src()
+            except Exception:
+                actual_source = path
+            print("[定位][LCD] 地图加载已提交：src={}".format(
+                actual_source))
+            self._sync_location_loading_overlay()
+        except Exception as error:
+            print("[定位] 地图显示失败：{}".format(error))
+
+    def _change_location_zoom(self, delta):
+        level = self._location_map_level + int(delta)
+        if level < 16 or level > 18:
+            return
+        path_revision = self._location_map_path_revisions.get(level)
+        level_ready = (
+            level in self._location_map_paths and
+            int(path_revision if path_revision is not None else -1) ==
+            self._location_fix_revision)
+        if (not level_ready and
+                level not in self._location_map_loading_levels):
+            return
+        self._location_map_level = level
+        self._refresh_location_map()
+
+    def _request_location_refresh(self):
+        if self._poc_client is None:
+            return
+        if (self._poc_snapshot or {}).get(
+                "location_refresh_state") == "refreshing":
+            return
+        try:
+            if self._poc_client.request_location_refresh():
+                if self._location_refresh_overlay is not None:
+                    self._location_refresh_overlay.clear_flag(
+                        lv.obj.FLAG.HIDDEN)
+                    try:
+                        self._location_refresh_overlay.move_foreground()
+                    except Exception:
+                        pass
+        except Exception as error:
+            print("[定位] 刷新请求失败：{}".format(error))
 
     def _location_resync_clock(self):
         try:
@@ -3926,21 +4247,21 @@ class JingWuUI:
         self._switch_page(key, page, False)
 
     def show_shoulder_root(self):
-        self._show_root_icon_page("root_shoulder", "U:/shoulder_lamp.png", "肩灯", self.show_shoulder_menu)
+        self._show_root_icon_page("root_shoulder", "E:/shoulder_lamp.png", "肩灯", self.show_shoulder_menu)
 
     def show_intercom_root(self):
-        self._show_root_icon_page("root_intercom", "U:/intercom.png", "对讲机", self.show_intercom)
+        self._show_root_icon_page("root_intercom", "E:/intercom.png", "对讲机", self.show_intercom)
 
     def show_settings_root(self):
-        self._show_root_icon_page("root_settings", "U:/settings.png", "设置", self.show_settings)
+        self._show_root_icon_page("root_settings", "E:/settings.png", "设置", self.show_settings)
 
     def _refresh_location_page(self):
         labels = self._location_labels
         if not labels or self.current is None or self.current[0] != "location":
             return
-        service = getattr(self._poc_client, "gnss_service", None) if self._poc_client else None
-        gga = getattr(service, "last_gga", b"") if service else b""
-        if getattr(service, "last_success", False) and gga and gga != self._location_last_gga:
+        gga = ((self._poc_snapshot or {}).get("location_accepted_gga") or
+               b"")
+        if gga and gga != self._location_last_gga:
             fields = str(gga.decode("ascii") if isinstance(gga, bytes) else gga).split(",")
             if len(fields) >= 10:
                 def coord(raw, hemi):
@@ -3960,6 +4281,12 @@ class JingWuUI:
             labels["satellites"].set_text("卫星数量：" + sats)
         else:
             labels["address"].set_text("                定位中...")
+        if self._location_last_success:
+            labels["address"].set_text(
+                self._location_address or "定位成功")
+            labels["name"].set_text(self._location_name)
+        else:
+            labels["name"].set_text("")
         if self._location_time_base and self._location_ticks_base:
             try:
                 elapsed = utime.ticks_diff(utime.ticks_ms(), self._location_ticks_base) // 1000
@@ -3985,10 +4312,10 @@ class JingWuUI:
                     page.set_style_pad_left(0, lv.PART.MAIN | state)
                     page.set_style_pad_right(0, lv.PART.MAIN | state)
             self._settings_row(
-                page, page, 6, "U:/group_call.png", "组呼模式",
+                page, page, 6, "E:/group_call.png", "组呼模式",
                 lambda obj: self.show_group_mode())
             self._settings_row(
-                page, page, 72, "U:/single_call.png", "单呼模式",
+                page, page, 72, "E:/single_call.png", "单呼模式",
                 lambda obj: self.show_single_mode())
         self._load("intercom", page)
         if self._poc_client is not None:
@@ -4324,8 +4651,8 @@ class JingWuUI:
     def show_shoulder_menu(self):
         page, created = self._screen("shoulder_menu", "")
         if created:
-            self._settings_row(page, page, 6, "U:/shoulder_mode.png", "肩灯模式", lambda obj: self.show_shoulder_mode())
-            self._settings_row(page, page, 72, "U:/double_click_mode.png", "双击模式", lambda obj: self.show_double_click_mode())
+            self._settings_row(page, page, 6, "E:/shoulder_mode.png", "肩灯模式", lambda obj: self.show_shoulder_mode())
+            self._settings_row(page, page, 72, "E:/double_click_mode.png", "双击模式", lambda obj: self.show_double_click_mode())
         self._load("shoulder_menu", page)
 
     def show_shoulder_mode(self):
@@ -4409,14 +4736,14 @@ class JingWuUI:
             content = self._vertical_scroll_area(
                 page, STATUS_HEIGHT, PAGE_HEIGHT)
             items = (
-                ("U:/settings_device.png", "设备信息", self.show_device),
-                ("U:/settings_brightness.png", "屏幕亮度", self.show_brightness),
-                ("U:/settings_shoulder_brightness.png", "肩灯亮度",
+                ("E:/settings_device.png", "设备信息", self.show_device),
+                ("E:/settings_brightness.png", "屏幕亮度", self.show_brightness),
+                ("E:/settings_shoulder_brightness.png", "肩灯亮度",
                  self.show_shoulder_brightness),
-                ("U:/settings_volume.png", "音量", self.show_volume),
-                ("U:/settings_sleep.png", "息屏时间", self.show_sleep),
-                ("U:/settings_network.png", "网络状态", self.show_network),
-                ("U:/settings_fall_detection.png", "跌倒检测", self.show_fall_detection),
+                ("E:/settings_volume.png", "音量", self.show_volume),
+                ("E:/settings_sleep.png", "息屏时间", self.show_sleep),
+                ("E:/settings_network.png", "网络状态", self.show_network),
+                ("E:/settings_fall_detection.png", "跌倒检测", self.show_fall_detection),
             )
             for index, item in enumerate(items):
                 y = index * (SETTINGS_ROW_HEIGHT + SETTINGS_ROW_GAP)
@@ -4953,7 +5280,7 @@ class JingWuUI:
 
         # 使用现有扬声器图片，不显示亮度页的太阳图标和百分号。
         icon = lv.img(page)
-        icon.set_src("U:/settings_volume.png")
+        icon.set_src("E:/settings_volume.png")
         icon.set_size(40, 40)
         icon.set_pos(slider_x + (slider_width - 40) // 2, 164)
         _fix_position(icon)

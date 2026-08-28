@@ -13,12 +13,12 @@ import uos
 import checkNet
 from machine import WDT,Timer
 FIRMWARE_VER = modem.getDevFwVersion()  #获取到固件版本
-SOFTWARE_VER = "1.0.15"                  #软件版本
+SOFTWARE_VER = "1.0.16"                  #软件版本
 HARDWARE_VER = "1.0.0"                  #硬件版本
 # POC服务器参数集中放在启动入口，后续更换测试服务器无需修改业务模块。
 DEVICE_ID = "33030002002000000591"
-#POC_TCP_HOST = "125.124.233.231"
-POC_TCP_HOST = "68.95.0.31"
+#
+
 
 POC_TCP_PORT = 6060
 POC_RTP_LOCAL_PORT = DEFAULT_LOCAL_RTP_PORT
@@ -31,22 +31,66 @@ POC_TCP_RETRY_TIMEOUT_STEP_MS = 500
 # PCM使用4个底层周期缓冲；RTP接收先缓存5包（约100ms）再开始播放。
 POC_PCM_PERIOD_COUNT = 4
 POC_RTP_JITTER_PACKETS = 5
-#POC_HTTP_URL = (
-#    "http://125.124.233.231:18081/biz/deviceInfo/data?deviceId=" + DEVICE_ID)
+
+POC_TCP_HOST = "125.124.233.231"
+POC_HTTP_URL = (
+    "http://125.124.233.231:18081/biz/deviceInfo/data?deviceId=" + DEVICE_ID)
+POC_LOCATION_MAP_URL = (
+    "http://125.124.233.231:18081/biz/tile/crop?"
+    "lat={lat}&lon={lon}&width=252&height=210")
+POC_LOCATION_ADDRESS_URL = (
+    "http://125.124.233.231:18081/map/poi/selection?"
+    "longitude={lon}&latitude={lat}")
+'''
+POC_TCP_HOST = "68.95.0.31"
 POC_HTTP_URL = (
     "http://68.95.0.31:38080/biz/deviceInfo/data?deviceId=" + DEVICE_ID)
+POC_LOCATION_MAP_URL = (
+    "http://68.95.0.31:38080/biz/tile/crop?"
+    "lat={lat}&lon={lon}&width=252&height=210")
+POC_LOCATION_ADDRESS_URL = (
+    "http://68.95.0.31:38080/map/poi/selection?"
+    "longitude={lon}&latitude={lat}")
+'''
+def cleanup_location_map_temp_files():
+    """清理上次断电或脚本重启遗留的地图下载临时文件。"""
+    removed = 0
+    try:
+        names = uos.listdir("/ext")
+    except Exception as error:
+        print("[Flash] 地图临时文件扫描失败：{}".format(error))
+        return 0
+    for name in names:
+        name = str(name)
+        if (not name.startswith("location_map_") or
+                not name.endswith(".png.tmp")):
+            continue
+        path = "/ext/" + name
+        try:
+            uos.remove(path)
+            removed += 1
+            print("[Flash] 已清理地图临时文件：{}".format(path))
+        except Exception as error:
+            print("[Flash] 地图临时文件清理失败：{}，{}".format(
+                path, error))
+    print("[Flash] 地图临时文件清理完成：{}个".format(removed))
+    return removed
+
+
 def mount_external_flash():
     """在创建JingWuUI前挂载外置NOR Flash，供LVGL加载字体资源。"""
     try:
         device = uos.VfsLfs1(32, 32, 32, "ext_fs", 0, 2)
         uos.mount(device, "/ext")
         print("[Flash] 外置NOR Flash挂载成功：/ext")
+        cleanup_location_map_temp_files()
         return True
     except Exception as error:
         # 软重跑main.py时可能已经挂载；此时目录可读即可安全复用。
         try:
             uos.listdir("/ext")
             print("[Flash] 外置NOR Flash已挂载：/ext")
+            cleanup_location_map_temp_files()
             return True
         except Exception:
             print("[Flash] 外置NOR Flash挂载失败：{}".format(error))
@@ -65,7 +109,7 @@ if __name__ == "__main__":
     # 给 LCD 电源和控制器留出稳定时间，不再固定黑屏等待 10 秒。
     #utime.sleep_ms(100)
     mount_external_flash()
-    print("开机原因：",Power.powerOnReason())
+    print("开机原因112221：",Power.powerOnReason())
     print("关机原因：",Power.powerDownReason())
 
     wdt = WDT(20)  # 启动看门狗，设置超时时间
@@ -84,6 +128,8 @@ if __name__ == "__main__":
         tcp_host=POC_TCP_HOST,
         tcp_port=POC_TCP_PORT,
         http_url=POC_HTTP_URL,
+        location_map_url=POC_LOCATION_MAP_URL,
+        location_address_url=POC_LOCATION_ADDRESS_URL,
         network_monitor=network_monitor,
         gnss_upload_interval_ms=POC_GNSS_UPLOAD_INTERVAL_MS,
         tcp_max_retries=POC_TCP_MAX_RETRIES,
@@ -116,10 +162,11 @@ if __name__ == "__main__":
     hardware_key_service = HardwareKeyService(
         rtp_audio,
         on_activity=ui.notify_activity,
-        ptt_gpio=29,
+        ptt_gpio=22,#28,
         volume_up_gpio=30,
         volume_down_gpio=31,
     )
     if not hardware_key_service.start():
         print("[按键] 物理按键服务未能启动")
     ui.run()
+
