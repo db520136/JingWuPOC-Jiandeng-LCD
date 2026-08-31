@@ -2218,8 +2218,21 @@ class JingWuUI:
         return (not self._back_animating and self.current is not None and
                 not self._is_root_page() and bool(self.stack))
 
+    def _set_location_ui_busy(self, busy):
+        """Tell the client to yield map I/O during LCD navigation."""
+        if self._poc_client is None:
+            return
+        setter = getattr(self._poc_client, "set_location_ui_busy", None)
+        if setter is None:
+            return
+        try:
+            setter(bool(busy))
+        except Exception as error:
+            print("[Location] LCD busy state update failed: {}".format(error))
+
     def _clear_back_drag_state(self):
         """清除一次右滑跟踪状态，不改变任何页面的显示位置。"""
+        self._set_location_ui_busy(False)
         self._back_drag_tracking = False
         self._back_drag_active = False
         self._back_drag_start = None
@@ -2258,6 +2271,7 @@ class JingWuUI:
         if (self._back_drag_current is None or
                 self._back_drag_previous is None):
             return False
+        self._set_location_ui_busy(True)
         current_page = self._back_drag_current[1]
         previous_page = self._back_drag_previous[1]
         self._set_page_visible(previous_page, True)
@@ -2525,7 +2539,14 @@ class JingWuUI:
         self._back_anim_duration_ms = 0
         self._back_anim_last_frame_ms = 0
         self._back_anim_finish_pending = False
+        self._set_location_ui_busy(False)
         self._clear_back_drag_state()
+        if (self.current is not None and
+                self.current[0] == "location_detail"):
+            # A snapshot received during the swipe was intentionally deferred
+            # until the page was stable; apply it once at the end.
+            self._refresh_location_map()
+            self._sync_location_loading_overlay()
 
     def _start_programmatic_back(self):
         """坐标接口不可用时，收到硬件右滑后播放完整线性返回动画。"""
@@ -2804,6 +2825,7 @@ class JingWuUI:
         if previous is not None and previous[0] == key:
             self._sync_police_status_visibility(key)
             return
+        self._set_location_ui_busy(True)
         if push_history and previous is not None:
             self.stack.append(previous)
         if previous is not None:
@@ -2834,6 +2856,7 @@ class JingWuUI:
                 except Exception:
                     pass
         self._pending_gc = True
+        self._set_location_ui_busy(False)
 
     def _screen(self, key, title):
         """按页面名称创建一次屏幕；后续进入同一页面时直接复用。"""
@@ -3988,7 +4011,8 @@ class JingWuUI:
             if self.current is not None:
                 if self.current[0] == "location":
                     self._refresh_location_page()
-                elif self.current[0] == "location_detail":
+                elif (self.current[0] == "location_detail" and
+                      not self._back_transition_active()):
                     self._refresh_location_map()
         refresh_revision = int(snapshot.get("location_refresh_revision") or 0)
         if refresh_revision != self._location_refresh_revision_seen:

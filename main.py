@@ -13,10 +13,10 @@ import uos
 import checkNet
 from machine import WDT,Timer
 FIRMWARE_VER = modem.getDevFwVersion()  #获取到固件版本
-SOFTWARE_VER = "1.0.16"                  #软件版本
+SOFTWARE_VER = "1.0.17"                  #软件版本
 HARDWARE_VER = "1.0.0"                  #硬件版本
 # POC服务器参数集中放在启动入口，后续更换测试服务器无需修改业务模块。
-DEVICE_ID = "33030002002000000591"
+DEVICE_ID = "33030002002000000590"
 #
 
 
@@ -31,7 +31,7 @@ POC_TCP_RETRY_TIMEOUT_STEP_MS = 500
 # PCM使用4个底层周期缓冲；RTP接收先缓存5包（约100ms）再开始播放。
 POC_PCM_PERIOD_COUNT = 4
 POC_RTP_JITTER_PACKETS = 5
-
+'''
 POC_TCP_HOST = "125.124.233.231"
 POC_HTTP_URL = (
     "http://125.124.233.231:18081/biz/deviceInfo/data?deviceId=" + DEVICE_ID)
@@ -51,7 +51,7 @@ POC_LOCATION_MAP_URL = (
 POC_LOCATION_ADDRESS_URL = (
     "http://68.95.0.31:38080/map/poi/selection?"
     "longitude={lon}&latitude={lat}")
-'''
+
 def cleanup_location_map_temp_files():
     """清理上次断电或脚本重启遗留的地图下载临时文件。"""
     removed = 0

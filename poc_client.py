@@ -42,6 +42,10 @@ TCP_SIGNAL_NAMES = {
 }
 # GNSS初始化失败后延迟重试，避免主循环高频调用底层硬件接口。
 GNSS_INIT_RETRY_INTERVAL_MS = 10000
+# Keep map I/O preemptible on the embedded scheduler.  The delay is applied
+# between response chunks, never while holding the business lock.
+LOCATION_MAP_IO_YIELD_MS = 1
+LOCATION_MAP_PAUSE_POLL_MS = 100
 
 try:
     import _thread
@@ -65,6 +69,11 @@ except Exception:
         import json as _json
     except Exception:
         _json = None
+
+
+class _LocationMapPaused(Exception):
+    """Raised at a safe boundary when a higher-priority event takes over."""
+
 
 try:
     from usr.poc_protocol import (FrameParser, build_frame,
@@ -301,6 +310,11 @@ class POCClient:
         self._location_map_fix_revision = -1
         self._location_map_request_revision = None
         self._location_detail_active = False
+        # The LCD uses this flag for page transitions.  It is deliberately
+        # separate from detail visibility: leaving the map page must not
+        # cancel an already queued download.
+        self._location_map_ui_busy = False
+        self._location_map_cleanup_pending = []
         self._location_last_coordinates = None
         self.join_state = "idle"
         self.join_error = None
@@ -581,6 +595,58 @@ class POCClient:
             self.pending_floor_group_id is not None or
             self._floor_request_action is not None)
 
+    def _location_map_pause_active(self):
+        """Return whether map I/O must yield to audio or LCD transitions."""
+        return bool(self._gnss_pause_active() or
+                    self._location_map_ui_busy)
+
+    def _location_map_pause_checkpoint(self):
+        """Abort one map image at a safe response/Flash chunk boundary."""
+        if self._location_map_pause_active():
+            raise _LocationMapPaused()
+
+    def set_location_ui_busy(self, busy):
+        """Pause map publication/I/O while the LCD is moving between pages."""
+        self._location_map_ui_busy = bool(busy)
+        if not busy:
+            # A worker can finish while navigation is active. Process any
+            # deferred bank cleanup when the LCD becomes idle again.
+            self._process_location_map_cleanup()
+
+    def _queue_location_map_cleanup(self, level, keep_lvgl_path):
+        item = (int(level), str(keep_lvgl_path))
+        self._lock_acquire()
+        try:
+            if item not in self._location_map_cleanup_pending:
+                self._location_map_cleanup_pending.append(item)
+        finally:
+            self._lock_release()
+
+    def _process_location_map_cleanup(self):
+        """Remove old map banks only while no realtime/UI work is active."""
+        if self._location_map_pause_active():
+            return
+        self._lock_acquire()
+        try:
+            pending = list(self._location_map_cleanup_pending)
+            self._location_map_cleanup_pending = []
+        finally:
+            self._lock_release()
+        for level, keep_path in pending:
+            if self._location_map_pause_active():
+                self._queue_location_map_cleanup(level, keep_path)
+                break
+            self._lock_acquire()
+            try:
+                current_path = self._location_map_paths.get(level)
+            finally:
+                self._lock_release()
+            # A newer map may have reused the other Flash bank while this
+            # cleanup was deferred. Never let a stale cleanup delete it.
+            if str(current_path or "") != str(keep_path):
+                continue
+            self._cleanup_old_location_map_level(level, keep_path)
+
     @staticmethod
     def _time_reached(deadline_ms, now_ms=None):
         if deadline_ms is None:
@@ -801,10 +867,10 @@ class POCClient:
             if (fix_revision is not None and
                     self._location_map_request_revision !=
                     int(fix_revision)):
-                return
+                return False
             if (not self._location_map_loading_levels and
                     self._location_map_request_revision is None):
-                return
+                return False
             self._location_map_loading_levels = []
             self._location_map_request_revision = None
             self._location_result_revision += 1
@@ -812,6 +878,7 @@ class POCClient:
         finally:
             self._lock_release()
         print("[Location][Map] remaining zoom downloads stopped")
+        return True
 
     @staticmethod
     def _response_json(response):
@@ -999,9 +1066,17 @@ class POCClient:
             chunks.append(bytes(chunk))
         return b"".join(chunks)
 
-    def _location_get(self, url, accept):
-        while self._running and self._gnss_pause_active():
-            utime.sleep_ms(100)
+    def _location_get(self, url, accept, map_io=False):
+        # Map requests are lower priority than audio and LCD navigation. Wait
+        # before opening the socket so an intercom event never competes with a
+        # new map connection.
+        if map_io:
+            while self._running and self._location_map_pause_active():
+                utime.sleep_ms(LOCATION_MAP_PAUSE_POLL_MS)
+            self._location_map_pause_checkpoint()
+        else:
+            while self._running and self._gnss_pause_active():
+                utime.sleep_ms(LOCATION_MAP_PAUSE_POLL_MS)
         response = request.get(url, headers={"Accept": accept})
         status = getattr(response, "status_code", 0)
         print("[Location][HTTP] response received: accept={}, "
@@ -1121,7 +1196,7 @@ class POCClient:
         try:
             print("-----------------------------HTTP获取照片{}-----------------------".format(temp_path))
             print("[Location][Map PNG HTTP] request: {}".format(url))
-            response = self._location_get(url, "image/png")
+            response = self._location_get(url, "image/png", map_io=True)
             total = 0
             chunk_count = 0
             header = bytearray()
@@ -1130,6 +1205,7 @@ class POCClient:
             print("-----------------------------HTTP获取照片结束，开始下载到FLASH{}-----------------------".format(temp_path))
             with open(temp_path, "wb") as output:
                 for data in self._response_binary_chunks(response):
+                    self._location_map_pause_checkpoint()
                     if len(header) < 8:
                         remaining = 8 - len(header)
                         header.extend(data[:remaining])
@@ -1139,10 +1215,13 @@ class POCClient:
                     output.write(data)
                     total += len(data)
                     chunk_count += 1
+                    self._location_map_pause_checkpoint()
+                    utime.sleep_ms(LOCATION_MAP_IO_YIELD_MS)
             print("[Location][Map PNG HTTP] response: status={}, chunks={}, "
                   "length={}, expected={}".format(
                       getattr(response, "status_code", 0), chunk_count,
                       total, expected_length))
+            self._location_map_pause_checkpoint()
             if total <= 0:
                 raise RuntimeError("empty PNG response")
             if bytes(header) != b"\x89PNG\r\n\x1a\n":
@@ -1156,10 +1235,17 @@ class POCClient:
                     "incomplete PNG: IEND marker missing, length={}".format(
                         total))
             print("-----------------------------下载FLASH结束，移除旧空间{}-----------------------".format(temp_path))
+            self._location_map_pause_checkpoint()
             try:
+                self._location_map_pause_checkpoint()
                 uos.remove(path)
+            except _LocationMapPaused:
+                raise
             except Exception:
                 pass
+            # Removal and rename form one short publication boundary. Once
+            # the completed temporary file is ready, do not abort between
+            # them or the previously valid formal file could be lost.
             uos.rename(temp_path, path)
             try:
                 saved_size = int(uos.stat(path)[6])
@@ -1262,8 +1348,11 @@ class POCClient:
         try:
             url = self.location_map_url.format(lat=lat, lon=lon)
             print("[Location][Map HTTP] request: {}".format(url))
-            response = self._location_get(url, "application/json")
+            self._location_map_pause_checkpoint()
+            response = self._location_get(url, "application/json", map_io=True)
+            self._location_map_pause_checkpoint()
             payload = self._response_json(response)
+            self._location_map_pause_checkpoint()
             print("[Location][Map HTTP] response: {}".format(payload))
             code = int(payload.get("code", -2)) if isinstance(payload, dict) else -2
             if code == -1:
@@ -1282,8 +1371,10 @@ class POCClient:
                 # detail page can display quickly; 16 and 18 continue in the
                 # same background worker and are published independently.
                 for level in (17, 16, 18):
+                    self._location_map_pause_checkpoint()
                     file_path, lvgl_path = self._next_location_map_file(level)
                     self._download_location_png(urls[level], file_path)
+                    self._location_map_pause_checkpoint()
                     if not self._publish_location_map_level(
                             level, lvgl_path, latitude, longitude,
                             fix_revision):
@@ -1300,8 +1391,13 @@ class POCClient:
                 # levels are ready. This avoids deleting a file still used by
                 # the LCD main loop while it is busy with audio or navigation.
                 for level in (17, 16, 18):
-                    self._cleanup_old_location_map_level(
-                        level, map_paths[level])
+                    if self._location_map_pause_active():
+                        self._queue_location_map_cleanup(
+                            level, map_paths[level])
+                    else:
+                        self._location_map_pause_checkpoint()
+                        self._cleanup_old_location_map_level(
+                            level, map_paths[level])
                 self._lock_acquire()
                 try:
                     if int(fix_revision) == self._location_fix_revision:
@@ -1346,6 +1442,10 @@ class POCClient:
     def _location_http_worker(self):
         while self._running:
             try:
+                # Wait before taking work from the queue while realtime audio
+                # or a page transition is active. A queued map stays intact.
+                while self._running and self._location_map_pause_active():
+                    utime.sleep_ms(LOCATION_MAP_PAUSE_POLL_MS)
                 self._lock_acquire()
                 try:
                     address_work = self._location_address_pending
@@ -1357,9 +1457,8 @@ class POCClient:
                 finally:
                     self._lock_release()
                 if address_work is None and map_work is None:
+                    self._process_location_map_cleanup()
                     return
-                while self._running and self._gnss_pause_active():
-                    utime.sleep_ms(100)
                 if address_work is not None:
                     try:
                         self._fetch_location_address(*address_work)
@@ -1369,17 +1468,48 @@ class POCClient:
                 if map_work is not None:
                     latitude, longitude, fix_revision, manual = map_work
                     success = False
+                    paused = False
+                    failure_handled = False
                     try:
                         success = bool(self._fetch_location_map(
                             latitude, longitude, fix_revision))
+                    except _LocationMapPaused:
+                        # The current response/temporary file has already
+                        # been closed and removed by _download_location_png.
+                        # Requeue only when no newer fix replaced this work.
+                        paused = True
+                        self._lock_acquire()
+                        try:
+                            current_request = (
+                                self._location_map_request_revision ==
+                                fix_revision)
+                            pending = self._location_map_pending
+                            if current_request and pending is None:
+                                self._location_map_pending = map_work
+                            elif (current_request and pending is not None and
+                                  int(pending[2]) == int(fix_revision)):
+                                self._location_map_pending = (
+                                    pending[0], pending[1], pending[2],
+                                    bool(pending[3] or manual))
+                        finally:
+                            self._lock_release()
+                        print("[Location][Map] paused by realtime/UI event; "
+                              "work requeued: revision={}".format(
+                                  fix_revision))
                     except Exception as error:
                         print("[Location] map request failed: {}".format(error))
-                        self._finish_location_map_loading_failed(fix_revision)
+                        failure_handled = bool(
+                            self._finish_location_map_loading_failed(fix_revision))
+                    if paused:
+                        self._process_location_map_cleanup()
+                        continue
                     self._lock_acquire()
                     try:
                         current_request = (
                             self._location_map_request_revision ==
                             fix_revision)
+                        if failure_handled:
+                            current_request = True
                         if current_request:
                             self._location_map_request_revision = None
                         if manual and current_request:
@@ -1389,6 +1519,7 @@ class POCClient:
                     if manual and current_request:
                         self._finish_location_refresh(
                             "success" if success else "failed")
+                self._process_location_map_cleanup()
             except Exception as error:
                 print("[Location] HTTP worker failed: {}".format(error))
                 self._lock_acquire()
