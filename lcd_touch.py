@@ -59,11 +59,11 @@ LCD_WIDTH = 296
 LCD_HEIGHT = 240
 STATUS_HEIGHT = 30
 PAGE_HEIGHT = LCD_HEIGHT - STATUS_HEIGHT
-# 绘制缓冲提高到60行，减少整页平移时的分块刷新次数。
-DISPLAY_BUFFER_LINES = 60
+# 提高滚动刷新块行数，减少一帧内的 LVGL 分块与 LCD 提交次数。
+DISPLAY_BUFFER_LINES = 90
 # EC800M 的 lcd_write() 在部分固件中会异步持有刷新缓冲区。页面平移期间
 # 如果同时启用LVGL双缓冲，下一帧可能覆盖上一帧仍在发送的数据，导致花屏
-# 甚至异常重启。保留60行单缓冲，待底层驱动确认同步发送后再开启双缓冲。
+# 甚至异常重启。保留单缓冲，待底层驱动确认同步发送后再开启双缓冲。
 DISPLAY_ENABLE_DOUBLE_BUFFER = False
 # 显式开启双缓冲时仍需为页面、字体、图片和业务对象保留的堆空间。
 DISPLAY_DOUBLE_BUFFER_RESERVE = 160 * 1024
@@ -86,6 +86,8 @@ LANDSCAPE_GESTURE_MAP = {
 }
 # 手指移动超过此距离即判定为滑动，不再触发点击。
 CLICK_MOVE_LIMIT = 12
+# CLICKED 事件延迟一小段时间，等待原生滚动或硬件手势确认，避免快速滑动误点击。
+CLICK_DISPATCH_GUARD_MS = 100
 # 右滑开始跟手的最小位移。独立于点击阈值，快速滑动时更容易及时接管。
 BACK_DRAG_START_DISTANCE = 8
 # 右滑达到屏幕宽度约四分之一后完成返回，否则松手时回弹。
@@ -167,11 +169,13 @@ SETTINGS_ICON_BOX_SIZE = 48
 SETTINGS_ICON_BOX_X = 6
 SETTINGS_ICON_BOX_Y = (SETTINGS_ROW_HEIGHT - SETTINGS_ICON_BOX_SIZE) // 2
 SETTINGS_LABEL_X = SETTINGS_ICON_BOX_X + SETTINGS_ICON_BOX_SIZE + 4
-# 设置页释放后的惯性衰减参数；从 25 调到 12，滑行距离约增强为当前的 2 倍。
-SETTINGS_SCROLL_THROW = 12
-# 设置页跟手滚动倍率；原生 1 倍位移再补 2 倍，合计约 3 倍。
-SETTINGS_SCROLL_MULTIPLIER = 3
-# 设置页点击判定使用更小的位移阈值，优先把上下拖动识别为滑动。
+# 所有纵向菜单共用的 LVGL 原生惯性衰减参数；数值增大后松手减速更快，
+# 可降低触摸采样抖动造成的惯性距离差异。
+SETTINGS_SCROLL_THROW = 20
+SETTINGS_SCROLL_LIMIT = 8
+# 动态名单只在原生滚动停止后更新，避免滚动动画中改变行坐标和内容高度。
+MENU_SCROLL_SETTLE_MS = 100
+# 菜单页点击阈值略小于普通页面，优先把上下拖动识别为滑动。
 SETTINGS_CLICK_MOVE_LIMIT = 8
 SETTINGS_ROW_BG = 0x2D2D2D
 # 滚动过程中不切换菜单行底色，避免按压态反复出现造成水波纹闪动。
@@ -564,7 +568,12 @@ class JingWuUI:
         self._location_refresh_overlay = None
         self._pending_root_swipe = None
         self._pending_back = False
+        self._touch_sequence_id = 0
         self._touch_sequence_swipe = False
+        self._pending_click_dispatch = None
+        self._touch_sequence_start = None
+        self._touch_sequence_max_dx = 0
+        self._touch_sequence_max_dy = 0
         self._pointer_point = None
         self._pending_gc = False
         self._back_drag_tracking = False
@@ -633,10 +642,11 @@ class JingWuUI:
         self._click_targets = []
         self._click_area = None
         self._click_dispatched = False
-        # 当前是否仍处于按住状态；设置页只在按住拖动阶段放大位移。
+        # 当前是否仍处于按住状态，供点击过滤和页面返回手势判断。
         self._touch_pressed = False
         self._event_callbacks = []
         self._scroll_containers = []
+        self._last_menu_scroll_ms = None
         self._sleep_scroll_positions = []
         self.brightness = BRIGHTNESS_DEFAULT
         self._sleep_brightness = BRIGHTNESS_DEFAULT
@@ -702,12 +712,12 @@ class JingWuUI:
             print("[LCD] 启动首帧刷新失败：{}".format(error))
 
     def _init_display(self):
-        # 第一块60行绘制缓冲和持久发送缓冲是基础配置。
+        # 第一块绘制缓冲和持久发送缓冲是基础配置。
         self._display_buffer = bytearray(
             LCD_WIDTH * DISPLAY_BUFFER_LINES * 2)
         global FLUSH_BUFFER, FLUSH_TAIL_BUFFER
         FLUSH_BUFFER = bytearray(len(self._display_buffer))
-        # 页面内容区为210行，使用60行缓冲时最后一块是30行；长期复用该
+        # 页面内容区为210行，按当前缓冲行数计算最后一块；长期复用该
         # 尾块，避免每一帧动画都临时分配约17.8KB。
         tail_lines = max(
             LCD_HEIGHT % DISPLAY_BUFFER_LINES,
@@ -737,7 +747,7 @@ class JingWuUI:
                     self._display_buffer, secondary, buffer_size)
                 self._display_buffer_secondary = secondary
                 self._display_double_buffered = True
-                print("[LCD] 显示缓冲：60行双缓冲")
+                print("[LCD] 显示缓冲：{}行双缓冲".format(DISPLAY_BUFFER_LINES))
             except Exception as error:
                 # 分配失败时释放第二块缓冲，再创建安全单缓冲。
                 self._display_buffer_secondary = None
@@ -745,7 +755,8 @@ class JingWuUI:
                 self._draw_buffer.init(
                     self._display_buffer, None, buffer_size)
                 gc.collect()
-                print("[LCD] 显示缓冲：60行单缓冲，双缓冲失败：{}".format(
+                print("[LCD] 显示缓冲：{}行单缓冲，双缓冲失败：{}".format(
+                    DISPLAY_BUFFER_LINES,
                     error))
         else:
             # 当前EC800M配置固定使用安全单缓冲，不通过异常流程重复创建对象。
@@ -753,7 +764,8 @@ class JingWuUI:
             self._draw_buffer.init(
                 self._display_buffer, None, buffer_size)
             gc.collect()
-            print("[LCD] 显示缓冲：60行安全单缓冲")
+            print("[LCD] 显示缓冲：{}行安全单缓冲".format(
+                DISPLAY_BUFFER_LINES))
         self._display_driver = lv.disp_drv_t()
         self._display_driver.init()
         self._display_driver.draw_buf = self._draw_buffer
@@ -935,14 +947,19 @@ class JingWuUI:
         # LVGL 会在轮询输入设备时按固件约定自动调用它。
         self._touch_driver.read_cb = self.tp.read
         self._touch_driver.long_press_time = 80
-        # 设置菜单启用释放惯性，让快速上滑/下滑时松手后继续滑行。
+        # 纵向菜单启用 LVGL 原生释放惯性，让快速上滑/下滑松手后继续滑行。
         try:
             self._touch_driver.scroll_throw = SETTINGS_SCROLL_THROW
         except Exception:
             pass
         try:
-            # 让 LVGL 手势阈值与点击位移阈值一致，作为坐标判断的双重保护。
-            self._touch_driver.gesture_limit = CLICK_MOVE_LIMIT
+            # 原生滚动尽早接管垂直拖动，避免少量采样点被当成点击。
+            self._touch_driver.scroll_limit = SETTINGS_SCROLL_LIMIT
+        except Exception:
+            pass
+        try:
+            # 手势阈值与菜单点击阈值一致，作为坐标判断的双重保护。
+            self._touch_driver.gesture_limit = SETTINGS_CLICK_MOVE_LIMIT
         except Exception:
             pass
         self._touch_input = self._touch_driver.register()
@@ -1868,6 +1885,14 @@ class JingWuUI:
         if (self._poc_call_active or self._is_audio_priority_active() or
                 self._poc_popup_frame_pending_revision is not None):
             return
+        if (self.current is not None and
+                self.current[0] in ("group_mode", "single_mode")):
+            if self._touch_pressed:
+                return
+            last_scroll = self._last_menu_scroll_ms
+            if (last_scroll is not None and
+                    self._ticks_since(last_scroll) < MENU_SCROLL_SETTLE_MS):
+                return
         self._pending_intercom_data = None
         self._apply_intercom_data(pending[0], pending[1])
         self._poc_http_data_applied = True
@@ -2559,12 +2584,112 @@ class JingWuUI:
             return False
         return self._start_back_complete()
 
+    def _begin_touch_sequence(self):
+        """Start one shared touch sequence for page and child callbacks."""
+        if not self._touch_pressed:
+            self._touch_sequence_id += 1
+            self._touch_sequence_swipe = False
+            self._click_dispatched = False
+            self._touch_point_cache = None
+            self._touch_sequence_start = None
+            self._touch_sequence_max_dx = 0
+            self._touch_sequence_max_dy = 0
+            # 上一段触摸留下的点击不能跨序列执行，尤其是在固件延迟
+            # 上报 CLICKED/RELEASED 的情况下。
+            self._pending_click_dispatch = None
+        self._touch_pressed = True
+
+    def _record_touch_point(self, point):
+        """记录本次触摸的最大位移，补足稀疏 PRESSING 事件的判断。"""
+        if point is None:
+            return
+        if self._touch_sequence_start is None:
+            self._touch_sequence_start = point
+            self._touch_sequence_max_dx = 0
+            self._touch_sequence_max_dy = 0
+            return
+        dx = abs(int(point[0]) - int(self._touch_sequence_start[0]))
+        dy = abs(int(point[1]) - int(self._touch_sequence_start[1]))
+        if dx > self._touch_sequence_max_dx:
+            self._touch_sequence_max_dx = dx
+        if dy > self._touch_sequence_max_dy:
+            self._touch_sequence_max_dy = dy
+        limit = self._click_move_limit()
+        if dx > limit or dy > limit:
+            self._mark_touch_sequence_swipe()
+
+    def _mark_touch_sequence_swipe(self):
+        """Lock the active sequence as a swipe without moving any object."""
+        self._touch_sequence_swipe = True
+        self._click_dispatched = True
+        pending = self._pending_click_dispatch
+        if (pending is not None and
+                pending[0] == self._touch_sequence_id):
+            self._pending_click_dispatch = None
+
+    def _queue_click_dispatch(self, point=None, preferred_obj=None):
+        """Delay one click until native scroll/gesture processing settles."""
+        if (self.current is None or self._selection_popup_visible or
+                self._back_animating or self._touch_sequence_swipe):
+            return False
+
+        pending = self._pending_click_dispatch
+        if (pending is not None and
+                pending[0] == self._touch_sequence_id):
+            # Page and row callbacks can observe the same CLICKED event. Keep
+            # the more precise child object when it becomes available.
+            if pending[3] is None and preferred_obj is not None:
+                self._pending_click_dispatch = (
+                    pending[0], pending[1], pending[2], preferred_obj,
+                    pending[4])
+            return True
+        if self._click_dispatched:
+            return False
+
+        self._click_dispatched = True
+        now = utime.ticks_ms()
+        self._pending_click_dispatch = (
+            self._touch_sequence_id, self.current, point, preferred_obj,
+            now + CLICK_DISPATCH_GUARD_MS)
+        return True
+
+    def _process_pending_click(self):
+        """Dispatch a queued tap only after the swipe guard interval."""
+        pending = self._pending_click_dispatch
+        if pending is None:
+            return
+        sequence_id, page, point, preferred_obj, deadline = pending
+        # A CLICKED event can be delivered before RELEASED on some bindings;
+        # wait until the active touch is released before dispatching.
+        if sequence_id == self._touch_sequence_id and self._touch_pressed:
+            return
+        try:
+            if utime.ticks_diff(utime.ticks_ms(), deadline) < 0:
+                return
+        except Exception:
+            if utime.ticks_ms() < deadline:
+                return
+
+        self._pending_click_dispatch = None
+        if (self._selection_popup_visible or self._back_animating or
+                page is not self.current):
+            return
+        if (sequence_id == self._touch_sequence_id and
+                self._touch_sequence_swipe):
+            return
+        if (sequence_id == self._touch_sequence_id and
+                (self._touch_sequence_max_dx > self._click_move_limit() or
+                 self._touch_sequence_max_dy > self._click_move_limit())):
+            return
+        self._dispatch_click(point, preferred_obj)
+
     def _bind_page_swipe(self, page):
         """页面统一接收点击和滑动，避免横屏旋转后的点击落空。"""
         press_state = [None, False]
 
         def update_movement(event=None):
             point = self._get_pointer_point(event)
+            self._record_touch_point(point)
             start = press_state[0]
             if point is None or start is None:
                 return point
@@ -2572,6 +2697,7 @@ class JingWuUI:
             if (abs(point[0] - start[0]) > move_limit or
                     abs(point[1] - start[1]) > move_limit):
                 press_state[1] = True
+                self._mark_touch_sequence_swipe()
             return point
 
         def page_event(*args):
@@ -2593,12 +2719,9 @@ class JingWuUI:
                 return
 
             if code == lv.EVENT.PRESSED:
-                self._touch_pressed = True
-                self._touch_sequence_swipe = False
-                self._click_dispatched = False
-                # 新触摸序列不得复用上一次点击留下的坐标。
-                self._touch_point_cache = None
+                self._begin_touch_sequence()
                 point = self._get_pointer_point(event)
+                self._record_touch_point(point)
                 press_state[0] = point
                 press_state[1] = False
                 self._back_drag_press(point)
@@ -2606,21 +2729,21 @@ class JingWuUI:
                 self._back_drag_move(update_movement(event))
             elif code == lv.EVENT.GESTURE:
                 press_state[1] = True
-                self._touch_sequence_swipe = True
+                self._mark_touch_sequence_swipe()
             elif code == lv.EVENT.RELEASED:
                 self._touch_pressed = False
                 if self._back_drag_release(update_movement(event)):
                     press_state[1] = True
             elif code == lv.EVENT.CLICKED:
-                self._touch_pressed = False
                 point = update_movement(event)
                 if (not press_state[1] and
                         not self._touch_sequence_swipe and
                         not self._back_animating and
                         not self._click_dispatched):
                     # 即使 LVGL 按竖屏原始坐标把事件交给了页面空白区，
-                    # 仍按转换后的横屏坐标命中实际菜单行。
-                    self._click_dispatched = self._dispatch_click(point)
+                    # 仍按转换后的横屏坐标命中实际菜单行；点击先暂存，
+                    # 等待原生滚动/硬件手势确认后再执行。
+                    self._queue_click_dispatch(point)
                 press_state[0] = None
                 press_state[1] = False
 
@@ -2641,6 +2764,7 @@ class JingWuUI:
 
         def update_movement(event=None):
             point = self._get_pointer_point(event)
+            self._record_touch_point(point)
             start = press_state[0]
             if point is None or start is None:
                 return point
@@ -2648,6 +2772,7 @@ class JingWuUI:
             if (abs(point[0] - start[0]) > move_limit or
                     abs(point[1] - start[1]) > move_limit):
                 press_state[1] = True
+                self._mark_touch_sequence_swipe()
             return point
 
         def pointer_event(*args):
@@ -2663,14 +2788,11 @@ class JingWuUI:
                 return
 
             if code == lv.EVENT.PRESSED:
-                self._touch_pressed = True
-                # 新触摸序列先清空旧坐标，CLICKED 只能回退到本次序列缓存。
-                self._touch_point_cache = None
-                self._click_dispatched = False
+                self._begin_touch_sequence()
                 point = self._get_pointer_point(event)
+                self._record_touch_point(point)
                 press_state[0] = point
                 press_state[1] = False
-                self._touch_sequence_swipe = False
                 self._back_drag_press(point)
             elif code == lv.EVENT.PRESSING:
                 self._back_drag_move(update_movement(event))
@@ -2680,15 +2802,14 @@ class JingWuUI:
                     press_state[1] = True
             elif code == lv.EVENT.GESTURE:
                 press_state[1] = True
-                self._touch_sequence_swipe = True
+                self._mark_touch_sequence_swipe()
             elif code == lv.EVENT.CLICKED:
-                self._touch_pressed = False
                 point = update_movement(event)
                 if (not press_state[1] and
                         not self._touch_sequence_swipe and
                         not self._back_animating and
                         not self._click_dispatched):
-                    self._click_dispatched = self._dispatch_click(point, obj)
+                    self._queue_click_dispatch(point, obj)
                 press_state[0] = None
                 press_state[1] = False
 
@@ -2713,7 +2834,7 @@ class JingWuUI:
         gesture = LANDSCAPE_GESTURE_MAP.get(raw_gesture, raw_gesture)
         if self._selection_popup_visible:
             # 确认框期间屏蔽硬件滑动手势，按钮点击仍由按钮事件处理。
-            self._touch_sequence_swipe = True
+            self._mark_touch_sequence_swipe()
             return
         names = {
             0: "右滑",
@@ -2735,7 +2856,7 @@ class JingWuUI:
             return
         if gesture in (0, 1, 2, 3, 4, 6):
             # 硬件手势作为坐标位移判断之外的第二道滑动确认。
-            self._touch_sequence_swipe = True
+            self._mark_touch_sequence_swipe()
         if (gesture in (0, 4, 6) and self.current and
                 not self._is_root_page()):
             # 先锁存硬件确认，再由主循环安全地处理页面动画。这样即使
@@ -2938,104 +3059,88 @@ class JingWuUI:
             lv.PART.MAIN)
         return label
 
-    def _bind_vertical_scroll_speed(self, content):
-        """将纵向菜单的跟手位移放大到约 3 倍，并保持边界限制。"""
-        state = [None, False]
+    def _bind_native_scroll_guard(self, content):
+        """Mark LVGL native scrolling as a gesture and suppress clicks."""
+        def _native_on_scroll(*args):
+            # Scrolling is performed entirely by LVGL. This callback only
+            # prevents RELEASED/CLICKED from dispatching a menu action.
+            self._last_menu_scroll_ms = utime.ticks_ms()
+            # 松手后的惯性动画仍会触发 SCROLL；没有活动触摸或待处理点击
+            # 时不要污染下一次触摸序列的状态。
+            if (self._touch_pressed or
+                    self._pending_click_dispatch is not None):
+                self._mark_touch_sequence_swipe()
 
-        def read_scroll_y():
-            try:
-                return int(content.get_scroll_y())
-            except Exception:
-                try:
-                    return int(lv.obj_get_scroll_y(content))
-                except Exception:
-                    return None
-
-        def scroll_by_bounded(delta_y):
-            """优先使用 LVGL 有边界版本，避免放大位移越过首尾。"""
-            delta_y = int(delta_y)
-            if delta_y == 0:
-                return False
-            try:
-                content.scroll_by_bounded(0, delta_y, lv.ANIM.OFF)
-                return True
-            except Exception:
-                try:
-                    lv.obj_scroll_by_bounded(
-                        content, 0, delta_y, lv.ANIM.OFF)
-                    return True
-                except Exception:
-                    return False
-
-        def on_scroll(*args):
-            if state[1]:
-                return
-            current = read_scroll_y()
-            if current is None:
-                return
-            previous = state[0]
-            state[0] = current
-            if previous is None:
-                return
-
-            # 原生滚动已经移动 1 倍，这里只补充剩余 2 倍，合计约 3 倍。
-            delta_y = current - previous
-            if delta_y == 0:
-                return
-            # 设置容器一旦发生真实滚动，本次触摸就不能再派发点击。
-            self._touch_sequence_swipe = True
-            # 松手后的惯性只由 LVGL 原生路径处理，避免再次放大造成波纹抖动。
-            if not self._touch_pressed:
-                return
-            extra = delta_y * (SETTINGS_SCROLL_MULTIPLIER - 1)
-            state[1] = True
-            try:
-                scroll_by_bounded(extra)
-            finally:
-                state[1] = False
-            latest = read_scroll_y()
-            state[0] = current if latest is None else latest
-
-        # 保存回调引用，避免 MicroPython 垃圾回收后 LVGL 调用失效对象。
-        self._event_callbacks.append(on_scroll)
+        self._event_callbacks.append(_native_on_scroll)
         try:
-            content.add_event_cb(on_scroll, lv.EVENT.SCROLL, None)
+            content.add_event_cb(_native_on_scroll, lv.EVENT.SCROLL, None)
         except Exception:
-            # 旧版绑定若不支持新增事件回调，则保持原生 1 倍滚动，避免覆盖已有回调。
             pass
+        scroll_begin = getattr(lv.EVENT, "SCROLL_BEGIN", None)
+        if scroll_begin is not None:
+            try:
+                content.add_event_cb(_native_on_scroll, scroll_begin, None)
+            except Exception:
+                pass
+
 
     def _vertical_scroll_area(self, page, y, height):
-        """创建快速、无回弹、隐藏滚动条的纵向菜单容器。"""
-        content = lv.obj(page)
-        content.set_size(LCD_WIDTH, height)
-        content.set_pos(0, y)
+        """创建固定视口和明确高度的原生纵向滚动内容层。"""
+        viewport = lv.obj(page)
+        viewport.set_size(LCD_WIDTH, height)
+        viewport.set_pos(0, y)
         # 先清除主题默认的滚动惯性和弹性，再单独开启纵向滚动。
         # 这样拖到顶部/底部后继续拖动会直接停在边界，不会回弹或抖动。
-        _fix_position(content)
+        _fix_position(viewport)
         try:
-            content.add_flag(lv.obj.FLAG.SCROLLABLE)
+            viewport.add_flag(lv.obj.FLAG.SCROLLABLE)
         except Exception:
             pass
         try:
-            content.set_scroll_dir(lv.DIR.VER)
+            viewport.set_scroll_dir(lv.DIR.VER)
         except Exception:
             pass
         # 不使用吸附动画，避免松手后出现一帧轻微的上下回弹。
         try:
-            content.set_scroll_snap_y(lv.SCROLL_SNAP.NONE)
+            viewport.set_scroll_snap_y(lv.SCROLL_SNAP.NONE)
         except Exception:
             pass
         # 关闭弹性回弹、水平滚动链和吸附；惯性单独保留，用于松手后的自然滑行。
         for flag_name in ("SCROLL_ELASTIC", "SCROLL_CHAIN_HOR",
                           "SCROLL_CHAIN_VER", "SNAPPABLE"):
             try:
-                content.clear_flag(getattr(lv.obj.FLAG, flag_name))
+                viewport.clear_flag(getattr(lv.obj.FLAG, flag_name))
             except Exception:
                 pass
         try:
-            content.add_flag(lv.obj.FLAG.SCROLL_MOMENTUM)
+            viewport.add_flag(lv.obj.FLAG.SCROLL_MOMENTUM)
         except Exception:
             pass
+        for state in (lv.STATE.DEFAULT, lv.STATE.PRESSED,
+                      lv.STATE.FOCUSED, lv.STATE.CHECKED):
+            # An opaque viewport repaints vacated rows deterministically and
+            # avoids stale pixels showing through during partial flushes.
+            viewport.set_style_bg_opa(255, lv.PART.MAIN | state)
+            viewport.set_style_bg_color(
+                lv.color_hex(_lv_color(BLACK)), lv.PART.MAIN | state)
+            viewport.set_style_border_width(0, lv.PART.MAIN | state)
+            viewport.set_style_outline_width(0, lv.PART.MAIN | state)
+            viewport.set_style_shadow_width(0, lv.PART.MAIN | state)
+            viewport.set_style_radius(0, lv.PART.MAIN | state)
+            try:
+                viewport.set_style_pad_all(0, lv.PART.MAIN | state)
+            except Exception:
+                viewport.set_style_pad_top(0, lv.PART.MAIN | state)
+                viewport.set_style_pad_bottom(0, lv.PART.MAIN | state)
+                viewport.set_style_pad_left(0, lv.PART.MAIN | state)
+                viewport.set_style_pad_right(0, lv.PART.MAIN | state)
+
+        # 行控件统一放在独立内容层中。内容层高度由有效行数明确设置，
+        # 隐藏旧行不会再改变滚动范围或与当前行发生叠加。
+        content = lv.obj(viewport)
+        content.set_size(LCD_WIDTH, height)
+        content.set_pos(0, 0)
+        _fix_position(content)
         for state in (lv.STATE.DEFAULT, lv.STATE.PRESSED,
                       lv.STATE.FOCUSED, lv.STATE.CHECKED):
             content.set_style_bg_opa(0, lv.PART.MAIN | state)
@@ -3043,16 +3148,12 @@ class JingWuUI:
             content.set_style_outline_width(0, lv.PART.MAIN | state)
             content.set_style_shadow_width(0, lv.PART.MAIN | state)
             content.set_style_radius(0, lv.PART.MAIN | state)
-            try:
-                content.set_style_pad_all(0, lv.PART.MAIN | state)
-            except Exception:
-                content.set_style_pad_top(0, lv.PART.MAIN | state)
-                content.set_style_pad_bottom(0, lv.PART.MAIN | state)
-                content.set_style_pad_left(0, lv.PART.MAIN | state)
-                content.set_style_pad_right(0, lv.PART.MAIN | state)
-        self._bind_page_swipe(content)
-        self._bind_vertical_scroll_speed(content)
-        self._scroll_containers.append(content)
+
+        self._bind_page_swipe(viewport)
+        # Let LVGL own vertical movement and momentum. This guard only marks
+        # a native scroll as a gesture so the same touch cannot click a row.
+        self._bind_native_scroll_guard(viewport)
+        self._scroll_containers.append(viewport)
         return content
 
     def _tile(self, page, x, y, width, height, text, callback, selected=False):
@@ -3141,6 +3242,54 @@ class JingWuUI:
         self._bind_click(page, row, callback)
         return row
 
+    def _settings_row_fast(self, page, parent, y, icon_path, text, callback):
+        """Create a settings row with one image object instead of an icon holder."""
+        row = lv.obj(parent)
+        try:
+            row.add_flag(lv.obj.FLAG.CLICKABLE)
+        except Exception:
+            pass
+        row.set_size(LCD_WIDTH - 8, SETTINGS_ROW_HEIGHT)
+        row.set_pos(4, y)
+        _fix_position(row)
+        for state in (lv.STATE.DEFAULT, lv.STATE.PRESSED,
+                      lv.STATE.FOCUSED, lv.STATE.CHECKED):
+            row.set_style_bg_opa(255, lv.PART.MAIN | state)
+            row.set_style_bg_color(
+                lv.color_hex(_lv_color(SETTINGS_ROW_BG)),
+                lv.PART.MAIN | state)
+            row.set_style_border_width(0, lv.PART.MAIN | state)
+            row.set_style_outline_width(0, lv.PART.MAIN | state)
+            row.set_style_shadow_width(0, lv.PART.MAIN | state)
+            row.set_style_radius(8, lv.PART.MAIN | state)
+            try:
+                row.set_style_pad_all(0, lv.PART.MAIN | state)
+            except Exception:
+                pass
+        row.set_style_bg_color(
+            lv.color_hex(_lv_color(SETTINGS_ROW_PRESSED_BG)),
+            lv.PART.MAIN | lv.STATE.PRESSED)
+
+        icon = lv.img(row)
+        icon.set_src(icon_path)
+        icon.set_size(SETTINGS_ICON_SIZE, SETTINGS_ICON_SIZE)
+        icon.set_pos(
+            SETTINGS_ICON_BOX_X + (SETTINGS_ICON_BOX_SIZE -
+                                   SETTINGS_ICON_SIZE) // 2,
+            SETTINGS_ICON_BOX_Y + (SETTINGS_ICON_BOX_SIZE -
+                                   SETTINGS_ICON_SIZE) // 2)
+        _fix_position(icon)
+
+        label = lv.label(row)
+        label.set_text(text)
+        label.set_size(LCD_WIDTH - SETTINGS_LABEL_X - 8, FONT_MAIN[1])
+        label.set_pos(SETTINGS_LABEL_X,
+                      (SETTINGS_ROW_HEIGHT - FONT_MAIN[1]) // 2)
+        label.add_style(self._get_style(
+            FONT_MAIN, WHITE, lv.TEXT_ALIGN.LEFT), lv.PART.MAIN)
+        self._bind_click(page, row, callback)
+        return row
+
     def _radio_row(self, parent, y, text, key, selected, callback, rows,
                    owner_page=None):
         """用 LVGL 原生 checkbox 创建圆形单选按钮。"""
@@ -3224,6 +3373,33 @@ class JingWuUI:
             callback(key)
         self._bind_click(owner_page, radio, on_select)
         return radio
+
+    def _set_radio_row_layout(self, radio, y=None, visible=True):
+        """将名单行恢复为固定槽位，隐藏行缩成安全的零内容占位。"""
+        if radio is None:
+            return
+        if visible:
+            try:
+                radio.set_size(LCD_WIDTH, SETTINGS_ROW_HEIGHT)
+            except Exception:
+                pass
+            if y is not None:
+                radio.set_pos(0, int(y))
+            try:
+                radio.clear_flag(lv.obj.FLAG.HIDDEN)
+            except Exception:
+                pass
+        else:
+            try:
+                radio.add_flag(lv.obj.FLAG.HIDDEN)
+            except Exception:
+                pass
+            # 不使用负坐标隐藏，避免旧固件把它纳入内容尺寸或返回旧绘制区域。
+            try:
+                radio.set_size(1, 1)
+                radio.set_pos(0, 0)
+            except Exception:
+                pass
 
     def _set_radio_row_selected(self, radio, selected):
         """更新原生单选按钮的 CHECKED 状态。"""
@@ -4402,6 +4578,12 @@ class JingWuUI:
         """按最新HTTP名单新增、更新或隐藏组呼行，控件对象始终复用。"""
         if self._group_content is None:
             return
+
+        # 先把旧行缩成隐藏占位，再按本次结果重新分配固定槽位；这样
+        # 名单缩短、排序变化或滚动位置变化时都不会出现旧行叠加。
+        for radio in self._group_rows.values():
+            self._set_radio_row_layout(radio, visible=False)
+
         active_keys = {"__none_group__": True}
         none_radio = self._group_rows.get("__none_group__")
         if none_radio is None:
@@ -4411,14 +4593,18 @@ class JingWuUI:
                 self._group_rows, owner_page=self.pages.get("group_mode"))
         else:
             none_radio.set_text("无/退出")
-            none_radio.set_pos(0, 6)
-            none_radio.clear_flag(lv.obj.FLAG.HIDDEN)
-        for index, group in enumerate(self._intercom_groups):
+        self._set_radio_row_layout(none_radio, 6, True)
+
+        row_index = 1
+        seen = {"__none_group__": True}
+        for group in self._intercom_groups:
             key = str(group.get("raw_id", ""))
-            if not key:
+            if not key or key in seen:
                 continue
+            seen.add(key)
             active_keys[key] = True
-            y = 6 + (index + 1) * (SETTINGS_ROW_HEIGHT + SETTINGS_ROW_GAP)
+            y = 6 + row_index * (SETTINGS_ROW_HEIGHT + SETTINGS_ROW_GAP)
+            row_index += 1
             text = str(group.get("name") or key)
             radio = self._group_rows.get(key)
             if radio is None:
@@ -4429,19 +4615,26 @@ class JingWuUI:
                     owner_page=self.pages.get("group_mode"))
             else:
                 radio.set_text(text)
-                radio.set_pos(0, y)
-                radio.clear_flag(lv.obj.FLAG.HIDDEN)
+            self._set_radio_row_layout(radio, y, True)
         for key, radio in self._group_rows.items():
             if key not in active_keys:
-                radio.add_flag(lv.obj.FLAG.HIDDEN)
-                # 旧固件对隐藏对象仍可能返回旧坐标，移出内容区作为双保险。
-                radio.set_pos(0, -1000)
+                self._set_radio_row_layout(radio, visible=False)
+        # 内容层只按有效行数扩展，隐藏行不会参与滚动范围。
+        content_height = max(
+            PAGE_HEIGHT,
+            6 + row_index * (SETTINGS_ROW_HEIGHT + SETTINGS_ROW_GAP))
+        try:
+            self._group_content.set_height(content_height)
+        except Exception:
+            pass
         self._group_rows_built = bool(active_keys)
 
     def _populate_single_rows(self):
         """按最新HTTP名单新增、更新或隐藏单呼行，保留“无/解散”。"""
         if self._single_content is None:
             return
+        for radio in self._single_rows.values():
+            self._set_radio_row_layout(radio, visible=False)
         # 第一项始终存在，即使HTTP没有返回任何人员也能反映“无单呼”状态。
         if self._single_none_key not in self._single_rows:
             self._radio_row(
@@ -4451,15 +4644,16 @@ class JingWuUI:
         active_keys = {self._single_none_key: True}
         none_radio = self._single_rows.get(self._single_none_key)
         none_radio.set_text("无/解散")
-        none_radio.set_pos(0, 6)
-        none_radio.clear_flag(lv.obj.FLAG.HIDDEN)
+        self._set_radio_row_layout(none_radio, 6, True)
         index = 1
+        seen = {self._single_none_key: True}
         for person in self._intercom_people:
             if self._is_logged_in_person(person):
                 continue
             key = self._person_key(person)
-            if not key:
+            if not key or key in seen:
                 continue
+            seen.add(key)
             active_keys[key] = True
             y = 6 + index * (SETTINGS_ROW_HEIGHT + SETTINGS_ROW_GAP)
             index += 1
@@ -4475,8 +4669,7 @@ class JingWuUI:
                     owner_page=self.pages.get("single_mode"))
             else:
                 radio.set_text(text)
-                radio.set_pos(0, y)
-                radio.clear_flag(lv.obj.FLAG.HIDDEN)
+            self._set_radio_row_layout(radio, y, True)
             try:
                 color = WHITE if online else BLACK
                 radio.set_style_text_color(lv.color_hex(_lv_color(color)),
@@ -4487,8 +4680,14 @@ class JingWuUI:
                 pass
         for key, radio in self._single_rows.items():
             if key not in active_keys:
-                radio.add_flag(lv.obj.FLAG.HIDDEN)
-                radio.set_pos(0, -1000)
+                self._set_radio_row_layout(radio, visible=False)
+        content_height = max(
+            PAGE_HEIGHT,
+            6 + index * (SETTINGS_ROW_HEIGHT + SETTINGS_ROW_GAP))
+        try:
+            self._single_content.set_height(content_height)
+        except Exception:
+            pass
         self._single_rows_built = True
 
     def select_group(self, group):
@@ -4771,9 +4970,15 @@ class JingWuUI:
             )
             for index, item in enumerate(items):
                 y = index * (SETTINGS_ROW_HEIGHT + SETTINGS_ROW_GAP)
-                self._settings_row(
+                self._settings_row_fast(
                     page, content, y, item[0], item[1],
                     lambda obj, cb=item[2]: cb())
+            try:
+                content.set_height(max(
+                    PAGE_HEIGHT,
+                    len(items) * (SETTINGS_ROW_HEIGHT + SETTINGS_ROW_GAP)))
+            except Exception:
+                pass
         self._load("settings", page)
 
     def _simple_list(self, key, title, labels):
@@ -5360,6 +5565,13 @@ class JingWuUI:
                     self.sleep_timeout_seconds == item[1],
                     self.select_sleep_timeout, self._sleep_rows,
                     owner_page=page)
+            try:
+                content.set_height(max(
+                    PAGE_HEIGHT,
+                    6 + len(SLEEP_OPTIONS) *
+                    (SETTINGS_ROW_HEIGHT + SETTINGS_ROW_GAP)))
+            except Exception:
+                pass
         else:
             # 页面对象长期复用，重新进入时同步业务层保存的选中状态。
             for key, radio in self._sleep_rows.items():
@@ -5673,6 +5885,7 @@ class JingWuUI:
                 self._location_last_refresh_ms = now
                 self._refresh_location_page()
             self._process_pending_back()
+            self._process_pending_click()
             self._process_pending_gc()
             self._process_auto_sleep()
             utime.sleep_ms(5)
