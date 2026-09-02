@@ -3,7 +3,10 @@ import gc
 import utime
 from machine import LCD
 import lvgl as lv
-from tp import cst816
+try:
+	from usr.CST816D import CST816D
+except Exception:
+	from CST816D import CST816D
 from misc import PWM_V2
 try:
 	from usr.et6312b import ShoulderLampController
@@ -43,15 +46,6 @@ DISPLAY_DOUBLE_BUFFER_RESERVE = 160 * 1024
 DISPLAY_BOOT_CLEAR_LINES = 20
 PERF_REPORT_MS = 5000
 MADCTL_LANDSCAPE_RGB = 0x60
-LANDSCAPE_GESTURE_MAP = {
-	0: 3,
-	1: 2,
-	2: 0,
-	3: 1,
-	4: 4,
-	5: 5,
-	6: 6,
-}
 CLICK_MOVE_LIMIT = 12
 CLICK_DISPATCH_GUARD_MS = 100
 BACK_DRAG_START_DISTANCE = 8
@@ -516,6 +510,13 @@ class JingWuUI:
 		self._click_area = None
 		self._click_dispatched = False
 		self._touch_pressed = False
+		# Hardware press edges are tracked independently of LVGL's event
+		# delivery.  A fast second tap can arrive before LVGL has emitted the
+		# previous RELEASED/CLICKED pair, so using _touch_pressed alone can
+		# incorrectly keep the old click sequence alive.
+		self._touch_sequence_active = False
+		self._touch_press_edge_pending = False
+		self._touch_press_generation = 0
 		self._touch_high_freq_yield_cycles = 0
 		self._event_callbacks = []
 		self._scroll_containers = []
@@ -771,14 +772,14 @@ class JingWuUI:
 		popup.add_flag(lv.obj.FLAG.HIDDEN)
 		self._poc_popup = popup
 	def _init_touch(self):
-		self.tp = cst816(irq=11, reset=15)
-		self.tp.activate()
-		self.tp.init()
-		self.tp.set_callback(self._gesture)
+		self._touch_controller = CST816D()
+		self._touch_controller.set_gesture_callback(
+			self._on_cst816d_gesture)
+		self._touch_controller.start()
 		self._touch_driver = lv.indev_drv_t()
 		self._touch_driver.init()
 		self._touch_driver.type = lv.INDEV_TYPE.POINTER
-		self._touch_driver.read_cb = self.tp.read
+		self._touch_driver.read_cb = self._touch_controller.read
 		self._touch_driver.long_press_time = 80
 		try:
 			self._touch_driver.scroll_throw = SETTINGS_SCROLL_THROW
@@ -793,6 +794,9 @@ class JingWuUI:
 		except Exception:
 			pass
 		self._touch_input = self._touch_driver.register()
+		# CST816D.read supplies panel/raw coordinates.  When the display driver
+		# supports rotation, LVGL applies that single 90-degree transform before
+		# dispatching events (the flag was set during display initialization).
 	def _init_brightness_pwm(self, boot=False):
 		global _ACTIVE_BACKLIGHT
 		if self._brightness_pwm is not None:
@@ -921,6 +925,8 @@ class JingWuUI:
 			return max(0, now - start_ms)
 	def _reset_touch_for_wake(self):
 		self._touch_pressed = False
+		self._touch_sequence_active = False
+		self._touch_press_edge_pending = False
 		self._touch_sequence_swipe = True
 		self._click_dispatched = True
 		self._pending_back = False
@@ -1000,6 +1006,8 @@ class JingWuUI:
 			self._pending_root_swipe = None
 			self._pending_click_dispatch = None
 			self._touch_pressed = False
+			self._touch_sequence_active = False
+			self._touch_press_edge_pending = True
 			self._touch_sequence_swipe = True
 			self._click_dispatched = True
 			self._poc_touch_guard = True
@@ -1046,6 +1054,8 @@ class JingWuUI:
 			elif code in (lv.EVENT.RELEASED, lv.EVENT.CLICKED):
 				self._poc_touch_released = True
 			self._touch_pressed = False
+			self._touch_sequence_active = False
+			self._touch_press_edge_pending = True
 			self._touch_sequence_swipe = True
 			self._click_dispatched = True
 			self._pending_back = False
@@ -1859,32 +1869,9 @@ class JingWuUI:
 		except Exception:
 			return None
 	def _read_tp_xy(self):
-		try:
-			reader = getattr(self.tp, "read_xy", None)
-			if reader is None:
-				print("2")
-				return None
-			print("1")
-			result = reader()
-			x = y = None
-			if isinstance(result, dict):
-				x = result.get("x")
-				y = result.get("y")
-			elif isinstance(result, (tuple, list)):
-				if (len(result) >= 2 and
-						not isinstance(result[0], (tuple, list, dict))):
-					x, y = result[0], result[1]
-				elif len(result) == 1 and isinstance(result[0], (tuple, list)):
-					value = result[0]
-					if len(value) >= 2:
-						x, y = value[0], value[1]
-			if x is None or y is None:
-				return None
-			point = self._map_touch_point(x, y)
-			self._touch_point_cache = point
-			return point
-		except Exception:
-			return None
+		# Coordinates are sampled by CST816D.poll_once() in the LCD thread;
+		# this method is retained as a cache-only compatibility helper.
+		return self._touch_point_cache
 	def _get_pointer_point(self, event=None):
 		if event is not None:
 			try:
@@ -1911,8 +1898,7 @@ class JingWuUI:
 				return point
 		except Exception:
 			pass
-		point = self._read_tp_xy()
-		return point if point is not None else self._touch_point_cache
+		return self._touch_point_cache
 	def _click_move_limit(self):
 		if (self.current is not None and
 				self.current[0] in (
@@ -2208,7 +2194,8 @@ class JingWuUI:
 			return False
 		return self._start_back_complete()
 	def _begin_touch_sequence(self):
-		if not self._touch_pressed:
+		if (not self._touch_sequence_active or
+				self._touch_press_edge_pending):
 			self._touch_sequence_id += 1
 			self._touch_sequence_swipe = False
 			self._click_dispatched = False
@@ -2217,6 +2204,8 @@ class JingWuUI:
 			self._touch_sequence_max_dx = 0
 			self._touch_sequence_max_dy = 0
 			self._pending_click_dispatch = None
+			self._touch_press_edge_pending = False
+			self._touch_sequence_active = True
 		self._touch_pressed = True
 	def _record_touch_point(self, point):
 		if point is None:
@@ -2272,9 +2261,15 @@ class JingWuUI:
 			return False
 		self._click_dispatched = True
 		now = utime.ticks_ms()
+		# Keypad taps do not need the swipe-confirmation delay.  Dispatching
+		# immediately after LVGL's CLICKED event prevents a fast following tap
+		# from replacing the previous pending click.
+		guard_ms = 0
+		if self.current is None or self.current[0] != "login":
+			guard_ms = CLICK_DISPATCH_GUARD_MS
 		self._pending_click_dispatch = (
 			self._touch_sequence_id, self.current, point, preferred_obj,
-			now + CLICK_DISPATCH_GUARD_MS)
+			now + guard_ms)
 		return True
 	def _process_pending_click(self):
 		pending = self._pending_click_dispatch
@@ -2343,6 +2338,8 @@ class JingWuUI:
 				self._mark_touch_sequence_swipe()
 			elif code == lv.EVENT.RELEASED:
 				self._touch_pressed = False
+				self._touch_sequence_active = False
+				self._touch_press_edge_pending = True
 				if self._back_drag_release(update_movement(event)):
 					press_state[1] = True
 			elif code == lv.EVENT.CLICKED:
@@ -2397,6 +2394,8 @@ class JingWuUI:
 				self._back_drag_move(update_movement(event))
 			elif code == lv.EVENT.RELEASED:
 				self._touch_pressed = False
+				self._touch_sequence_active = False
+				self._touch_press_edge_pending = True
 				if self._back_drag_release(update_movement(event)):
 					press_state[1] = True
 			elif code == lv.EVENT.GESTURE:
@@ -2418,35 +2417,15 @@ class JingWuUI:
 			wrapper = lambda target, event: pointer_event(event)
 			self._event_callbacks.append(wrapper)
 			obj.set_event_cb(wrapper, lv.EVENT.ALL, None)
-	def _gesture(self, *args):
-		if not args:
-			return
-		raw_gesture = args[-1]
-		try:
-			raw_gesture = int(raw_gesture)
-		except Exception:
-			pass
-		gesture = LANDSCAPE_GESTURE_MAP.get(raw_gesture, raw_gesture)
+	def _handle_touch_gesture(self, gesture):
+		"""Apply an already-normalized gesture without old-driver remapping."""
 		if self._selection_popup_visible:
 			self._mark_touch_sequence_swipe()
 			return
-		names = {
-			0: "右滑",
-			1: "左滑",
-			2: "上滑",
-			3: "下滑",
-			4: "边缘返回",
-			5: "点击",
-			6: "返回键",
-		}
-		name = names.get(gesture, "未知")
-		print(name)
 		if self._poc_touch_locked:
 			self._consume_gesture_for_poc()
 			return
-		if self._consume_gesture_for_wake():
-			return
-		if self._consume_gesture_for_poc():
+		if self._consume_gesture_for_wake() or self._consume_gesture_for_poc():
 			return
 		if gesture in (0, 1, 2, 3, 4, 6):
 			self._mark_touch_sequence_swipe()
@@ -2454,14 +2433,6 @@ class JingWuUI:
 				not self._is_root_page()):
 			self._back_drag_hardware_confirmed = True
 			self._pending_back = True
-			if self._back_drag_tracking:
-				pass
-			elif not self._back_animating:
-				if (gesture == 0 and
-						not self._touch_point_warning_reported):
-					print("[触摸] 未取得连续坐标，仅执行松手返回")
-					self._touch_point_warning_reported = True
-				self._pending_back = True
 		if self.current and self._is_root_page() and gesture in (0, 1):
 			next_key = {
 				("location", 1): "root_shoulder",
@@ -2473,6 +2444,63 @@ class JingWuUI:
 			}.get((self.current[0], gesture))
 			if next_key:
 				self._pending_root_swipe = next_key
+	def _on_cst816d_gesture(self, name):
+		"""Convert the direct-driver gesture name to the legacy UI action."""
+		# The direct driver already reports normalized landscape directions.
+		gesture = {
+			"右滑": 0,
+			"左滑": 1,
+			"上滑": 2,
+			"下滑": 3,
+			"单击": 5,
+		}.get(name)
+		if gesture is not None:
+			self._handle_touch_gesture(gesture)
+	def _poll_cst816d(self):
+		controller = self._touch_controller
+		if controller is None:
+			return
+		was_pressed = self._touch_pressed
+		try:
+			press_generation = controller.get_press_generation()
+		except Exception:
+			press_generation = self._touch_press_generation
+		controller.poll_once()
+		# Custom UI gesture/back-drag logic consumes the cached landscape point.
+		# The LVGL indev callback itself receives raw coordinates and lets LVGL
+		# perform the one configured display rotation.
+		self._touch_point_cache = controller.get_raw_point()
+		is_pressed = controller.is_pressed()
+		try:
+			new_press_generation = controller.get_press_generation()
+		except Exception:
+			new_press_generation = press_generation
+		# Start/end the UI touch sequence from the hardware state transition,
+		# not only from LVGL's per-object callbacks.  This is important for
+		# consecutive short taps: LVGL may coalesce or omit a RELEASED event
+		# when the next press arrives before the previous frame is dispatched.
+		if is_pressed and not was_pressed:
+			self._touch_sequence_active = False
+			self._touch_press_edge_pending = True
+			# Reset the click gate at the hardware edge as well.  On a fast
+			# keypad tap LVGL can deliver the next object's PRESSED event before
+			# the prior CLICKED callback has finished; leaving this gate set would
+			# make the button visibly press but suppress its callback.
+			self._touch_sequence_swipe = False
+			self._click_dispatched = False
+			self._pending_click_dispatch = None
+		elif (is_pressed and
+				new_press_generation != self._touch_press_generation):
+			self._touch_sequence_active = False
+			self._touch_press_edge_pending = True
+			self._touch_sequence_swipe = False
+			self._click_dispatched = False
+			self._pending_click_dispatch = None
+		elif (not is_pressed) and was_pressed:
+			self._touch_sequence_active = False
+			self._touch_press_edge_pending = True
+		self._touch_pressed = is_pressed
+		self._touch_press_generation = new_press_generation
 	def _process_pending_back(self):
 		if self._pending_back:
 			self._pending_back = False
@@ -5033,7 +5061,12 @@ class JingWuUI:
 		except Exception:
 			pass
 	def _touch_high_frequency_active(self):
-		"""Use a tighter loop only after a pressed pointer actually moved."""
+		"""Keep the LCD loop awake for the complete CST816D touch session."""
+		try:
+			if self._touch_controller.is_dynamic_active():
+				return True
+		except Exception:
+			pass
 		return bool(self._touch_pressed and self._touch_sequence_swipe and
 					 not self._poc_touch_locked and
 					 not self._screen_sleeping and
@@ -5123,6 +5156,7 @@ class JingWuUI:
 		last_lvgl_task_ms = last_tick_ms
 		while True:
 			now = utime.ticks_ms()
+			self._poll_cst816d()
 			try:
 				tick_elapsed = utime.ticks_diff(now, last_tick_ms)
 			except Exception:
