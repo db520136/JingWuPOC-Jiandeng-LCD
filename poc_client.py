@@ -46,6 +46,8 @@ GNSS_INIT_RETRY_INTERVAL_MS = 10000
 # between response chunks, never while holding the business lock.
 LOCATION_MAP_IO_YIELD_MS = 1
 LOCATION_MAP_PAUSE_POLL_MS = 100
+# Touch/scroll may defer proactive work, but never indefinitely.
+UI_INTERACTION_DEFER_MAX_MS = 5000
 
 try:
     import _thread
@@ -314,6 +316,8 @@ class POCClient:
         # separate from detail visibility: leaving the map page must not
         # cancel an already queued download.
         self._location_map_ui_busy = False
+        self._ui_interaction_active = False
+        self._ui_interaction_started_ms = None
         self._location_map_cleanup_pending = []
         self._location_last_coordinates = None
         self.join_state = "idle"
@@ -595,9 +599,36 @@ class POCClient:
             self.pending_floor_group_id is not None or
             self._floor_request_action is not None)
 
+    def set_ui_interaction_active(self, active):
+        """Publish LCD touch/scroll state without calling any LVGL API."""
+        active = bool(active)
+        if active == self._ui_interaction_active:
+            return
+        self._ui_interaction_active = active
+        self._ui_interaction_started_ms = (
+            utime.ticks_ms() if active else None)
+        if not active:
+            self._wake_location_cleanup_worker()
+
+    def _ui_interaction_defer_active(self, now_ms=None):
+        if not self._ui_interaction_active:
+            return False
+        started = self._ui_interaction_started_ms
+        if started is None:
+            return False
+        if now_ms is None:
+            now_ms = utime.ticks_ms()
+        deadline = self._add_ms(started, UI_INTERACTION_DEFER_MAX_MS)
+        return not self._time_reached(deadline, now_ms)
+
+    def _low_priority_pause_active(self):
+        """Pause proactive work for realtime audio or bounded UI activity."""
+        return bool(self._gnss_pause_active() or
+                    self._ui_interaction_defer_active())
+
     def _location_map_pause_active(self):
         """Return whether map I/O must yield to audio or LCD transitions."""
-        return bool(self._gnss_pause_active() or
+        return bool(self._low_priority_pause_active() or
                     self._location_map_ui_busy)
 
     def _location_map_pause_checkpoint(self):
@@ -607,11 +638,35 @@ class POCClient:
 
     def set_location_ui_busy(self, busy):
         """Pause map publication/I/O while the LCD is moving between pages."""
-        self._location_map_ui_busy = bool(busy)
+        busy = bool(busy)
+        if busy == self._location_map_ui_busy:
+            return
+        self._location_map_ui_busy = busy
         if not busy:
-            # A worker can finish while navigation is active. Process any
-            # deferred bank cleanup when the LCD becomes idle again.
-            self._process_location_map_cleanup()
+            self._wake_location_cleanup_worker()
+
+    def get_location_map_io_active(self):
+        """Return whether the location worker currently has map I/O work."""
+        self._lock_acquire()
+        try:
+            if not self._location_http_worker_running:
+                return False
+            return bool(
+                self._location_map_pending is not None or
+                self._location_map_request_revision is not None or
+                self._location_map_loading_levels)
+        finally:
+            self._lock_release()
+
+    def _wake_location_cleanup_worker(self):
+        """Process deferred Flash cleanup off the LCD/LVGL thread."""
+        self._lock_acquire()
+        try:
+            pending = bool(self._location_map_cleanup_pending)
+        finally:
+            self._lock_release()
+        if pending and not self._location_map_pause_active():
+            self._start_location_http_worker()
 
     def _queue_location_map_cleanup(self, level, keep_lvgl_path):
         item = (int(level), str(keep_lvgl_path))
@@ -668,7 +723,7 @@ class POCClient:
     def _ensure_gnss_initialized(self, now_ms=None):
         """在非对讲阶段初始化GNSS；失败后每10秒最多重试一次。"""
         service = self.gnss_service
-        if service is None or self._gnss_pause_active():
+        if service is None or self._low_priority_pause_active():
             return False
         if bool(getattr(service, "initialized", False)):
             return True
@@ -1075,7 +1130,7 @@ class POCClient:
                 utime.sleep_ms(LOCATION_MAP_PAUSE_POLL_MS)
             self._location_map_pause_checkpoint()
         else:
-            while self._running and self._gnss_pause_active():
+            while self._running and self._low_priority_pause_active():
                 utime.sleep_ms(LOCATION_MAP_PAUSE_POLL_MS)
         response = request.get(url, headers={"Accept": accept})
         status = getattr(response, "status_code", 0)
@@ -1533,7 +1588,7 @@ class POCClient:
         """登录后首次及周期上报定位；过期期间只保留一次待发送。"""
         if (self._socket is None or self.login_state != "success" or
                 self._gnss_request_cnt is not None or
-                self._gnss_pause_active()):
+                self._low_priority_pause_active()):
             return
         now_ms = utime.ticks_ms()
         manual_refresh = self._location_manual_pending
@@ -2142,7 +2197,9 @@ class POCClient:
 
     def _send_heartbeat_if_due(self):
         """TCP空闲满一分钟时发送0x02心跳请求。"""
-        if self._heartbeat_request_cnt is not None or not self._heartbeat_due():
+        if (self._heartbeat_request_cnt is not None or
+                self._low_priority_pause_active() or
+                not self._heartbeat_due()):
             return
         request_cnt = self._next_request_cnt()
         packet = build_frame(
@@ -3271,7 +3328,8 @@ class POCClient:
                     self.join_error = "退出组呼应答超时"
                     self._join_changed()
 
-        if self._heartbeat_sent_ms is not None:
+        if (self._heartbeat_sent_ms is not None and
+                not self._low_priority_pause_active()):
             (self._heartbeat_sent_ms, self._heartbeat_retry_count,
              timed_out) = self._retry_packet_if_due(
                 self._heartbeat_packet, self._heartbeat_sent_ms,
@@ -3286,7 +3344,7 @@ class POCClient:
                 print("[POC] TCP心跳应答超时")
 
         if (self._gnss_sent_ms is not None and
-                not self._gnss_pause_active()):
+                not self._low_priority_pause_active()):
             (self._gnss_sent_ms, self._gnss_retry_count,
              timed_out) = self._retry_packet_if_due(
                 self._gnss_packet, self._gnss_sent_ms,
@@ -3871,6 +3929,10 @@ class POCClient:
         try:
             while self._running:
                 self._process_prelogin_http_refresh()
+                # Deferred map-bank cleanup belongs to the POC worker, so a
+                # transition out of audio/UI priority also releases stale
+                # Flash files even when the HTTP worker already exited.
+                self._process_location_map_cleanup()
                 if self._socket is None:
                     if not self._network_ready():
                         utime.sleep_ms(500)

@@ -332,6 +332,7 @@ class ShoulderLampController:
         self._fall_alarm_active = False
         self._fall_alarm_phase = 0
         self._next_alarm_toggle_ms = None
+        self._revision = 0
         # 每次明确选择 off 都递增，供跌倒服务区分“普通模式本来就是关闭”
         # 和“用户刚刚执行了取消当前跌倒事件”。
         self._fall_cancel_version = 0
@@ -435,6 +436,8 @@ class ShoulderLampController:
                 self.phase = 0
                 self.driver.apply_mask(0)
                 self.mode = mode
+                if was_changed:
+                    self._revision += 1
                 return was_changed
 
             self.mode = mode
@@ -442,10 +445,14 @@ class ShoulderLampController:
             if self._fall_alarm_active:
                 # 报警期间只记录用户选择，报警灯效保持优先。
                 self._next_toggle_ms = None
+                if was_changed:
+                    self._revision += 1
                 return was_changed
 
             self._configure_autonomous_mode(mode)
             self._next_toggle_ms = None
+            if was_changed:
+                self._revision += 1
             return was_changed
         finally:
             self._lock.release()
@@ -472,6 +479,7 @@ class ShoulderLampController:
                 self._now_ms(), self.FALL_ALARM_INTERVAL_MS)
             self._next_toggle_ms = None
             self._apply_alarm_phase()
+            self._revision += 1
             return True
         finally:
             self._lock.release()
@@ -491,6 +499,7 @@ class ShoulderLampController:
             else:
                 self._configure_autonomous_mode(self.mode)
                 self._next_toggle_ms = None
+            self._revision += 1
             return True
         finally:
             self._lock.release()
@@ -537,6 +546,22 @@ class ShoulderLampController:
             # Normal modes run entirely inside ET6312B. Keep tick() for API
             # compatibility and UI synchronization, but never poll/write I2C.
             return False
+        finally:
+            self._lock.release()
+
+    def get_revision(self):
+        """Return a cheap atomic state revision for LCD event polling."""
+        return self._revision
+
+    def get_status_snapshot(self):
+        """Copy the mode/alarm state only after the revision changes."""
+        self._lock.acquire()
+        try:
+            return {
+                "revision": self._revision,
+                "mode": self.mode,
+                "fall_alarm_active": self._fall_alarm_active,
+            }
         finally:
             self._lock.release()
 

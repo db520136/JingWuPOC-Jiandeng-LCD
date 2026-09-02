@@ -23,6 +23,34 @@ try:
 except Exception:
     ExtInt = None
 
+try:
+    from machine import Timer
+except Exception:
+    Timer = None
+
+
+def _new_event_sem():
+    """Create a semaphore/lock whose first acquire blocks."""
+    if hasattr(_thread, "allocate_semphore"):
+        sem = _thread.allocate_semphore(1)
+        try:
+            count = sem.getCnt()
+            initial = count[1] if isinstance(count, (tuple, list)) else count
+            for _ in range(int(initial or 0)):
+                try:
+                    sem.acquire()
+                except Exception:
+                    break
+        except Exception:
+            try:
+                sem.acquire()
+            except Exception:
+                pass
+        return sem
+    sem = _thread.allocate_lock()
+    sem.acquire()
+    return sem
+
 
 SC7A20H_ADDR = 0x19
 SC7A20H_ADDR_SDO_GND = 0x18
@@ -181,6 +209,19 @@ class SC7A20H:
         self.read_register(REG_AOI2_SRC)
         self.initialized = True
         return True
+
+    def set_fall_interrupts_enabled(self, enabled):
+        """Map/unmap AOI1 and AOI2 on INT2 without affecting CLICK/INT1."""
+        self._write_register(REG_CTRL6, 0x60 if enabled else 0x00)
+        if not enabled:
+            self.read_register(REG_AOI1_SRC)
+            self.read_register(REG_AOI2_SRC)
+
+    def set_double_click_interrupt_enabled(self, enabled):
+        """Map/unmap CLICK on INT1 while preserving its register setup."""
+        self._write_register(REG_CTRL3, 0x80 if enabled else 0x00)
+        if not enabled:
+            self.read_register(REG_CLICK_SRC)
 
     def _read_raw_value(self, low, high):
         data = self._i2c_read(low, 2)
@@ -349,6 +390,13 @@ GPIO25（物理 Pin17）接 INT1，GPIO26（物理 Pin18）接 INT2。中断回�
         self._thread_started = False
         self._int1_pending = False
         self._int2_pending = False
+        self._sample_pending = False
+        self._fall_config_pending = False
+        self._double_click_config_pending = False
+        self._wake_pending = False
+        self._event_sem = _new_event_sem()
+        self._fall_timer = None
+        self._fall_timer_started = False
         self._irq_objects = []
         self._sensor_error_reported = False
         self._last_double_click_ms = None
@@ -431,22 +479,66 @@ GPIO25（物理 Pin17）接 INT1，GPIO26（物理 Pin18）接 INT2。中断回�
             int2_ok = self._setup_one_irq("GPIO26", 26, self._on_int2)
             return int1_ok and int2_ok
         except Exception as error:
-            print("[加速度] GPIO 中断初始化失败，将使用轮询：{}".format(error))
+            print("[加速度] GPIO 中断初始化失败，双击中断不可用：{}".format(error))
             self._irq_objects = []
             return False
 
+    def _wake_worker(self):
+        # Coalesce callbacks while the worker is already runnable. This keeps
+        # the semaphore count bounded even when INT and Timer arrive together.
+        if self._wake_pending:
+            return
+        self._wake_pending = True
+        try:
+            self._event_sem.release()
+        except Exception:
+            self._wake_pending = False
+
+    def _on_fall_sample_timer(self, *args):
+        self._sample_pending = True
+        self._wake_worker()
+
+    def _start_fall_sample_timer(self):
+        if self._fall_timer_started or not self._running:
+            return
+        if Timer is None or not hasattr(Timer, "Timer2"):
+            raise RuntimeError("当前固件不支持 Timer2，无法启动跌倒采样")
+        timer = Timer(Timer.Timer2)
+        mode = getattr(timer, "PERIODIC", getattr(Timer, "PERIODIC", 1))
+        timer.start(period=self.sample_interval_ms, mode=mode,
+                    callback=self._on_fall_sample_timer)
+        self._fall_timer = timer
+        self._fall_timer_started = True
+
+    def _stop_fall_sample_timer(self):
+        timer = self._fall_timer
+        self._fall_timer = None
+        self._fall_timer_started = False
+        self._sample_pending = False
+        if timer is not None:
+            try:
+                timer.stop()
+            except Exception:
+                pass
+
     def _on_int1(self, *args):
-        # IRQ 中禁止 I2C 和业务调用，只记录待处理事件。
+        # IRQ 中禁止 I2C 和业务调用，只记录事件并唤醒服务线程。
         self._int1_pending = True
+        self._wake_worker()
 
     def _on_int2(self, *args):
         self._int2_pending = True
+        self._wake_worker()
 
     def start(self):
         """初始化传感器、注册中断并启动服务线程。"""
         if self._running:
             return True
         self.sensor.initialize()
+        # Fall detection is disabled by default. Leave only CLICK/INT1 active
+        # so normal movement cannot wake the Python service thread.
+        self.sensor.set_fall_interrupts_enabled(
+            self.fall_detection_enabled)
         self._setup_irqs()
         self._running = True
         try:
@@ -456,24 +548,55 @@ GPIO25（物理 Pin17）接 INT1，GPIO26（物理 Pin18）接 INT2。中断回�
             self._running = False
             self._thread_started = False
             raise
+        if self.fall_detection_enabled:
+            try:
+                self._start_fall_sample_timer()
+            except Exception:
+                self.stop()
+                raise
         print("[加速度] SC7A20H 服务已启动，INT1=GPIO25/Pin17，INT2=GPIO26/Pin18")
         return True
 
     def set_fall_detection_enabled(self, enabled):
         """切换跌倒检测；关闭时清空当前检测状态。"""
-        self.fall_detection_enabled = bool(enabled)
-        if not self.fall_detection_enabled:
+        enabled = bool(enabled)
+        if enabled == self.fall_detection_enabled:
+            return enabled
+        self.fall_detection_enabled = enabled
+        self._fall_config_pending = True
+        if enabled:
+            try:
+                self._start_fall_sample_timer()
+            except Exception:
+                self.fall_detection_enabled = False
+                raise
+        else:
+            self._stop_fall_sample_timer()
             self._reset_fall_state()
+        self._wake_worker()
+        return enabled
 
     def set_double_click_enabled(self, enabled):
         """Enable or suppress existing hardware double-click handling."""
-        self.double_click_enabled = bool(enabled)
+        enabled = bool(enabled)
+        if enabled == self.double_click_enabled:
+            return enabled
+        self.double_click_enabled = enabled
+        self._double_click_config_pending = True
         if not self.double_click_enabled:
             self._last_double_click_ms = None
+        self._wake_worker()
+        return enabled
 
     def stop(self):
         """停止线程并禁用已注册的 GPIO 中断。"""
         self._running = False
+        self._stop_fall_sample_timer()
+        # Force a wake even if an interrupt callback marked the worker as
+        # pending just before stop().  Otherwise the worker could consume
+        # that notification and block again before observing _running=False.
+        self._wake_pending = False
+        self._wake_worker()
         for irq in self._irq_objects:
             try:
                 irq.disable()
@@ -483,14 +606,13 @@ GPIO25（物理 Pin17）接 INT1，GPIO26（物理 Pin18）接 INT2。中断回�
 
     def _consume_sources(self, now_ms):
         """在线程上下文读取锁存源寄存器，处理中断事件。"""
-        poll_all = not self._irq_objects
         int1 = self._int1_pending
         int2 = self._int2_pending
         self._int1_pending = False
         self._int2_pending = False
 
         try:
-            if int1 or poll_all:
+            if int1:
                 click_source = self.sensor.read_click_source()
                 if self.double_click_enabled and (click_source & 0x0F) == 2:
                     if (self._last_double_click_ms is None or
@@ -499,7 +621,7 @@ GPIO25（物理 Pin17）接 INT1，GPIO26（物理 Pin18）接 INT2。中断回�
                         self._last_double_click_ms = now_ms
                         mode = self.controller.cycle_mode()
                         print("[加速度] 双击，肩灯模式切换为 {}".format(mode))
-            if int2 or poll_all:
+            if int2:
                 aoi1_source = self.sensor.read_aoi1_source()
                 aoi2_source = self.sensor.read_aoi2_source()
                 if aoi1_source & 0x40:
@@ -616,37 +738,60 @@ GPIO25（物理 Pin17）接 INT1，GPIO26（物理 Pin18）接 INT2。中断回�
             self._static_started_ms = None
 
     def _run(self):
-        next_sample_ms = utime.ticks_ms()
-        while self._running:
+        while True:
+            self._event_sem.acquire()
+            self._wake_pending = False
+            if not self._running:
+                break
             now_ms = utime.ticks_ms()
-            if self._ticks_diff(now_ms, next_sample_ms) >= 0:
-                next_sample_ms = self._ticks_add(
-                    now_ms, self.sample_interval_ms)
+            sample_pending = self._sample_pending
+            self._sample_pending = False
+            try:
+                if self._fall_config_pending:
+                    enabled = self.fall_detection_enabled
+                    self.sensor.set_fall_interrupts_enabled(enabled)
+                    if enabled == self.fall_detection_enabled:
+                        self._fall_config_pending = False
+                if self._double_click_config_pending:
+                    enabled = self.double_click_enabled
+                    self.sensor.set_double_click_interrupt_enabled(enabled)
+                    if enabled == self.double_click_enabled:
+                        self._double_click_config_pending = False
+                self._consume_sources(now_ms)
                 try:
-                    self._consume_sources(now_ms)
-                    try:
-                        cancel_version = self.controller.get_fall_cancel_version()
-                    except Exception:
-                        cancel_version = self._fall_cancel_version
-                    if cancel_version != self._fall_cancel_version:
-                        # 只在用户明确选择 off 时取消当前事件；普通模式保持 off
-                        # 并不会关闭检测，否则开机默认 off 时将无法识别跌倒。
-                        self._fall_cancel_version = cancel_version
-                        self._reset_fall_state()
-                    if not self.fall_detection_enabled:
-                        self._reset_fall_state(keep_baseline=True)
-                    elif self._fall_confirmed:
+                    cancel_version = self.controller.get_fall_cancel_version()
+                except Exception:
+                    cancel_version = self._fall_cancel_version
+                if cancel_version != self._fall_cancel_version:
+                    # 只在用户明确选择 off 时取消当前事件；普通模式保持 off
+                    # 并不会关闭检测，否则开机默认 off 时将无法识别跌倒。
+                    self._fall_cancel_version = cancel_version
+                    self._reset_fall_state()
+                if self.fall_detection_enabled and sample_pending:
+                    if self._fall_confirmed:
                         if not self.controller.is_fall_alarm_active():
                             self._reset_fall_state(keep_baseline=True)
+                        else:
+                            self.controller.tick(now_ms)
                     else:
                         values = self.sensor.read_acceleration_g()
                         self._process_sample(now_ms, values)
-                    self._sensor_error_reported = False
-                except Exception as error:
-                    if not self._sensor_error_reported:
-                        print("[加速度] 采样服务异常：{}".format(error))
-                        self._sensor_error_reported = True
-            utime.sleep_ms(5)
+                        if self._fall_confirmed:
+                            self.controller.tick(now_ms)
+                self._sensor_error_reported = False
+            except Exception as error:
+                if not self._sensor_error_reported:
+                    print("[加速度] 采样服务异常：{}".format(error))
+                    self._sensor_error_reported = True
+            # An IRQ/timer callback can arrive after _consume_sources() took
+            # its snapshot.  Re-arm the notification so that event is handled
+            # by the next iteration instead of being stranded in a flag.
+            if (self._running and
+                    (self._int1_pending or self._int2_pending or
+                     self._sample_pending or self._fall_config_pending or
+                     self._double_click_config_pending)):
+                self._wake_worker()
+        self._thread_started = False
 
 
 def run_4270hz_sampling_test(interval_ms=100, sample_count=None,

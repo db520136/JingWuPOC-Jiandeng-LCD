@@ -140,7 +140,7 @@ class CAT1_GNSS:
             gga = self._find_last_gga(text)
             print("***************88111***********")
             if self.test_a == 1:
-                gga = "$GNGGA,100601.00,2758.75564,N,12044.39540,E,1,05,2.21,172.9,M,,M,,*58"
+                #gga = "$GNGGA,100601.00,2758.75564,N,12044.39540,E,1,05,2.21,172.9,M,,M,,*58"
                 self.test_a = 0
             print("[GNSS] 定位信息：{}".format(gga or text.strip() or "无"))
             

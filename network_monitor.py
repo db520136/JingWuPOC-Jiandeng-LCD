@@ -2,8 +2,8 @@
 """EC800M SIM 卡、网络连接和信号状态监控。
 
 本模块不直接操作 LVGL。网络就绪检查可能阻塞最长 30 秒，因此只在一个
-后台线程中调用 ``checkNet.waitNetworkReady(30)``；主线程通过 ``tick()``
-读取缓存并负责更新界面。SIM 卡号和信号值读取失败时不会抛出到 UI 主循环。
+后台线程中调用 ``checkNet.waitNetworkReady(30)``，并在同一线程采集 SIM/信号；
+主线程通过 ``tick()`` 只读取缓存。硬件访问不会再阻塞 LCD/LVGL 循环。
 """
 
 import utime
@@ -29,7 +29,7 @@ except Exception:
     checkNet = None
 
 
-# 信号值每30秒采集一次；进入网络状态页时可通过 refresh_now() 立即采集。
+# 信号值每30秒采集一次；进入网络状态页时可请求后台提前采集。
 SIGNAL_REFRESH_INTERVAL_MS = 30000
 NETWORK_RETRY_INTERVAL_MS = 5000
 _DEFAULT_MONITOR = None
@@ -91,6 +91,7 @@ class NetworkMonitor:
         self._revision = 0
         self._reported_revision = -1
         self._next_signal_ms = utime.ticks_ms()
+        self._signal_refresh_requested = True
         self._network_worker_running = False
         self._network_worker_id = None
         self._lock = None
@@ -137,6 +138,15 @@ class NetworkMonitor:
         """后台执行可能阻塞的网络就绪检测，不接触任何 LVGL 对象。"""
         try:
             while self._network_worker_running:
+                now_ms = utime.ticks_ms()
+                if (self._signal_refresh_requested or
+                        _ticks_diff(now_ms, self._next_signal_ms) >= 0):
+                    # Clear before the hardware call so a concurrent page
+                    # refresh request remains pending for the next iteration.
+                    self._signal_refresh_requested = False
+                    self._update_signal_cache()
+                    self._next_signal_ms = _ticks_add(
+                        utime.ticks_ms(), self.signal_interval_ms)
                 stage = None
                 state = None
                 connected = False
@@ -232,34 +242,13 @@ class NetworkMonitor:
             self._lock_release()
 
     def tick(self, now_ms=None):
-        """由 LVGL 主循环调用；开机立即读取，之后每30秒读取一次。
-
-        只有缓存发生变化时才返回快照，否则返回 None。
-        """
-        if now_ms is None:
-            now_ms = utime.ticks_ms()
-        if _ticks_diff(now_ms, self._next_signal_ms) >= 0:
-            self._update_signal_cache()
-            self._next_signal_ms = _ticks_add(
-                now_ms, self.signal_interval_ms)
-
+        """Return a changed cached snapshot without any hardware access."""
         return self.get_snapshot_if_changed()
 
     def refresh_now(self, now_ms=None):
-        """立即刷新 SIM/信号缓存并返回完整快照。
-
-        网络状态页打开时调用此方法，避免等待下一个30秒周期；刷新后重新
-        计算下一次周期，防止页面打开后连续采集两次。
-        """
-        if now_ms is None:
-            now_ms = utime.ticks_ms()
-        self._update_signal_cache()
-        self._next_signal_ms = _ticks_add(now_ms, self.signal_interval_ms)
-        # 标记本次刷新已被消费，避免页面打开后下一轮tick重复返回同一快照。
-        snapshot = self.get_snapshot_if_changed()
-        if snapshot is None:
-            snapshot = self.get_snapshot()
-        return snapshot
+        """Request an asynchronous signal refresh and return current cache."""
+        self._signal_refresh_requested = True
+        return self.get_snapshot()
 
     def get_snapshot_if_changed(self):
         """返回一次性变化快照，避免主循环重复刷新标签。"""
