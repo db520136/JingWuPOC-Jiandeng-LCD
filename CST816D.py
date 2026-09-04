@@ -13,8 +13,17 @@ CST816D_I2C_MODE = I2C.FAST_MODE
 CST816D_DYNAMIC_SAMPLE_HZ = 100
 CST816D_DYNAMIC_SAMPLE_INTERVAL_MS = 1000 // CST816D_DYNAMIC_SAMPLE_HZ
 CST816D_RELEASE_CONFIRM_MS = 2000
+# Time-based release handling is independent of the variable main-loop rate.
+# The first 200ms suppresses a noisy transition; after 1s without a touch the
+# LCD fast path may resume deferred work, while the 2s confirmation below still
+# controls IRQ re-enable and dynamic-session completion.
+CST816D_RELEASE_DEBOUNCE_MS = 200
+CST816D_FAST_PATH_RELEASE_MS = 1000
 CST816D_SWIPE_DISTANCE_PX = 30
 CST816D_FILTER_DEADZONE_PX = 3
+# Keep gesture classification visible while allowing the remaining CST816D
+# performance/session diagnostics to be silenced during UI tests.
+CST816D_DIAGNOSTIC_LOG_ENABLED = False
 # CST816D reports the touch panel in portrait coordinates (240x296), while
 # ST7789 is configured for 296x240 landscape.  The panel must be rotated
 # clockwise to line up with the LCD.
@@ -47,9 +56,9 @@ class CST816D:
         self.swipe_distance_px = max(1, int(swipe_distance_px))
         self.filter_deadzone_px = max(0, int(filter_deadzone_px))
         self.i2c = I2C(CST816D_I2C_BUS, CST816D_I2C_MODE)
-        self.reset_pin = Pin(CST816D_RESET_GPIO, Pin.OUT,
-                              Pin.PULL_DISABLE, 1)
-        utime.sleep_ms(100)
+        #self.reset_pin = Pin(CST816D_RESET_GPIO, Pin.OUT,
+        #                      Pin.PULL_DISABLE, 1)
+        #utime.sleep_ms(500)
         self.irq = None
         self._running = False
         self._irq_pending = False
@@ -65,8 +74,16 @@ class CST816D:
         self._release_since_ms = None
         self._session_started_ms = None
         self._session_samples = 0
+        # Strict fast-path statistics.  Release-confirmation polls (including
+        # the controller's 2 s tail) are intentionally excluded so the
+        # reported rate describes only samples obtained while a finger was
+        # actually down in the LCD fast path.
+        self._fast_session_started_ms = None
+        self._fast_session_last_touch_ms = None
+        self._fast_session_samples = 0
         self._press_generation = 0
         self._irq_count = 0
+        self._last_i2c_read_us = 0
         self._last_event_flag = 0
         self._gesture_reported = False
         self._deferred_release = False
@@ -133,9 +150,10 @@ class CST816D:
         if callback is not None:
             self._gesture_callback = callback
         chip, project, version = self.read_identity()
-        print("[CST816D] started I2C1 IRQ=GPIO11 RST=GPIO15 "
-                      "chip=0x{:02X} project=0x{:02X} fw=0x{:02X} target={}Hz".format(
-                          chip, project, version, CST816D_DYNAMIC_SAMPLE_HZ))
+        if CST816D_DIAGNOSTIC_LOG_ENABLED:
+            print("[CST816D] started I2C1 IRQ=GPIO11 RST=GPIO15 "
+                          "chip=0x{:02X} project=0x{:02X} fw=0x{:02X} target={}Hz".format(
+                              chip, project, version, CST816D_DYNAMIC_SAMPLE_HZ))
         self._configure()
         self._running = True
         self._enable_irq()
@@ -150,6 +168,24 @@ class CST816D:
 
     def is_dynamic_active(self):
         return bool(self._dynamic)
+
+    def is_fast_path_active(self):
+        """Whether the LCD should keep the touch fast path enabled.
+
+        Dynamic sampling remains active through the controller's 2s release
+        confirmation, but expensive UI work is allowed again after 1s of
+        continuous no-touch samples.
+        """
+        if not self._dynamic:
+            return False
+        if self._release_since_ms is None:
+            return True
+        try:
+            return (utime.ticks_diff(utime.ticks_ms(),
+                                     self._release_since_ms) <
+                    CST816D_FAST_PATH_RELEASE_MS)
+        except Exception:
+            return True
 
     def is_pressed(self):
         return bool(self._pressed)
@@ -167,12 +203,33 @@ class CST816D:
         return self._press_generation
 
     def _read_point(self):
-        data = self._read_regs(REG_FINGER_NUM, 5)
+        try:
+            started_us = utime.ticks_us()
+            use_us = True
+        except Exception:
+            started_us = utime.ticks_ms()
+            use_us = False
+        try:
+            data = self._read_regs(REG_FINGER_NUM, 5)
+        finally:
+            try:
+                if use_us:
+                    self._last_i2c_read_us = utime.ticks_diff(
+                        utime.ticks_us(), started_us)
+                else:
+                    self._last_i2c_read_us = 1000 * utime.ticks_diff(
+                        utime.ticks_ms(), started_us)
+            except Exception:
+                self._last_i2c_read_us = 0
         fingers = data[0]
         event_flag = (data[1] >> 6) & 0x03
         x = ((data[1] & 0x0F) << 8) | data[2]
         y = ((data[3] & 0x0F) << 8) | data[4]
         return fingers, event_flag, x, y
+
+    def get_last_i2c_read_us(self):
+        """Return the most recent 5-byte coordinate I2C transaction time."""
+        return int(self._last_i2c_read_us)
 
     def _filter_point(self, point):
         if self._last_point is not None:
@@ -210,13 +267,21 @@ class CST816D:
 
     def _finish_session(self):
         now = utime.ticks_ms()
-        elapsed_ms = max(1, utime.ticks_diff(now, self._session_started_ms))
-        frequency = ((self._session_samples - 1) * 1000.0 / elapsed_ms
-                     if self._session_samples > 1 else 0.0)
-        print("[CST816D] 触摸结束：采样次数={} 时长={}ms 实际频率={:.1f}Hz "
-              "最后状态={} IRQ次数={}".format(
-                  self._session_samples, elapsed_ms, frequency,
-                  self._last_event_flag, self._irq_count))
+        stats_started = (self._fast_session_started_ms
+                         if self._fast_session_started_ms is not None
+                         else self._session_started_ms)
+        stats_ended = (self._fast_session_last_touch_ms
+                       if self._fast_session_last_touch_ms is not None
+                       else now)
+        elapsed_ms = max(1, utime.ticks_diff(stats_ended, stats_started))
+        sample_count = self._fast_session_samples
+        frequency = ((sample_count - 1) * 1000.0 / elapsed_ms
+                     if sample_count > 1 else 0.0)
+        if CST816D_DIAGNOSTIC_LOG_ENABLED:
+            print("[CST816D] 触摸结束：快速采样次数={} 快速时长={}ms 快速实际频率={:.1f}Hz "
+                  "最后状态={} IRQ次数={}".format(
+                      sample_count, elapsed_ms, frequency,
+                      self._last_event_flag, self._irq_count))
         self._dynamic = False
         self._pressed = False
         self._input_point = (0, 0)
@@ -226,6 +291,9 @@ class CST816D:
         self._release_since_ms = None
         self._session_started_ms = None
         self._session_samples = 0
+        self._fast_session_started_ms = None
+        self._fast_session_last_touch_ms = None
+        self._fast_session_samples = 0
         self._gesture_reported = False
         self._deferred_release = False
         self._irq_pending = False
@@ -244,6 +312,9 @@ class CST816D:
             self._dynamic = True
             self._session_started_ms = utime.ticks_ms()
             self._session_samples = 0
+            self._fast_session_started_ms = self._session_started_ms
+            self._fast_session_last_touch_ms = None
+            self._fast_session_samples = 0
             self._start_point = None
             self._last_point = None
             self._release_since_ms = None
@@ -271,6 +342,9 @@ class CST816D:
                         (new_press and self._start_point is not None)):
                     self._session_started_ms = now
                     self._session_samples = 1
+                    self._fast_session_started_ms = now
+                    self._fast_session_last_touch_ms = None
+                    self._fast_session_samples = 0
                     self._start_point = None
                     self._last_point = None
                     self._gesture_reported = False
@@ -285,8 +359,20 @@ class CST816D:
                 self._last_point = point
                 self._pressed = True
                 self._release_since_ms = None
+                self._fast_session_samples += 1
+                self._fast_session_last_touch_ms = now
             else:
-                self._pressed = False
+                if self._release_since_ms is None:
+                    self._release_since_ms = now
+                release_elapsed = utime.ticks_diff(
+                    now, self._release_since_ms)
+                if (self._pressed and
+                        release_elapsed < CST816D_RELEASE_DEBOUNCE_MS):
+                    # Keep publishing the last coordinate while the release
+                    # transition is debounced by time, not frame count.
+                    return True
+                if self._pressed:
+                    self._pressed = False
                 if self._start_point is not None:
                     self._report_gesture_once()
                 elif (self._session_samples == 1 and
@@ -301,12 +387,14 @@ class CST816D:
                     self._point = self._landscape_point(raw_point)
                     self._pressed = True
                     self._deferred_release = True
+                    # Count the synthetic first point as a fast-path sample;
+                    # otherwise a very short tap would report zero samples
+                    # even though its coordinate was delivered to LVGL.
+                    self._fast_session_samples += 1
+                    self._fast_session_last_touch_ms = now
                     self._release_since_ms = None
                     return True
-                if self._release_since_ms is None:
-                    self._release_since_ms = now
-                elif utime.ticks_diff(now, self._release_since_ms) >= \
-                        CST816D_RELEASE_CONFIRM_MS:
+                if release_elapsed >= CST816D_RELEASE_CONFIRM_MS:
                     self._finish_session()
             return True
         except Exception as error:

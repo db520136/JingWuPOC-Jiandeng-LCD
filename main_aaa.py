@@ -16,8 +16,8 @@ FIRMWARE_VER = modem.getDevFwVersion()  #获取到固件版本
 SOFTWARE_VER = "1.0.18"                  #软件版本
 HARDWARE_VER = "1.0.0"                  #硬件版本
 # POC服务器参数集中放在启动入口，后续更换测试服务器无需修改业务模块。
-DEVICE_ID = "33030002002000000591"
-
+DEVICE_ID = "33030002002000000590"
+#
 
 
 POC_TCP_PORT = 6060
@@ -31,6 +31,13 @@ POC_TCP_RETRY_TIMEOUT_STEP_MS = 500
 # PCM使用4个底层周期缓冲；RTP接收先缓存5包（约100ms）再开始播放。
 POC_PCM_PERIOD_COUNT = 4
 POC_RTP_JITTER_PACKETS = 5
+# A/B diagnosis switches. Keep all enabled for normal operation; set one to
+# False for an isolated touch-frequency run without changing UI code.
+AB_ENABLE_NETWORK_MONITOR = True
+AB_ENABLE_RTP_AUDIO = True
+AB_ENABLE_POC_TCP = True
+AB_ENABLE_POC_TCP_TX = True
+AB_ENABLE_HARDWARE_KEYS = True
 
 POC_TCP_HOST = "125.124.233.231"
 POC_HTTP_URL = (
@@ -102,6 +109,10 @@ def feed(t):
 
 # 设备启动入口：先打开外设 3.3V，再创建横屏界面并进入 LVGL 事件循环。
 if __name__ == "__main__":
+    print("网络监控线程={},RTP音频线程={},POC/TCP线程={},TCP发送控制线程={},物理按键线程={}".format(
+        AB_ENABLE_NETWORK_MONITOR, AB_ENABLE_RTP_AUDIO, AB_ENABLE_POC_TCP,
+        AB_ENABLE_POC_TCP_TX, AB_ENABLE_HARDWARE_KEYS))
+
     # LCD 供电恢复前先关闭背光，避免 ST7789 尚未刷新时显示历史 GRAM 内容。
     lcd_touch.prepare_backlight_off()
     #EN_3V3 = Pin(Pin.GPIO12, Pin.OUT, Pin.PULL_DISABLE, 1)
@@ -130,11 +141,12 @@ if __name__ == "__main__":
         http_url=POC_HTTP_URL,
         location_map_url=POC_LOCATION_MAP_URL,
         location_address_url=POC_LOCATION_ADDRESS_URL,
-        network_monitor=network_monitor,
+        network_monitor=(network_monitor if AB_ENABLE_NETWORK_MONITOR else None),
         gnss_upload_interval_ms=POC_GNSS_UPLOAD_INTERVAL_MS,
         tcp_max_retries=POC_TCP_MAX_RETRIES,
         tcp_retry_initial_timeout_ms=POC_TCP_RETRY_INITIAL_TIMEOUT_MS,
         tcp_retry_timeout_step_ms=POC_TCP_RETRY_TIMEOUT_STEP_MS,
+        enable_tx_worker=AB_ENABLE_POC_TCP_TX,
     )
     # RTP 与 TCP 使用同一服务器地址；服务器UDP端口由0x88/0x0B应答更新。  ptt 27
     rtp_audio = RTPAudioController(
@@ -153,11 +165,12 @@ if __name__ == "__main__":
     )
     # 此时登录页和LCD首帧已准备完成，再启动网络和POC线程；
     # 进入run()后网络连接、登录页面和LVGL主循环并行运行。
-    if not network_monitor.start_network_worker():
+    if AB_ENABLE_NETWORK_MONITOR and not network_monitor.start_network_worker():
         print("[网络] 后台检测线程未能启动或已经运行")
-    if not rtp_audio.start():
+    if AB_ENABLE_RTP_AUDIO and not rtp_audio.start():
         print("[RTP] 音频服务未能启动")
-    if not poc_client.start():
+    if AB_ENABLE_POC_TCP and not poc_client.start(
+            enable_tx_worker=AB_ENABLE_POC_TCP_TX):
         print("[POC] 后台线程未能启动")
     hardware_key_service = HardwareKeyService(
         rtp_audio,
@@ -166,7 +179,7 @@ if __name__ == "__main__":
         volume_up_gpio=30,
         volume_down_gpio=31,
     )
-    if not hardware_key_service.start():
+    if AB_ENABLE_HARDWARE_KEYS and not hardware_key_service.start():
         print("[按键] 物理按键服务未能启动")
     ui.run()
 

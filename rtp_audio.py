@@ -32,9 +32,10 @@ except Exception:
     G711 = None
 
 try:
-    from machine import Pin
+    from machine import Pin, ExtInt
 except Exception:
     Pin = None
+    ExtInt = None
 
 try:
     import dataCall
@@ -205,9 +206,26 @@ class RTPAudioController:
         self._rx_no_packet_warned = False
         self._stats_started_ms = _ticks_ms()
         self._stats = self._new_stats()
+        self._perf_worker = [0, 0, 0, 0, 0, 0]
+        self._perf_recv = [0, 0, 0, 0, 0, 0]
         self.volume = 11
         self.volume_revision = 0
         self._key_beep_pending = False
+        self._event_sem = None
+        self._wake_pending = False
+        if _thread is not None:
+            try:
+                self._event_sem = _thread.allocate_semphore(1)
+                try:
+                    self._event_sem.acquire()
+                except Exception:
+                    pass
+            except Exception:
+                try:
+                    self._event_sem = _thread.allocate_lock()
+                    self._event_sem.acquire()
+                except Exception:
+                    self._event_sem = None
         self.on_request_floor = None
         self.on_release_floor = None
 
@@ -222,6 +240,15 @@ class RTPAudioController:
             self._speaker_enabled = enabled
         except Exception:
             pass
+
+    def _wake_worker(self):
+        if self._event_sem is None or self._wake_pending:
+            return
+        self._wake_pending = True
+        try:
+            self._event_sem.release()
+        except Exception:
+            self._wake_pending = False
 
     @staticmethod
     def _new_stats():
@@ -608,6 +635,7 @@ class RTPAudioController:
         if pressed == self._ptt_pressed:
             return
         self._ptt_pressed = pressed
+        self._wake_worker()
         if pressed:
             if self.on_request_floor is not None:
                 if not self.on_request_floor():
@@ -634,6 +662,7 @@ class RTPAudioController:
         if self._ptt_pressed:
             # TCP线程只发布状态，首包和语音统一由RTP线程发送。
             self._start_tx_pending = True
+        self._wake_worker()
 
     def on_floor_released(self, group_id=None):
         self._stop_tx()
@@ -647,6 +676,7 @@ class RTPAudioController:
             self._rx_ui_wait_started_ms = None
             self._clear_receive_probe()
             self._reset_receive_state()
+        self._wake_worker()
 
     def stop_transmit(self):
         """立即停止本地PCM采集和RTP发送，不等待TCP释放麦应答。"""
@@ -669,6 +699,7 @@ class RTPAudioController:
         print("[RTP] 远端讲话准备接收：group_id={}，本地端口={}，目标={}:{}".format(
             self._rx_group_id, self.local_port,
             self.server_ip, self.server_port))
+        self._wake_worker()
 
     def on_floor_occupied_probe(self, group_id, udp_port):
         """排队发送0x0B首包，不改变当前音频收发或播放状态。"""
@@ -691,6 +722,7 @@ class RTPAudioController:
             [group_id, udp_port, now_ms, 0, now_ms])
         print("[RTP] 已安排0x0B UDP首包：group_id={}，目标={}:{}".format(
             group_id, self.server_ip, udp_port))
+        self._wake_worker()
         return True
 
     def on_floor_idle(self, group_id):
@@ -898,6 +930,7 @@ class RTPAudioController:
             self._stats["rx_buffer_max"] = buffered
 
     def _receive_available(self, max_packets=None):
+        started_ms = _ticks_ms()
         received = 0
         limit = (RTP_RECEIVE_BURST if max_packets is None else
                  max(1, int(max_packets)))
@@ -908,6 +941,14 @@ class RTPAudioController:
                 break
             received += 1
             self._queue_received_packet(packet)
+        elapsed = _ticks_diff(_ticks_ms(), started_ms)
+        item = self._perf_recv
+        item[0] += 1
+        item[1] += elapsed
+        item[2] = max(item[2], elapsed)
+        if elapsed >= 30: item[3] += 1
+        if elapsed >= 50: item[4] += 1
+        if elapsed >= 100: item[5] += 1
 
     def _get_pcm_free_count(self):
         getter = getattr(self.pcm, "getWriteFrameCount", None)
@@ -1085,6 +1126,7 @@ class RTPAudioController:
 
     def _worker(self):
         while self._running:
+            worker_started_ms = _ticks_ms()
             if self.socket is None:
                 try:
                     self._init_socket()
@@ -1093,6 +1135,20 @@ class RTPAudioController:
                     print("[RTP] UDP端口绑定失败，稍后重试：{}".format(error))
                     utime.sleep_ms(1000)
                     continue
+            # Socket setup remains available for the next audio event, but an
+            # idle RTP service does not repeatedly poll UDP/PCM.  TCP floor,
+            # PTT and remote-audio callbacks wake this semaphore.
+            if (self._event_sem is not None and
+                    not (self._tx_active or self._start_tx_pending or
+                         self._rx_group_id is not None or
+                         self._floor_probe_queue)):
+                try:
+                    self._event_sem.acquire()
+                    self._wake_pending = False
+                except Exception:
+                    pass
+                if not self._running:
+                    break
             now = _ticks_ms()
             # 弹框首帧确认前限制接收突发，避免RTP线程一次处理多个包抢占
             # LCD主线程；套接字仍保持少量读取，防止接收缓存立即溢出。
@@ -1155,9 +1211,30 @@ class RTPAudioController:
             except Exception:
                 pass
 
+            elapsed = _ticks_diff(_ticks_ms(), worker_started_ms)
+            item = self._perf_worker
+            item[0] += 1
+            item[1] += elapsed
+            item[2] = max(item[2], elapsed)
+            if elapsed >= 30: item[3] += 1
+            if elapsed >= 50: item[4] += 1
+            if elapsed >= 100: item[5] += 1
+
+    def get_thread_perf_snapshot(self):
+        result = {"worker": tuple(self._perf_worker),
+                  "recv": tuple(self._perf_recv)}
+        for item in (self._perf_worker, self._perf_recv):
+            for i in range(6): item[i] = 0
+        return result
+
 
 class HardwareKeyService:
-    """单线程处理PTT及音量键，减少EC800M线程栈内存占用。"""
+    """GPIO中断唤醒、线程内消抖的PTT及音量键服务。
+
+    空闲时工作线程永久阻塞在信号量上，不再按固定周期轮询 GPIO；中断
+    回调只记录“有按键变化”并唤醒线程，所有读取和业务调用都在线程上下文
+    执行，避免在 ISR 中做耗时操作。
+    """
 
     def __init__(self, controller, on_activity=None, ptt_gpio=29,
                  volume_up_gpio=30, volume_down_gpio=31, poll_ms=10,
@@ -1178,6 +1255,33 @@ class HardwareKeyService:
         self._down_pressed = False
         self._candidate = None
         self._candidate_since_ms = None
+        self._irq_objects = []
+        self._event_sem = self._new_event_sem()
+        self._wake_pending = False
+
+    @staticmethod
+    def _new_event_sem():
+        if _thread is None:
+            return None
+        try:
+            sem = _thread.allocate_semphore(1)
+            # QuecPython may create a semaphore with count 1; make the
+            # initial state blocked so idle service threads do not spin.
+            try:
+                count = sem.getCnt()
+                initial = count[1] if isinstance(count, (tuple, list)) else count
+                for _ in range(int(initial or 0)):
+                    sem.acquire()
+            except Exception:
+                try:
+                    sem.acquire()
+                except Exception:
+                    pass
+            return sem
+        except Exception:
+            sem = _thread.allocate_lock()
+            sem.acquire()
+            return sem
 
     def _make_input(self, gpio):
         pin_id = getattr(Pin, "GPIO{}".format(gpio), gpio)
@@ -1186,6 +1290,39 @@ class HardwareKeyService:
             return Pin(pin_id, Pin.IN, pull, 1)
         except TypeError:
             return Pin(pin_id, Pin.IN, pull)
+
+    def _wake_worker(self):
+        if self._event_sem is None or self._wake_pending:
+            return
+        self._wake_pending = True
+        try:
+            self._event_sem.release()
+        except Exception:
+            self._wake_pending = False
+
+    def _on_gpio_irq(self, *args):
+        # ISR 中只做一次合并通知；不读 GPIO、不调用 PTT/音量业务。
+        self._wake_worker()
+
+    def _make_irq(self, gpio):
+        if ExtInt is None:
+            return None
+        # QuecPython names the dual-edge trigger IRQ_RISING_FALLING.  Use the
+        # ExtInt GPIO namespace when present; Pin GPIO values are numerically
+        # compatible on older firmware.
+        pin_id = getattr(ExtInt, "GPIO{}".format(gpio),
+                         getattr(Pin, "GPIO{}".format(gpio), gpio))
+        mode = getattr(ExtInt, "IRQ_RISING_FALLING",
+                       getattr(ExtInt, "IRQ_BOTH_EDGE",
+                               getattr(ExtInt, "IRQ_FALLING", 2)))
+        pull = getattr(ExtInt, "PULL_PU",
+                       getattr(ExtInt, "PULL_UP", 1))
+        try:
+            irq = ExtInt(pin_id, mode, pull, self._on_gpio_irq)
+        except TypeError:
+            irq = ExtInt(pin_id, mode, self._on_gpio_irq)
+        irq.enable()
+        return irq
 
     def start(self):
         if Pin is None or _thread is None:
@@ -1202,15 +1339,37 @@ class HardwareKeyService:
                                self._down_pressed)
             self._candidate_since_ms = _ticks_ms()
             self._running = True
+            self._irq_objects = []
+            for gpio in (self.ptt_gpio, self.volume_up_gpio,
+                         self.volume_down_gpio):
+                irq = self._make_irq(gpio)
+                if irq is None:
+                    raise RuntimeError("machine.ExtInt不可用")
+                self._irq_objects.append(irq)
             _thread.start_new_thread(self._worker, ())
-            print("[按键] 已启动：GPIO29 PTT，GPIO30音量+，GPIO31音量-")
+            print("[按键] 已启动：GPIO{} PTT，GPIO{}音量+，GPIO{}音量-（GPIO中断）".format(
+                self.ptt_gpio, self.volume_up_gpio, self.volume_down_gpio))
             return True
         except Exception as error:
+            for irq in self._irq_objects:
+                try:
+                    irq.disable()
+                except Exception:
+                    pass
+            self._irq_objects = []
+            self._running = False
             print("[按键] 初始化失败：{}".format(error))
             return False
 
     def stop(self):
         self._running = False
+        for irq in self._irq_objects:
+            try:
+                irq.disable()
+            except Exception:
+                pass
+        self._irq_objects = []
+        self._wake_worker()
 
     def _released(self, delta):
         value = self.controller.change_volume(delta)
@@ -1222,20 +1381,22 @@ class HardwareKeyService:
     def _worker(self):
         while self._running:
             try:
+                self._event_sem.acquire()
+            except Exception:
+                return
+            self._wake_pending = False
+            if not self._running:
+                break
+            try:
+                # 中断只表示“可能变化”；等待消抖时间后一次性读取稳定电平。
+                utime.sleep_ms(self.debounce_ms)
                 ptt = (int(self.ptt_pin.read()) == 0)
                 up = (int(self.up_pin.read()) == 0)
                 down = (int(self.down_pin.read()) == 0)
                 raw = (ptt, up, down)
                 now = _ticks_ms()
-                if raw != self._candidate:
-                    self._candidate = raw
-                    self._candidate_since_ms = now
-                    utime.sleep_ms(self.poll_ms)
-                    continue
-                if (_ticks_diff(now, self._candidate_since_ms) <
-                        self.debounce_ms):
-                    utime.sleep_ms(self.poll_ms)
-                    continue
+                self._candidate = raw
+                self._candidate_since_ms = now
                 if ptt != self._ptt_pressed:
                     self._ptt_pressed = ptt
                     if self.on_activity is not None:
@@ -1249,4 +1410,3 @@ class HardwareKeyService:
                 self._down_pressed = down
             except Exception as error:
                 print("[按键] 读取失败：{}".format(error))
-            utime.sleep_ms(self.poll_ms)

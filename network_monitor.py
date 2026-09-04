@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """EC800M SIM 卡、网络连接和信号状态监控。
 
-本模块不直接操作 LVGL。网络就绪检查可能阻塞最长 30 秒，因此只在一个
-后台线程中调用 ``checkNet.waitNetworkReady(30)``，并在同一线程采集 SIM/信号；
+本模块不直接操作 LVGL。网络状态检查只在后台线程执行，并在同一线程采集
+SIM/信号；触摸快速路径期间暂停低优先级检查，避免抢占 LCD 主循环。
 主线程通过 ``tick()`` 只读取缓存。硬件访问不会再阻塞 LCD/LVGL 循环。
 """
 
@@ -24,14 +24,28 @@ except Exception:
     net = None
 
 try:
+    import dataCall
+except Exception:
+    dataCall = None
+
+try:
     import checkNet
 except Exception:
     checkNet = None
 
 
+
 # 信号值每30秒采集一次；进入网络状态页时可请求后台提前采集。
 SIGNAL_REFRESH_INTERVAL_MS = 30000
 NETWORK_RETRY_INTERVAL_MS = 5000
+# Prefer the non-blocking modem status APIs.  ``checkNet.waitNetworkReady``
+# is retained only as a compatibility fallback when a firmware does not
+# expose a recognizable status shape.
+NETWORK_DIRECT_STATUS = True
+# During an active touch/scroll, signal and other proactive network work may
+# be deferred for a bounded period.  The bound prevents a continuously held
+# finger from starving network state refresh forever.
+UI_INTERACTION_DEFER_MAX_MS = 30000
 _DEFAULT_MONITOR = None
 
 # 返回给界面的固定等级名称，颜色由 lcd_touch.py 根据等级决定。
@@ -95,6 +109,11 @@ class NetworkMonitor:
         self._network_worker_running = False
         self._network_worker_id = None
         self._lock = None
+        self._ui_interaction_active = False
+        self._ui_interaction_started_ms = None
+        self._perf_worker = [0, 0, 0, 0, 0, 0]
+        self._perf_wait_ready = [0, 0, 0, 0, 0, 0]
+        self._perf_signal = [0, 0, 0, 0, 0, 0]
 
         if _thread is not None:
             try:
@@ -116,12 +135,58 @@ class NetworkMonitor:
     def _bump_revision(self):
         self._revision += 1
 
+    @staticmethod
+    def _perf_add(item, elapsed):
+        item[0] += 1
+        item[1] += elapsed
+        item[2] = max(item[2], elapsed)
+        if elapsed >= 30: item[3] += 1
+        if elapsed >= 50: item[4] += 1
+        if elapsed >= 100: item[5] += 1
+
+    def get_thread_perf_snapshot(self):
+        result = {}
+        for name, item in (("worker", self._perf_worker),
+                           ("wait_ready", self._perf_wait_ready),
+                           ("signal", self._perf_signal)):
+            result[name] = tuple(item)
+            for i in range(6): item[i] = 0
+        return result
+
+    def set_ui_interaction_active(self, active):
+        """Gate low-priority signal polling while the LCD is being touched.
+
+        This only changes a flag; it never acquires the monitor lock and never
+        interrupts an in-progress modem operation.  The worker checks the flag
+        before starting the next signal read and automatically resumes after
+        ``UI_INTERACTION_DEFER_MAX_MS``.
+        """
+        active = bool(active)
+        if active == self._ui_interaction_active:
+            return
+        self._ui_interaction_active = active
+        self._ui_interaction_started_ms = (
+            utime.ticks_ms() if active else None)
+
+    def _ui_interaction_deferred(self, now_ms=None):
+        if not self._ui_interaction_active:
+            return False
+        started = self._ui_interaction_started_ms
+        if started is None:
+            return False
+        if now_ms is None:
+            now_ms = utime.ticks_ms()
+        return _ticks_diff(now_ms, started) < UI_INTERACTION_DEFER_MAX_MS
+
     def start_network_worker(self):
         """启动唯一网络检测线程；重复调用不会创建多个线程。"""
         if self._network_worker_running:
             return False
-        if _thread is None or checkNet is None:
-            self.last_error = RuntimeError("网络线程或 checkNet 库不可用")
+        if (_thread is None or
+                (not NETWORK_DIRECT_STATUS and checkNet is None) or
+                (NETWORK_DIRECT_STATUS and net is None and
+                 dataCall is None and checkNet is None)):
+            self.last_error = RuntimeError("网络线程或网络状态接口不可用")
             return False
         self._network_worker_running = True
         try:
@@ -138,25 +203,116 @@ class NetworkMonitor:
         """后台执行可能阻塞的网络就绪检测，不接触任何 LVGL 对象。"""
         try:
             while self._network_worker_running:
+                worker_started_ms = utime.ticks_ms()
                 now_ms = utime.ticks_ms()
-                if (self._signal_refresh_requested or
-                        _ticks_diff(now_ms, self._next_signal_ms) >= 0):
+
+                # ``checkNet.waitNetworkReady`` is a low-priority
+                # readiness probe.  Some QuecPython builds implement this
+                # call with a long Python-side polling loop; allowing it to
+                # start while the LCD is in its touch fast path can therefore
+                # steal the interpreter for tens/hundreds of milliseconds.
+                # Defer the *whole* probe (not just signal sampling) until
+                # the interaction ends.  The cached state remains valid for
+                # the bounded 30-second interaction window.
+                if self._ui_interaction_deferred(now_ms):
+                    # Use a coarse one-second checkpoint rather than a
+                    # 100-ms polling loop.  This preserves the 30-second
+                    # starvation bound while keeping scheduler wakeups rare.
+                    utime.sleep_ms(1000)
+                    self._perf_add(self._perf_worker,
+                                   _ticks_diff(utime.ticks_ms(),
+                                               worker_started_ms))
+                    continue
+
+                signal_due = (self._signal_refresh_requested or
+                              _ticks_diff(now_ms, self._next_signal_ms) >= 0)
+                if (signal_due and
+                        not self._ui_interaction_deferred(now_ms)):
                     # Clear before the hardware call so a concurrent page
                     # refresh request remains pending for the next iteration.
                     self._signal_refresh_requested = False
+                    signal_started_ms = utime.ticks_ms()
                     self._update_signal_cache()
+                    self._perf_add(self._perf_signal,
+                                   _ticks_diff(utime.ticks_ms(), signal_started_ms))
                     self._next_signal_ms = _ticks_add(
                         utime.ticks_ms(), self.signal_interval_ms)
+                # Prefer direct, non-blocking modem status reads.  This avoids
+                # an in-flight 30-second waitNetworkReady() call straddling a
+                # touch edge and stealing the interpreter from the LCD loop.
                 stage = None
                 state = None
                 connected = False
+                wait_started_ms = utime.ticks_ms()
                 try:
-                    wait_ready = getattr(checkNet, "waitNetworkReady")
-                    stage, state = wait_ready(30)
-                    connected = stage == 3 and state == 1
+                    direct_known = False
+                    if NETWORK_DIRECT_STATUS and (net is not None or
+                                                   dataCall is not None):
+                        net_ready = None
+                        if net is not None:
+                            try:
+                                net_state = net.getState()
+                                if isinstance(net_state, (tuple, list)):
+                                    if (len(net_state) >= 2 and
+                                            not isinstance(net_state[1],
+                                                         (tuple, list))):
+                                        stage = int(net_state[0])
+                                        state = int(net_state[1])
+                                        net_ready = (stage == 3 and
+                                                     state == 1)
+                                    elif len(net_state) >= 2:
+                                        nested = net_state[1]
+                                        net_ready = (int(nested[0]) == 1)
+                                    elif len(net_state) == 1:
+                                        net_ready = int(net_state[0]) == 1
+                                elif net_state is not None:
+                                    net_ready = int(net_state) == 1
+                            except Exception:
+                                net_ready = None
+                        data_ready = None
+                        if dataCall is not None:
+                            try:
+                                data_state = dataCall.getInfo(1, 0)
+                                if isinstance(data_state, (tuple, list)):
+                                    # QuecPython EC800M: index 2 contains a
+                                    # status tuple whose first field is 1
+                                    # when the PDP context is active.
+                                    if (len(data_state) > 2 and
+                                            isinstance(data_state[2],
+                                                      (tuple, list))):
+                                        data_ready = (int(data_state[2][0]) == 1)
+                                    elif len(data_state) > 0:
+                                        data_ready = int(data_state[0]) == 1
+                            except Exception:
+                                data_ready = None
+                        # Use the direct result only when every available
+                        # interface returned a recognizable value.  If one
+                        # modem API failed or changed shape, fall back to the
+                        # compatibility probe instead of reporting a false
+                        # "connected" state.
+                        direct_known = (
+                            (net is None or net_ready is not None) and
+                            (dataCall is None or data_ready is not None))
+                        if direct_known:
+                            if net_ready is None:
+                                net_ready = True
+                            if data_ready is None:
+                                data_ready = True
+                            connected = bool(net_ready and data_ready)
+                            if stage is None:
+                                stage = 3 if connected else 0
+                            if state is None:
+                                state = 1 if connected else 0
+                    if not direct_known:
+                        if checkNet is None:
+                            raise RuntimeError("网络状态接口不可用")
+                        stage, state = checkNet.waitNetworkReady(1)
+                        connected = (stage == 3 and state == 1)
                     self.last_error = None
                 except Exception as error:
                     self.last_error = error
+                self._perf_add(self._perf_wait_ready,
+                               _ticks_diff(utime.ticks_ms(), wait_started_ms))
                 self._lock_acquire()
                 try:
                     changed = (
@@ -173,6 +329,8 @@ class NetworkMonitor:
 
                 # 失败或断网时也不要立即紧循环，避免网络异常造成 CPU 占用。
                 utime.sleep_ms(NETWORK_RETRY_INTERVAL_MS)
+                self._perf_add(self._perf_worker,
+                               _ticks_diff(utime.ticks_ms(), worker_started_ms))
         except Exception as error:
             self.last_error = error
         finally:

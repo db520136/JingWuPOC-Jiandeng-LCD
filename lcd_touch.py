@@ -40,25 +40,19 @@ LCD_WIDTH = 296
 LCD_HEIGHT = 240
 STATUS_HEIGHT = 30
 PAGE_HEIGHT = LCD_HEIGHT - STATUS_HEIGHT
-DISPLAY_BUFFER_LINES = 90
+DISPLAY_BUFFER_LINES = 60
 DISPLAY_ENABLE_DOUBLE_BUFFER = False
 DISPLAY_DOUBLE_BUFFER_RESERVE = 160 * 1024
 DISPLAY_BOOT_CLEAR_LINES = 20
 PERF_REPORT_MS = 5000
+# Diagnostic output is intentionally off for normal UI/performance runs.  The
+# counters and report code remain intact; set True when field diagnostics are
+# needed again.
+PERF_LOG_ENABLED = False
+NAV_DEBUG_LOG_ENABLED = False
 MADCTL_LANDSCAPE_RGB = 0x60
 CLICK_MOVE_LIMIT = 12
-CLICK_DISPATCH_GUARD_MS = 100
-BACK_DRAG_START_DISTANCE = 8
-BACK_COMMIT_DISTANCE = LCD_WIDTH // 4
-BACK_FLICK_DISTANCE = LCD_WIDTH // 8
-BACK_FLICK_MAX_MS = 240
-BACK_DIRECTION_NUMERATOR = 2
-BACK_DIRECTION_DENOMINATOR = 3
-BACK_FRAME_INTERVAL_MS = 20
-BACK_REBOUND_MIN_MS = 20
-BACK_REBOUND_MAX_MS = 70
-BACK_COMPLETE_MIN_MS = 60
-BACK_COMPLETE_MAX_MS = 90
+CLICK_DISPATCH_GUARD_MS = 140
 TOUCH_POINT_NEEDS_ROTATION = True
 DISPLAY_INVERSION_COMMAND = 0x21
 FLUSH_BUFFER = None
@@ -82,9 +76,12 @@ POC_POPUP_FRAME_SUBMIT_MS = 20
 POC_POPUP_FRAME_MAX_WAIT_MS = 600
 AUDIO_LVGL_TASK_INTERVAL_MS = 20
 LCD_LOOP_YIELD_MS = 1
-# 手指实际移动时提高触摸轮询频率。sleep_ms(0) 允许平台协作让出；
-# 周期性恢复一次1ms让出，避免在部分固件上sleep_ms(0)退化为空操作。
-TOUCH_HIGH_FREQ_FORCE_YIELD_CYCLES = 8
+# 手指实际移动时提高触摸轮询频率。快速路径不调用 sleep_ms()，
+# 只有退出触摸快速路径后才恢复 1ms 的普通循环让出。
+# Kept as a compatibility/configuration symbol for existing diagnostics.  A
+# touch fast path never yields the LCD thread; urgent P0/P1 work wakes its own
+# TCP worker directly, so this value is intentionally zero.
+TOUCH_HIGH_FREQ_FORCE_YIELD_CYCLES = 0
 BATTERY_LABEL_WIDTH = LCD_WIDTH // 2
 BATTERY_RIGHT_MARGIN = 20
 NETWORK_ICON_SIZE = 24
@@ -92,21 +89,30 @@ NETWORK_ICON_GAP = 10
 NETWORK_ICON_X = LCD_WIDTH // 2 - NETWORK_ICON_SIZE - NETWORK_ICON_GAP + 50
 NETWORK_ICON_Y = 0
 NETWORK_ICON_PATHS = {
-	None: "E:/wifi_0.png",
-	"极弱": "E:/wifi_1.png",
-	"弱": "E:/wifi_2.png",
-	"一般": "E:/wifi_3.png",
-	"强": "E:/wifi_4.png",
-	"极好": "E:/wifi_5.png",
+	None: "U:/wifi_0.png",
+	"极弱": "U:/wifi_1.png",
+	"弱": "U:/wifi_2.png",
+	"一般": "U:/wifi_3.png",
+	"强": "U:/wifi_4.png",
+	"极好": "U:/wifi_5.png",
 }
 SETTINGS_ROW_HEIGHT = 58
 SETTINGS_ROW_GAP = 8
+# Three complete rows are visible in the content viewport.  The viewport is
+# deliberately shorter than the full page so the fourth row cannot peek in.
+MENU_VISIBLE_ROWS = 3
+MENU_ROW_STEP = SETTINGS_ROW_HEIGHT + SETTINGS_ROW_GAP
+# Rows start at a 6-pixel top inset in all menu builders.
+MENU_VIEWPORT_TOP_INSET = 6
+MENU_VIEWPORT_HEIGHT = (MENU_VIEWPORT_TOP_INSET +
+							MENU_VISIBLE_ROWS * SETTINGS_ROW_HEIGHT +
+							(MENU_VISIBLE_ROWS - 1) * SETTINGS_ROW_GAP)
 SETTINGS_ICON_SIZE = 40
 SETTINGS_ICON_BOX_SIZE = 48
 SETTINGS_ICON_BOX_X = 6
 SETTINGS_ICON_BOX_Y = (SETTINGS_ROW_HEIGHT - SETTINGS_ICON_BOX_SIZE) // 2
 SETTINGS_LABEL_X = SETTINGS_ICON_BOX_X + SETTINGS_ICON_BOX_SIZE + 4
-SETTINGS_SCROLL_THROW = 12
+SETTINGS_SCROLL_THROW = 60
 SETTINGS_SCROLL_LIMIT = 8
 MENU_SCROLL_SETTLE_MS = 100
 SETTINGS_CLICK_MOVE_LIMIT = 8
@@ -192,6 +198,19 @@ NETWORK_SIGNAL_WEAK_COLOR = 0xFFD400
 NETWORK_SIGNAL_VERY_WEAK_COLOR = RED
 NETWORK_CONNECTED_COLOR = 0x00D060
 NETWORK_DISCONNECTED_COLOR = RED
+# Native LVGL pager parameters.  A two-slot pager is built while a root or
+# child page transition is active; it keeps existing page objects/callbacks
+# while LVGL provides drag, momentum and snap without custom set_x() animation.
+NATIVE_NAV_SCROLL_THROW = 3
+NATIVE_NAV_SCROLL_LIMIT = 8
+# Distance (in pixels) that the native page pager must travel before a
+# release is committed.  LVGL momentum may carry the pager past this point
+# even when the finger itself moved less than the threshold.
+NATIVE_NAV_SWITCH_DISTANCE_PX = 90
+# Navigation diagnostics are event-level only (press/release, click, and
+# pager settle); they do not print every sampled point or every LVGL frame.
+NAV_TRACE_LOG_ENABLED = True
+
 def _lv_color(color):
 	return int(color) & 0xFFFFFF
 def _flush(buf, x1, y1, x2, y2):
@@ -368,6 +387,10 @@ class JingWuUI:
 		self._poc_client = poc_client
 		self._ui_interaction_reported = None
 		self._poc_snapshot = None
+		# Snapshots received during the touch fast path are kept until the
+		# normal UI path resumes.  Urgent floor/PTT events are handled
+		# immediately, while the full set of UI widgets is updated afterwards.
+		self._poc_deferred_snapshot = None
 		self._poc_error_reported = False
 		self._poc_http_data_applied = False
 		self._prelogin_http_result_seen = None
@@ -441,36 +464,51 @@ class JingWuUI:
 		self._location_map_message = None
 		self._location_refresh_overlay = None
 		self._pending_root_swipe = None
-		self._pending_back = False
+		self._root_nav_deferred_current = None
+		self._root_nav_deferred_until_ms = None
 		self._touch_sequence_id = 0
 		self._touch_sequence_swipe = False
 		self._pending_click_dispatch = None
 		self._touch_sequence_start = None
+		self._touch_sequence_dx = 0
 		self._touch_sequence_max_dx = 0
 		self._touch_sequence_max_dy = 0
+		# Object that received PRESSED for the current hardware touch.  The
+		# release fallback may be needed when LVGL omits CLICKED; retaining this
+		# object lets native-pager root pages route the click without relying on a
+		# potentially shifted coordinate rectangle.
+		self._touch_sequence_preferred_obj = None
 		self._pointer_point = None
 		self._pending_gc = False
-		self._back_drag_tracking = False
-		self._back_drag_active = False
-		self._back_drag_start = None
-		self._back_drag_started_ms = None
-		self._back_drag_offset = 0
-		self._back_drag_target_offset = 0
-		self._back_drag_frame_pending = False
-		self._back_drag_last_frame_ms = 0
-		self._back_drag_current = None
-		self._back_drag_previous = None
-		self._back_drag_hardware_confirmed = False
-		self._back_animating = False
-		self._back_anim_complete = False
-		self._back_anim_start_value = 0
-		self._back_anim_end_value = 0
-		self._back_anim_started_ms = 0
-		self._back_anim_duration_ms = 0
-		self._back_anim_last_frame_ms = 0
-		self._back_anim_finish_pending = False
 		self._touch_point_cache = None
-		self._back_drag_ready_reported = False
+		# Native horizontal navigation pager. Child-page back navigation uses two
+		# slots; root-page navigation keeps the four fixed root pages as direct
+		# pager children, while LVGL owns drag and momentum.
+		self._nav_pager = None
+		self._nav_content = None
+		self._nav_current = None
+		self._nav_previous = None
+		self._nav_next = None
+		self._nav_root_center_x = LCD_WIDTH
+		self._nav_root_min_x = 0
+		self._nav_root_max_x = LCD_WIDTH
+		self._nav_clamp_active = False
+		self._nav_finish_pending = False
+		self._nav_finish_deadline = None
+		self._nav_user_scroll_pending = False
+		self._nav_trace_scroll_reported = False
+		self._nav_requested = False
+		self._nav_transition_forward = False
+		self._nav_target_on_left = True
+		self._nav_root_mode = False
+		self._nav_root_order = ("location", "root_shoulder",
+								"root_intercom", "root_settings")
+		self._root_nav_transition_request = False
+		self._root_nav_transition_forward = False
+		self._root_nav_building = False
+		self._root_nav_active = False
+		self._root_nav_keys = None
+		self._nav_supported = True
 		self._touch_point_warning_reported = False
 		self._lvgl_input_rotated = False
 		self.pages = {}
@@ -520,7 +558,9 @@ class JingWuUI:
 		self._touch_high_freq_yield_cycles = 0
 		self._event_callbacks = []
 		self._scroll_containers = []
+		self._vertical_scroll_pages = []
 		self._last_menu_scroll_ms = None
+		self._menu_scroll_active = False
 		self._pending_scroll_redraw = None
 		self._perf_stats = [[0, 0, 0, 0, 0, 0] for _ in range(10)]
 		self._perf_post_stats = [[0, 0, 0, 0, 0, 0] for _ in range(6)]
@@ -528,7 +568,26 @@ class JingWuUI:
 		# high-frequency cycles, forced cooperative yields
 		self._perf_yield = [0, 0, 0, 0, 0, None, 0, 0]
 		self._touch_perf = [0, 0, 0, 0, 0, 0, 0, None, None]
+		# Fast-path diagnostics: count/total/max (milliseconds).  These are
+		# intentionally separate from the coarse loop buckets so a slow I2C
+		# touch read or POC lock acquisition is visible in field logs.
+		self._perf_touch_poll = [0, 0, 0]
+		self._perf_touch_i2c = [0, 0, 0]
+		self._perf_poc_floor_get = [0, 0, 0]
+		self._perf_poc_full_get = [0, 0, 0]
+		# count, total, max, >=30ms, >=50ms, >=100ms
+		self._perf_gap = [0, 0, 0, 0, 0, 0]
+		self._perf_map_probe_counter = 0
 		self._perf_report_started_ms = utime.ticks_ms()
+		self._fast_perf_active = False
+		self._fast_perf_started_ms = None
+		self._fast_perf_release_pending = False
+		# Dedicated LCD-loop fast-path rate window. This is separate from
+		# ``[PERF][FAST] poll`` so the main-loop cadence can be compared directly
+		# with CST816D's touch sampling rate.
+		self._fast_lcd_cycles = 0
+		self._fast_lcd_started_ms = None
+		self._fast_lcd_last_ms = None
 		self._perf_lvgl_no_flush = 0
 		self._perf_skip_cycle = False
 		self._sleep_scroll_positions = []
@@ -929,8 +988,6 @@ class JingWuUI:
 		self._touch_press_edge_pending = False
 		self._touch_sequence_swipe = True
 		self._click_dispatched = True
-		self._pending_back = False
-		self._clear_back_drag_state()
 	def _remember_sleep_ui_state(self):
 		self._sleep_brightness = self.brightness
 		positions = []
@@ -996,13 +1053,6 @@ class JingWuUI:
 		self._poc_touch_locked = locked
 		if locked:
 			self._stop_menu_scrolling()
-			if (self._back_drag_active or
-					self._back_drag_hardware_confirmed or
-					self._back_animating):
-				self._finish_back_immediately_for_poc()
-			elif self._back_drag_tracking:
-				self._clear_back_drag_state()
-			self._pending_back = False
 			self._pending_root_swipe = None
 			self._pending_click_dispatch = None
 			self._touch_pressed = False
@@ -1033,20 +1083,15 @@ class JingWuUI:
 				content.scroll_to_y(y, lv.ANIM.OFF)
 			except Exception:
 				pass
+		if self._nav_pager is not None:
+			try:
+				x = self._nav_pager.get_scroll_x()
+				self._nav_pager.scroll_to_x(x, lv.ANIM.OFF)
+			except Exception:
+				pass
 		self._last_menu_scroll_ms = utime.ticks_ms()
+		self._menu_scroll_active = False
 		self._pending_scroll_redraw = None
-	def _finish_back_immediately_for_poc(self):
-		"""Commit an in-progress right swipe without running more animation."""
-		if not self._back_drag_active:
-			if not self._back_drag_hardware_confirmed:
-				return False
-			if not self._activate_back_drag():
-				return False
-		self._back_animating = True
-		self._back_anim_complete = True
-		self._back_anim_finish_pending = False
-		self._finish_back_animation()
-		return True
 	def _consume_touch_event_for_poc(self, code):
 		if self._poc_touch_locked:
 			if code == lv.EVENT.PRESSED:
@@ -1058,7 +1103,6 @@ class JingWuUI:
 			self._touch_press_edge_pending = True
 			self._touch_sequence_swipe = True
 			self._click_dispatched = True
-			self._pending_back = False
 			self._pending_root_swipe = None
 			self._pending_click_dispatch = None
 			return True
@@ -1099,7 +1143,6 @@ class JingWuUI:
 		self._touch_pressed = False
 		self._touch_sequence_swipe = True
 		self._click_dispatched = True
-		self._pending_back = False
 		return True
 	def _enter_display_sleep(self):
 		if self._screen_sleeping or self._pending_display_wake:
@@ -1261,7 +1304,7 @@ class JingWuUI:
 				return
 			self._network_snapshot = snapshot
 			if (self._screen_sleeping or self._pending_display_wake or
-					self._back_transition_active() or
+					self._native_nav_transition_active() or
 					self._ui_interaction_active()):
 				self._status_refresh_pending = True
 				self._network_refresh_pending = True
@@ -1638,16 +1681,49 @@ class JingWuUI:
 		self._pending_intercom_data = None
 		self._apply_intercom_data(pending[0], pending[1])
 		self._poc_http_data_applied = True
-	def _process_poc_client(self):
+	def _process_poc_client(self, fast_path=False):
 		if self._poc_client is None:
 			self._process_poc_popup()
 			self._process_pending_intercom_data()
 			return
 		try:
-			snapshot = self._poc_client.get_snapshot_if_changed()
+			# A dynamic touch session must not rebuild the login/location/intercom
+			# widgets on every loop.  Keep the newest snapshot and process only the
+			# urgent floor/PTT state; the normal path applies the complete snapshot
+			# immediately after the finger is released.
+			snapshot = None
+			if fast_path:
+				# Do not call get_snapshot_if_changed() while the finger is down:
+				# that method copies the complete POC state (lists, dictionaries,
+				# location/map fields) under the worker lock.  The lightweight floor
+				# snapshot contains only urgent PTT/占用 state.
+				stage_fast = utime.ticks_ms()
+				floor_snapshot = (
+					self._poc_client.get_floor_snapshot_if_changed())
+				self._perf_extra_add(
+					self._perf_poc_floor_get,
+					utime.ticks_diff(utime.ticks_ms(), stage_fast))
+				if floor_snapshot is not None:
+					base = dict(self._poc_snapshot or {})
+					base.update(floor_snapshot)
+					self._poc_snapshot = base
+					snapshot = base
+			if not fast_path:
+				snapshot = self._poc_deferred_snapshot
+				self._poc_deferred_snapshot = None
+			if snapshot is None and not fast_path:
+				stage_full = utime.ticks_ms()
+				snapshot = self._poc_client.get_snapshot_if_changed()
+				self._perf_extra_add(
+					self._perf_poc_full_get,
+					utime.ticks_diff(utime.ticks_ms(), stage_full))
 			if snapshot is None:
 				self._process_poc_popup()
 				self._process_pending_intercom_data()
+				return
+			if fast_path:
+				self._consume_poc_floor_event(snapshot)
+				self._process_poc_popup()
 				return
 			self._poc_snapshot = snapshot
 			self._status_police_no = str(
@@ -1910,289 +1986,41 @@ class JingWuUI:
 				self.current[0] in ("home", "login", "location",
 									"root_shoulder", "root_intercom",
 									"root_settings"))
-	def _can_drag_back(self):
-		return (not self._back_animating and self.current is not None and
-				not self._is_root_page() and bool(self.stack))
-	def _set_location_ui_busy(self, busy):
-		if self._poc_client is None:
-			return
-		setter = getattr(self._poc_client, "set_location_ui_busy", None)
-		if setter is None:
+	def _nav_page_name(self, key=None):
+		if key is None:
+			try:
+				key = self.current[0] if self.current is not None else None
+			except Exception:
+				key = None
+		return {
+			"login": "登录", "location": "定位", "root_shoulder": "肩灯",
+			"root_intercom": "对讲机", "root_settings": "设置",
+			"location_detail": "定位详情", "shoulder_menu": "肩灯菜单",
+			"shoulder": "肩灯模式", "double_click": "双击模式",
+			"intercom": "对讲机菜单", "group_mode": "组呼模式",
+			"single_mode": "单呼模式", "settings": "设置菜单",
+		}.get(key, str(key))
+	def _page_key(self, page):
+		# Avoid generator/next(default) on MicroPython ports where the native
+		# implementation accepts only one positional argument.
+		for key, value in self.pages.items():
+			if value is page:
+				return key
+		return None
+	def _nav_trace(self, message):
+		if not NAV_TRACE_LOG_ENABLED:
 			return
 		try:
-			setter(bool(busy))
-		except Exception as error:
-			print("[Location] LCD busy state update failed: {}".format(error))
-	def _clear_back_drag_state(self):
-		self._set_location_ui_busy(False)
-		self._back_drag_tracking = False
-		self._back_drag_active = False
-		self._back_drag_start = None
-		self._back_drag_started_ms = None
-		self._back_drag_offset = 0
-		self._back_drag_target_offset = 0
-		self._back_drag_frame_pending = False
-		self._back_drag_last_frame_ms = 0
-		self._back_drag_current = None
-		self._back_drag_previous = None
-		self._back_drag_hardware_confirmed = False
-	def _back_drag_press(self, point):
-		if self._back_animating:
-			return
-		if (self._back_drag_tracking and
-				self._back_drag_current is self.current):
-			return
-		self._clear_back_drag_state()
-		self._pending_back = False
-		if point is None or not self._can_drag_back():
-			return
-		self._back_drag_tracking = True
-		self._back_drag_start = point
-		self._back_drag_started_ms = utime.ticks_ms()
-		self._back_drag_current = self.current
-		self._back_drag_previous = self.stack[-1]
-	def _activate_back_drag(self):
-		if self._back_drag_active:
-			return True
-		if (self._back_drag_current is None or
-				self._back_drag_previous is None):
-			return False
-		self._set_location_ui_busy(True)
-		current_page = self._back_drag_current[1]
-		previous_page = self._back_drag_previous[1]
-		self._set_page_visible(previous_page, True)
-		previous_page.set_x(0)
-		current_page.set_x(0)
-		try:
-			current_page.move_foreground()
+			print("[导航] " + str(message))
 		except Exception:
 			pass
-		if (self._poc_popup_visible and self._poc_popup is not None and
-				self.current is not None and self.current[0] != "login"):
-			try:
-				self._poc_popup.move_foreground()
-			except Exception:
-				pass
-		self._back_drag_active = True
-		self._back_drag_offset = 0
-		self._back_drag_target_offset = 0
-		self._back_drag_frame_pending = False
-		self._back_drag_last_frame_ms = utime.ticks_ms()
-		self._touch_sequence_swipe = True
-		if not self._back_drag_ready_reported:
-			print("[触摸] 跟手右滑已启用")
-			self._back_drag_ready_reported = True
-		return True
-	def _set_back_drag_offset(self, offset):
-		if self._back_drag_current is None:
+	def _click_trace(self, message):
+		if not NAV_TRACE_LOG_ENABLED:
 			return
-		offset = max(0, min(LCD_WIDTH, int(offset)))
-		if offset == self._back_drag_offset:
-			return
-		self._back_drag_offset = offset
-		self._back_drag_current[1].set_x(offset)
-	def _queue_back_drag_offset(self, offset):
-		offset = max(0, min(LCD_WIDTH, int(offset)))
-		self._back_drag_target_offset = offset
-		self._back_drag_frame_pending = (
-			offset != self._back_drag_offset)
-	def _process_back_drag_frame(self, force=False):
-		if (not self._back_drag_active or self._back_animating or
-				not self._back_drag_frame_pending):
-			return False
-		now = utime.ticks_ms()
-		if (not force and self._back_drag_last_frame_ms and
-				self._ticks_since(self._back_drag_last_frame_ms) <
-				BACK_FRAME_INTERVAL_MS):
-			return False
-		target = self._back_drag_target_offset
-		self._back_drag_frame_pending = False
-		self._back_drag_last_frame_ms = now
-		self._set_back_drag_offset(target)
-		return True
-	def _back_drag_move(self, point):
-		if (not self._back_drag_tracking or point is None or
-				self._back_drag_start is None):
-			return False
-		if self.current is not self._back_drag_current:
-			self._clear_back_drag_state()
-			return False
-		delta_x = point[0] - self._back_drag_start[0]
-		delta_y = point[1] - self._back_drag_start[1]
-		if not self._back_drag_active:
-			if (abs(delta_y) > CLICK_MOVE_LIMIT and
-					(delta_x <= 0 or
-					 delta_x * BACK_DIRECTION_DENOMINATOR <
-					 abs(delta_y) * BACK_DIRECTION_NUMERATOR)):
-				self._clear_back_drag_state()
-				return False
-			if delta_x <= BACK_DRAG_START_DISTANCE:
-				return False
-			if (delta_x * BACK_DIRECTION_DENOMINATOR <
-					abs(delta_y) * BACK_DIRECTION_NUMERATOR):
-				return False
-			if not self._activate_back_drag():
-				return False
-		self._queue_back_drag_offset(delta_x)
-		return True
-	def _start_back_linear_animation(self, end, complete,
-									 minimum_ms, maximum_ms):
-		if not self._back_drag_active:
-			return False
-		start = self._back_drag_offset
-		end = max(0, min(LCD_WIDTH, int(end)))
-		distance = abs(end - start)
-		self._back_drag_target_offset = end
-		self._back_drag_frame_pending = False
-		self._back_animating = True
-		self._back_anim_complete = bool(complete)
-		self._back_anim_finish_pending = False
-		if distance == 0:
-			self._finish_back_animation()
-			return True
-		self._back_anim_start_value = start
-		self._back_anim_end_value = end
-		self._back_anim_duration_ms = (
-			int(minimum_ms) +
-			(int(maximum_ms) - int(minimum_ms)) * distance // LCD_WIDTH)
-		self._back_anim_started_ms = utime.ticks_ms()
-		self._back_anim_last_frame_ms = self._back_anim_started_ms
-		return True
-	def _start_back_rebound(self):
-		return self._start_back_linear_animation(
-			0, False, BACK_REBOUND_MIN_MS, BACK_REBOUND_MAX_MS)
-	def _start_back_complete(self):
-		return self._start_back_linear_animation(
-			LCD_WIDTH, True,
-			BACK_COMPLETE_MIN_MS, BACK_COMPLETE_MAX_MS)
-	def _process_back_animation(self):
-		if not self._back_animating:
-			return
-		if self._back_anim_finish_pending:
-			self._back_anim_finish_pending = False
-			self._finish_back_animation()
-			return
-		now = utime.ticks_ms()
 		try:
-			elapsed = utime.ticks_diff(now, self._back_anim_started_ms)
-			frame_elapsed = utime.ticks_diff(
-				now, self._back_anim_last_frame_ms)
+			print("[点击] " + str(message))
 		except Exception:
-			elapsed = now - self._back_anim_started_ms
-			frame_elapsed = now - self._back_anim_last_frame_ms
-		elapsed = max(0, elapsed)
-		duration = self._back_anim_duration_ms
-		if elapsed >= duration:
-			self._set_back_drag_offset(self._back_anim_end_value)
-			self._back_anim_finish_pending = True
-			return
-		if frame_elapsed < BACK_FRAME_INTERVAL_MS:
-			return
-		value = (self._back_anim_start_value +
-				 (self._back_anim_end_value -
-				  self._back_anim_start_value) * elapsed // duration)
-		self._back_anim_last_frame_ms = now
-		self._set_back_drag_offset(value)
-	def _back_drag_release(self, point):
-		if not self._back_drag_tracking:
-			return False
-		if self._back_animating:
-			if (self._back_drag_hardware_confirmed and
-					not self._back_anim_complete):
-				self._start_back_complete()
-			return True
-		self._back_drag_move(point)
-		if (not self._back_drag_active and
-				self._back_drag_hardware_confirmed):
-			self._activate_back_drag()
-		if not self._back_drag_active:
-			self._clear_back_drag_state()
-			return False
-		self._process_back_drag_frame(force=True)
-		fast_flick = False
-		if self._back_drag_started_ms is not None:
-			try:
-				elapsed = utime.ticks_diff(
-					utime.ticks_ms(), self._back_drag_started_ms)
-			except Exception:
-				elapsed = utime.ticks_ms() - self._back_drag_started_ms
-			fast_flick = (0 <= elapsed <= BACK_FLICK_MAX_MS and
-						  self._back_drag_target_offset >=
-						  BACK_FLICK_DISTANCE)
-		complete = (self._back_drag_hardware_confirmed or
-					self._back_drag_target_offset >=
-					BACK_COMMIT_DISTANCE or
-					fast_flick)
-		self._touch_sequence_swipe = True
-		if complete:
-			self._start_back_complete()
-		else:
-			self._start_back_rebound()
-		return True
-	def _finish_back_animation(self):
-		complete = self._back_anim_complete
-		outgoing = self._back_drag_current
-		previous = self._back_drag_previous
-		if complete and outgoing is not None and previous is not None:
-			self._set_page_visible(outgoing[1], False)
-			self._set_page_visible(previous[1], True)
-			outgoing[1].set_x(0)
-			previous[1].set_x(0)
-			try:
-				previous[1].move_foreground()
-			except Exception:
-				pass
-			if (self._poc_popup_visible and self._poc_popup is not None and
-					previous[0] != "login"):
-				try:
-					self._poc_popup.move_foreground()
-				except Exception:
-					pass
-			if self.stack and self.stack[-1][1] is previous[1]:
-				self.stack.pop()
-			self.current = previous
-			if self._poc_client is not None:
-				setter = getattr(
-					self._poc_client, "set_location_detail_active", None)
-				if setter is not None:
-					try:
-						setter(previous[0] == "location_detail")
-					except Exception as error:
-						print("[定位] 地图页面状态同步失败：{}".format(error))
-			self._sync_police_status_visibility(previous[0])
-		else:
-			if outgoing is not None:
-				outgoing[1].set_x(0)
-			if previous is not None:
-				previous[1].set_x(0)
-				self._set_page_visible(previous[1], False)
-		self._invalidate_page_transition(
-			outgoing[1] if outgoing is not None else None,
-			previous[1] if previous is not None else None)
-		self._pending_back = False
-		self._back_animating = False
-		self._back_anim_complete = False
-		self._back_anim_start_value = 0
-		self._back_anim_end_value = 0
-		self._back_anim_started_ms = 0
-		self._back_anim_duration_ms = 0
-		self._back_anim_last_frame_ms = 0
-		self._back_anim_finish_pending = False
-		self._set_location_ui_busy(False)
-		self._clear_back_drag_state()
-		if (self.current is not None and
-				self.current[0] == "location_detail"):
-			self._refresh_location_map()
-			self._sync_location_loading_overlay()
-	def _start_programmatic_back(self):
-		if not self._can_drag_back():
-			return False
-		self._clear_back_drag_state()
-		self._back_drag_current = self.current
-		self._back_drag_previous = self.stack[-1]
-		if not self._activate_back_drag():
-			return False
-		return self._start_back_complete()
+			pass
 	def _begin_touch_sequence(self):
 		if (not self._touch_sequence_active or
 				self._touch_press_edge_pending):
@@ -2203,6 +2031,7 @@ class JingWuUI:
 			self._touch_sequence_start = None
 			self._touch_sequence_max_dx = 0
 			self._touch_sequence_max_dy = 0
+			self._touch_sequence_preferred_obj = None
 			self._pending_click_dispatch = None
 			self._touch_press_edge_pending = False
 			self._touch_sequence_active = True
@@ -2212,18 +2041,21 @@ class JingWuUI:
 			return
 		t = self._touch_perf
 		if point != t[8]:
-			now = utime.ticks_ms()
-			if t[7] is not None:
-				gap = utime.ticks_diff(now, t[7])
-				t[1] += 1
-				t[2] += gap
-				t[3] = max(t[3], gap)
-				if gap >= 30: t[4] += 1
-				if gap >= 50: t[5] += 1
-				if gap >= 100: t[6] += 1
-			t[0] += 1
-			t[7] = now
-			t[8] = point
+			# Keep touch-gap statistics inside the isolated fast-path window.
+			# Gesture/sequence state below is still updated on every point.
+			if self._fast_perf_active:
+				now = utime.ticks_ms()
+				if t[7] is not None:
+					gap = utime.ticks_diff(now, t[7])
+					t[1] += 1
+					t[2] += gap
+					t[3] = max(t[3], gap)
+					if gap >= 30: t[4] += 1
+					if gap >= 50: t[5] += 1
+					if gap >= 100: t[6] += 1
+				t[0] += 1
+				t[7] = now
+				t[8] = point
 		if self._touch_sequence_start is None:
 			self._touch_sequence_start = point
 			self._touch_sequence_max_dx = 0
@@ -2231,6 +2063,8 @@ class JingWuUI:
 			return
 		dx = abs(int(point[0]) - int(self._touch_sequence_start[0]))
 		dy = abs(int(point[1]) - int(self._touch_sequence_start[1]))
+		self._touch_sequence_dx = (
+			int(point[0]) - int(self._touch_sequence_start[0]))
 		if dx > self._touch_sequence_max_dx:
 			self._touch_sequence_max_dx = dx
 		if dy > self._touch_sequence_max_dy:
@@ -2247,7 +2081,13 @@ class JingWuUI:
 			self._pending_click_dispatch = None
 	def _queue_click_dispatch(self, point=None, preferred_obj=None):
 		if (self.current is None or self._selection_popup_visible or
-				self._back_animating or self._touch_sequence_swipe):
+				self._native_nav_transition_active() or self._touch_sequence_swipe):
+			self._click_trace("不排队 页面={} 原因={}".format(
+				self._nav_page_name(),
+				"无页面" if self.current is None else
+				("弹窗中" if self._selection_popup_visible else
+				 ("导航过渡中" if self._native_nav_transition_active()
+				  else "本次触摸已滑动"))))
 			return False
 		pending = self._pending_click_dispatch
 		if (pending is not None and
@@ -2270,6 +2110,8 @@ class JingWuUI:
 		self._pending_click_dispatch = (
 			self._touch_sequence_id, self.current, point, preferred_obj,
 			now + guard_ms)
+		self._click_trace("已排队 页面={} 点={} 延时={}ms".format(
+			self._nav_page_name(), point, guard_ms))
 		return True
 	def _process_pending_click(self):
 		pending = self._pending_click_dispatch
@@ -2285,17 +2127,44 @@ class JingWuUI:
 			if utime.ticks_ms() < deadline:
 				return
 		self._pending_click_dispatch = None
-		if (self._selection_popup_visible or self._back_animating or
+		if (self._selection_popup_visible or self._native_nav_transition_active() or
 				page is not self.current):
+			self._click_trace("取消点击 页面={} 原因={}".format(
+				self._nav_page_name(),
+				"弹窗/导航过渡" if (self._selection_popup_visible or
+					self._native_nav_transition_active()) else "页面已变化"))
 			return
 		if (sequence_id == self._touch_sequence_id and
 				self._touch_sequence_swipe):
+			self._click_trace("取消点击 页面={} 原因=本次触摸已滑动".format(
+				self._nav_page_name()))
 			return
 		if (sequence_id == self._touch_sequence_id and
 				(self._touch_sequence_max_dx > self._click_move_limit() or
 				 self._touch_sequence_max_dy > self._click_move_limit())):
+			self._click_trace("取消点击 页面={} 原因=位移超限".format(
+				self._nav_page_name()))
 			return
+		self._click_trace("执行点击 页面={} 点={}".format(
+			self._nav_page_name(), point))
 		self._dispatch_click(point, preferred_obj)
+	def _set_location_ui_busy(self, busy):
+		"""Tell the location worker when page composition is in progress.
+
+		This is a background-I/O coordination flag, not a navigation animation
+		state.  Keep it independent from the native LVGL pager so page switches
+		can safely pause map work without reintroducing the removed custom return
+		animation.
+		"""
+		if self._poc_client is None:
+			return
+		setter = getattr(self._poc_client, "set_location_ui_busy", None)
+		if setter is None:
+			return
+		try:
+			setter(bool(busy))
+		except Exception as error:
+			print("[Location] LCD busy state update failed: {}".format(error))
 	def _bind_page_swipe(self, page):
 		press_state = [None, False]
 		def update_movement(event=None):
@@ -2312,6 +2181,9 @@ class JingWuUI:
 			return point
 		def page_event(*args):
 			event = args[-1]
+			if (self._native_nav_active_for(page) or
+					self._event_in_scroll_container(event)):
+				return
 			try:
 				code = event.get_code()
 			except Exception:
@@ -2330,23 +2202,30 @@ class JingWuUI:
 				self._record_touch_point(point)
 				press_state[0] = point
 				press_state[1] = False
-				self._back_drag_press(point)
 			elif code == lv.EVENT.PRESSING:
-				self._back_drag_move(update_movement(event))
+				update_movement(event)
 			elif code == lv.EVENT.GESTURE:
-				press_state[1] = True
-				self._mark_touch_sequence_swipe()
+				# QuecPython ports may emit LV_EVENT_GESTURE for a stationary
+				# release.  Do not turn a zero-displacement tap into a swipe; the
+				# CST816D directional callback is the authoritative swipe marker.
+				point = update_movement(event)
+				if (press_state[0] is not None and point is not None and
+						(abs(point[0] - press_state[0][0]) >
+						 self._click_move_limit() or
+						 abs(point[1] - press_state[0][1]) >
+						 self._click_move_limit())):
+					press_state[1] = True
+					self._mark_touch_sequence_swipe()
 			elif code == lv.EVENT.RELEASED:
 				self._touch_pressed = False
 				self._touch_sequence_active = False
 				self._touch_press_edge_pending = True
-				if self._back_drag_release(update_movement(event)):
-					press_state[1] = True
+				update_movement(event)
 			elif code == lv.EVENT.CLICKED:
 				point = update_movement(event)
 				if (not press_state[1] and
 						not self._touch_sequence_swipe and
-						not self._back_animating and
+						 not self._native_nav_transition_active() and
 						not self._click_dispatched):
 					self._queue_click_dispatch(point)
 				press_state[0] = None
@@ -2358,6 +2237,728 @@ class JingWuUI:
 			wrapper = lambda target, event: page_event(event)
 			self._event_callbacks.append(wrapper)
 			page.set_event_cb(wrapper, lv.EVENT.ALL, None)
+	def _nav_reparent(self, page, parent, x, visible=True):
+		"""Move an existing screen into/out of the native navigation pager."""
+		try:
+			old_parent = page.get_parent()
+		except Exception:
+			old_parent = None
+		try:
+			page.set_parent(parent)
+		except Exception:
+			return False
+		# Some QuecPython LVGL builds silently ignore set_parent() for an object
+		# that is currently being drawn.  Never reposition such an object: doing
+		# so moves the real page on the root screen (the visible right/down jump)
+		# while the pager remains empty.
+		try:
+			if page.get_parent() is not parent:
+				if old_parent is not None:
+					try:
+						page.set_parent(old_parent)
+					except Exception:
+						pass
+				return False
+		except Exception:
+			pass
+		in_native_pager = parent in (self._nav_content, self._nav_pager)
+		try:
+			y = 0 if in_native_pager else STATUS_HEIGHT
+			if parent is not self._nav_content:
+				if page is self.pages.get("location_detail"):
+					y = STATUS_HEIGHT - 10
+				elif page is self.pages.get("settings"):
+					# Settings is a full-screen root page so its status-bar
+					# transparent layout must be restored when leaving the pager.
+					y = 0
+			if parent is self._nav_content:
+				if page is self.pages.get("location_detail"):
+					y = 0
+				elif page is self.pages.get("settings"):
+					# The settings list was designed as a full-screen page: its
+					# title is at y=3 and its viewport starts at y=STATUS_HEIGHT.
+					# The native pager itself already starts below the status bar,
+					# so offset this page upward while it is attached to the pager.
+					y = -STATUS_HEIGHT
+			page.set_pos(int(x), y)
+		except Exception:
+			pass
+		# A child page may have a transparent/full-screen style (the settings
+		# page does this so root status widgets remain visible).  While attached
+		# to the pager it must be an opaque black surface; otherwise the pager's
+		# default/theme background can show through as a white rectangle.  Restore
+		# the root settings transparency when the page is detached again.
+		try:
+			for state in (lv.STATE.DEFAULT, lv.STATE.PRESSED,
+						  lv.STATE.FOCUSED, lv.STATE.CHECKED):
+				if in_native_pager:
+					page.set_style_bg_opa(255, lv.PART.MAIN | state)
+					page.set_style_bg_color(
+						lv.color_hex(_lv_color(BLACK)), lv.PART.MAIN | state)
+				else:
+					page.set_style_bg_opa(
+						0 if page is self.pages.get("settings") else 255,
+						lv.PART.MAIN | state)
+					if page is not self.pages.get("settings"):
+						page.set_style_bg_color(
+							lv.color_hex(_lv_color(BLACK)),
+							lv.PART.MAIN | state)
+		except Exception:
+			pass
+		try:
+			snappable = getattr(lv.obj.FLAG, "SNAPPABLE")
+			if in_native_pager:
+				page.add_flag(snappable)
+				# Let the ancestor pager own horizontal drag recognition.  The
+				# individual icons/labels remain clickable; the full page surface
+				# itself must not terminate pointer bubbling at the page object.
+				try:
+					page.clear_flag(lv.obj.FLAG.CLICKABLE)
+				except Exception:
+					pass
+				# A clickable page can otherwise consume the horizontal drag before
+				# the ancestor pager sees it on some LVGL ports.
+				try:
+					page.add_flag(getattr(lv.obj.FLAG, "SCROLL_CHAIN_HOR"))
+				except Exception:
+					pass
+			else:
+				page.clear_flag(snappable)
+				try:
+					page.add_flag(lv.obj.FLAG.CLICKABLE)
+				except Exception:
+					pass
+				try:
+					page.clear_flag(getattr(lv.obj.FLAG, "SCROLL_CHAIN_HOR"))
+				except Exception:
+					pass
+		except Exception:
+			pass
+		if visible:
+			self._set_page_visible(page, True)
+		else:
+			self._set_page_visible(page, False)
+		try:
+			page_key = self._page_key(page)
+			parent_name = ("一级pager" if parent is self._nav_pager else
+						   ("二级pager内容" if parent is self._nav_content else
+							"主屏"))
+			self._nav_trace("页面挂载 key={} parent={} x={} visible={}".format(
+				page_key, parent_name, int(x), bool(visible)))
+		except Exception:
+			pass
+		return True
+	def _native_nav_active_for(self, page):
+		if self._nav_pager is None or page is None:
+			return False
+		try:
+			return page.get_parent() in (self._nav_content, self._nav_pager)
+		except Exception:
+			return False
+	def _nav_page_attached(self, page):
+		"""Return whether a UI page is owned by either native pager layout."""
+		if page is None:
+			return False
+		try:
+			return page.get_parent() in (self._nav_content, self._nav_pager)
+		except Exception:
+			return False
+	def _event_in_scroll_container(self, event):
+		try:
+			target = event.get_target()
+		except Exception:
+			return False
+		for _ in range(8):
+			if target in self._scroll_containers:
+				return True
+			try:
+				target = target.get_parent()
+			except Exception:
+				break
+		return False
+	def _init_native_nav_pager(self):
+		if self._nav_pager is not None:
+			return True
+		try:
+			pager = lv.obj(self._root_screen)
+			pager.set_size(LCD_WIDTH, PAGE_HEIGHT)
+			pager.set_pos(0, STATUS_HEIGHT)
+			# LVGL objects may default to a white themed background.  The
+			# navigation viewport must be opaque black so unused pager areas never
+			# appear as a white bar behind a child page.
+			for state in (lv.STATE.DEFAULT, lv.STATE.PRESSED,
+						  lv.STATE.FOCUSED, lv.STATE.CHECKED):
+				pager.set_style_bg_opa(255, lv.PART.MAIN | state)
+				pager.set_style_bg_color(
+					lv.color_hex(_lv_color(BLACK)), lv.PART.MAIN | state)
+				pager.set_style_border_width(0, lv.PART.MAIN | state)
+				pager.set_style_outline_width(0, lv.PART.MAIN | state)
+				pager.set_style_shadow_width(0, lv.PART.MAIN | state)
+				pager.set_style_radius(0, lv.PART.MAIN | state)
+				try:
+					pager.set_style_pad_all(0, lv.PART.MAIN | state)
+				except Exception:
+					pass
+			pager.set_scrollbar_mode(lv.SCROLLBAR_MODE.OFF)
+			pager.add_flag(lv.obj.FLAG.SCROLLABLE)
+			# Keep the pager scrollable but not clickable.  A clickable ancestor can
+			# consume PRESSED/CLICKED before an icon or label in the active page gets
+			# its bound callback, which was visible after returning from the map page.
+			try:
+				pager.clear_flag(lv.obj.FLAG.CLICKABLE)
+			except Exception:
+				pass
+			pager.set_scroll_dir(lv.DIR.HOR)
+			pager.add_flag(lv.obj.FLAG.SCROLL_MOMENTUM)
+			for name in ("SCROLL_ELASTIC", "SCROLL_CHAIN_HOR",
+						 "SCROLL_CHAIN_VER", "SNAPPABLE"):
+				try:
+					pager.clear_flag(getattr(lv.obj.FLAG, name))
+				except Exception:
+					pass
+			# Child-page navigation keeps its two screens in ``content``. Root-page
+			# navigation attaches three fixed-width screens directly to this pager.
+			# LVGL owns drag/momentum; the release position is checked against the
+			# configurable 90px threshold before a page state is committed.
+			try:
+				none_snap = getattr(lv.SCROLL_SNAP, "NONE")
+				pager.set_scroll_snap_x(none_snap)
+			except Exception:
+				pass
+			try:
+				pager.set_scroll_throw(NATIVE_NAV_SCROLL_THROW)
+			except Exception:
+				pass
+			try:
+				pager.set_scroll_limit(NATIVE_NAV_SCROLL_LIMIT)
+			except Exception:
+				pass
+			content = lv.obj(pager)
+			content.set_size(LCD_WIDTH * 2, PAGE_HEIGHT)
+			content.set_pos(0, 0)
+			_fix_position(content)
+			for state in (lv.STATE.DEFAULT, lv.STATE.PRESSED,
+						  lv.STATE.FOCUSED, lv.STATE.CHECKED):
+				content.set_style_bg_opa(255, lv.PART.MAIN | state)
+				content.set_style_bg_color(
+					lv.color_hex(_lv_color(BLACK)), lv.PART.MAIN | state)
+				content.set_style_border_width(0, lv.PART.MAIN | state)
+			self._nav_pager = pager
+			self._nav_content = content
+			self._nav_supported = True
+			self._event_callbacks.append(self._native_nav_event)
+			try:
+				pager.add_event_cb(self._native_nav_event, lv.EVENT.ALL, None)
+			except Exception:
+				pager.set_event_cb(lambda target, event:
+					self._native_nav_event(event), lv.EVENT.ALL, None)
+			pager.add_flag(lv.obj.FLAG.HIDDEN)
+			return True
+		except Exception as error:
+			self._nav_supported = False
+			print("[触摸] 原生横向分页不可用：{}".format(error))
+			self._nav_pager = None
+			self._nav_content = None
+			return False
+	def _native_nav_event(self, *args):
+		event = args[-1]
+		try:
+			code = event.get_code()
+		except Exception:
+			code = event
+		if code in (lv.EVENT.SCROLL, getattr(lv.EVENT, "SCROLL_BEGIN", -1)):
+			self._menu_scroll_active = True
+			self._last_menu_scroll_ms = utime.ticks_ms()
+			self._nav_finish_pending = False
+			# On some ports the pager receives SCROLL before the LCD thread sees
+			# the hardware press edge.  Treat this as a user sequence only while
+			# the controller is dynamically active; programmatic centering remains
+			# excluded.
+			# Only the LCD-thread hardware press edge arms a user sequence.
+			# Reparenting pages during a click/commit can itself emit SCROLL;
+			# a release-confirmation ``dynamic_active`` state must not turn that
+			# programmatic event into a second navigation transition.
+			if self._nav_current is not None and self._touch_pressed:
+				self._nav_user_scroll_pending = True
+			if not self._nav_trace_scroll_reported:
+				self._nav_trace_scroll_reported = True
+				try:
+					x = int(self._nav_pager.get_scroll_x())
+				except Exception:
+					x = None
+				self._nav_trace("LVGL开始滚动 页面={} scroll_x={} 根分页={}".format(
+					self._nav_page_name(), x, self._nav_root_mode))
+		elif code == getattr(lv.EVENT, "SCROLL_END", -2):
+			try:
+				x = int(self._nav_pager.get_scroll_x())
+			except Exception:
+				x = None
+			self._nav_trace("LVGL滚动结束 页面={} scroll_x={} 用户序列={}".format(
+				self._nav_page_name(), x, self._nav_user_scroll_pending))
+			if not self._nav_user_scroll_pending:
+				# Initial positioning and post-commit re-centering are native LVGL
+				# operations, not a new user release.
+				self._menu_scroll_active = False
+				self._last_menu_scroll_ms = utime.ticks_ms()
+				self._nav_trace("忽略滚动结束：不是本次用户触摸")
+				return
+			# Some ports emit SCROLL_END for a plain press/release.  Do not let
+			# that synthetic event suppress a click or enter the page transition
+			# path unless LVGL actually moved the pager.
+			try:
+				x = int(self._nav_pager.get_scroll_x())
+				center = (self._nav_root_center_x if self._nav_root_mode else
+						  (LCD_WIDTH if self._nav_target_on_left else 0))
+				if abs(x - center) <= self._click_move_limit():
+					self._nav_user_scroll_pending = False
+					self._menu_scroll_active = False
+					self._last_menu_scroll_ms = utime.ticks_ms()
+					self._nav_trace("忽略滚动结束：位移不足，保留点击")
+					return
+			except Exception:
+				pass
+			self._nav_user_scroll_pending = False
+			self._menu_scroll_active = False
+			self._last_menu_scroll_ms = utime.ticks_ms()
+			self._nav_finish_pending = True
+			self._nav_finish_deadline = utime.ticks_add(
+				utime.ticks_ms(), 20)
+			self._nav_trace_scroll_reported = False
+	def _nav_prepare(self, current, previous, target_on_left=True,
+					 preserve_visible=False):
+		if not self._init_native_nav_pager() or self._nav_content is None:
+			return False
+		# Unless the caller explicitly arms root mode after preparation, this is
+		# a child-page/back transition using the normal pager commit rules.
+		self._nav_root_mode = False
+		self._nav_next = None
+		self._nav_root_center_x = LCD_WIDTH
+		self._nav_root_min_x = 0
+		self._nav_root_max_x = LCD_WIDTH
+		self._nav_clamp_active = False
+		# A stationary press can emit an LVGL SCROLL before the hardware release
+		# is observed.  This is not a user swipe; clear the pending marker before
+		# the reparent operations below, which may themselves emit SCROLL_END.
+		self._nav_user_scroll_pending = False
+		self._nav_finish_pending = False
+		try:
+			# Entering a child page uses a hidden batch composition.  A back gesture
+			# already has its destination page visible in this pager, so preserve that
+			# composition and update only the off-screen slot to avoid a black frame.
+			if not preserve_visible:
+				self._set_page_visible(self._nav_pager, False)
+			self._nav_content.clear_flag(lv.obj.FLAG.HIDDEN)
+			self._nav_content.set_size(LCD_WIDTH * 2, PAGE_HEIGHT)
+			self._set_page_visible(previous[1], False)
+			if not preserve_visible:
+				self._set_page_visible(current[1], False)
+			# Only two screens are ever attached to the pager.  Return all stale
+			# screens to the root first so their cached resources remain intact.
+			for item in self.pages.values():
+				try:
+					if item is current[1] or item is previous[1]:
+						continue
+					if self._nav_page_attached(item):
+						self._set_page_visible(item, False)
+						self._nav_reparent(item, self._root_screen, 0, False)
+				except Exception:
+					pass
+			previous_x = 0 if target_on_left else LCD_WIDTH
+			current_x = LCD_WIDTH if target_on_left else 0
+			if not self._nav_reparent(previous[1], self._nav_content,
+								 previous_x, False):
+				return False
+			if not self._nav_reparent(current[1], self._nav_content,
+								 current_x, preserve_visible):
+				return False
+			self._set_page_visible(previous[1], True)
+			self._set_page_visible(current[1], True)
+			if not preserve_visible:
+				self._set_page_visible(self._nav_pager, True)
+			self._nav_pager.move_foreground()
+			self._nav_current = current
+			self._nav_previous = previous
+			self._nav_target_on_left = bool(target_on_left)
+			self._nav_finish_pending = False
+			self._nav_requested = False
+			self._nav_user_scroll_pending = False
+			self._nav_trace_scroll_reported = False
+			self._nav_pager.scroll_to_x(
+				LCD_WIDTH if target_on_left else 0, lv.ANIM.OFF)
+			# Reparenting does not always invalidate the old and new coordinates on
+			# QuecPython's LVGL port.  Explicitly invalidate the pager and both
+			# pages so a stale frame (or the pager theme's white background) cannot
+			# remain visible at the top of a newly opened child page.
+			for target in (self._nav_pager, self._nav_content,
+						  previous[1], current[1], self._root_screen):
+				try:
+					target.invalidate()
+				except Exception:
+					pass
+			return True
+		except Exception as error:
+			print("[触摸] 原生分页准备失败：{}".format(error))
+			self._nav_supported = False
+			return False
+	def _nav_teardown(self):
+		if self._nav_pager is None:
+			return
+		self._nav_user_scroll_pending = False
+		self._nav_finish_pending = False
+		# Hide before returning child pages to the root screen.  Reparenting can
+		# invalidate and redraw synchronously on the target port.
+		try:
+			self._set_page_visible(self._nav_pager, False)
+		except Exception:
+			pass
+		for item in self.pages.values():
+			try:
+				if self._nav_page_attached(item):
+					self._set_page_visible(item, False)
+					self._nav_reparent(item, self._root_screen, 0, False)
+			except Exception:
+				pass
+		for target in (self._nav_pager, self._nav_content,
+					  self._root_screen):
+			try:
+				target.invalidate()
+			except Exception:
+				pass
+		self._nav_current = None
+		self._nav_previous = None
+		self._nav_next = None
+		self._nav_root_center_x = LCD_WIDTH
+		self._nav_root_min_x = 0
+		self._nav_root_max_x = LCD_WIDTH
+		self._nav_clamp_active = False
+		self._nav_root_mode = False
+		self._nav_finish_pending = False
+		self._nav_finish_deadline = None
+		self._nav_user_scroll_pending = False
+		self._nav_trace_scroll_reported = False
+	def _ensure_root_page(self, key):
+		"""Create one of the fixed root pages without changing the current page."""
+		page = self.pages.get(key)
+		if page is not None:
+			return page
+		root_defs = {
+			"root_shoulder": ("U:/shoulder_lamp.sjpg", "肩灯", self.show_shoulder_menu),
+			"root_intercom": ("U:/intercom.sjpg", "对讲机", self.show_intercom),
+			"root_settings": ("U:/settings.sjpg", "设置", self.show_settings),
+		}
+		if key == "location":
+			# The location page is normally created by show_location().
+			return self.pages.get(key)
+		definition = root_defs.get(key)
+		if definition is None:
+			return None
+		icon_path, title, callback = definition
+		page, created = self._screen(key, "")
+		if created:
+			image = lv.img(page)
+			image.set_size(92, 92)
+			image.set_pos(102, 34)
+			_fix_position(image)
+			try:
+				# Root pages are pre-created while the login page is being replaced;
+				# make the icon clickable before it is first mounted in the pager.
+				image.add_flag(lv.obj.FLAG.CLICKABLE)
+				image.add_flag(lv.obj.FLAG.SCROLL_CHAIN_HOR)
+			except Exception:
+				pass
+			try:
+				image.set_src(icon_path)
+			except Exception:
+				pass
+			label = lv.label(page)
+			label.set_size(LCD_WIDTH, FONT_MAIN[1] + 12)
+			label.set_pos(0, 140)
+			label.set_text(title)
+			label.add_style(self._get_style(FONT_MAIN, WHITE), lv.PART.MAIN)
+			self._bind_click(page, image, lambda obj, cb=callback: cb())
+			self._bind_click(page, label, lambda obj, cb=callback: cb())
+		return page
+	def _root_neighbor(self, key, direction):
+		try:
+			index = self._nav_root_order.index(key)
+			neighbor_index = index + (1 if direction > 0 else -1)
+			if 0 <= neighbor_index < len(self._nav_root_order):
+				neighbor_key = self._nav_root_order[neighbor_index]
+				page = self._ensure_root_page(neighbor_key)
+				return ((neighbor_key, page) if page is not None else None)
+		except Exception:
+			pass
+		return None
+	def _prepare_root_nav(self, current, direction_hint=None,
+						 preserve_visible=False):
+		"""Arm the fixed root-page pager and center the current root page.
+
+		The old implementation selected one adjacent page before the gesture was
+		known. Root navigation keeps all four root pages attached at stable slots;
+		LVGL owns the drag and momentum, while the LCD thread only commits the
+		settled slot.
+		"""
+		if (current is None or current[0] == "login" or
+				not self._is_root_page()):
+			return False
+		# Mounting the root pager in the same cycle as the login tap can route
+		# that tap's release tail into the new pager and trigger an unintended
+		# location -> shoulder transition. Defer mounting until the touch is over.
+		if self._touch_pressed:
+			self._root_nav_deferred_current = current
+			try:
+				self._root_nav_deferred_until_ms = utime.ticks_add(
+					utime.ticks_ms(), 80)
+			except Exception:
+				self._root_nav_deferred_until_ms = None
+			return False
+		if not self._init_native_nav_pager() or self._nav_pager is None:
+			return False
+		key = current[0]
+		left = self._root_neighbor(key, -1)
+		right = self._root_neighbor(key, 1)
+		try:
+			# Rebuilding the fixed root pager is a programmatic operation.  Do not
+			# let SCROLL_END generated by reparenting commit another root page.
+			self._nav_user_scroll_pending = False
+			self._nav_finish_pending = False
+			# Root pages are direct children of the pager at fixed absolute slots.
+			# The child-page content object is kept empty/hidden while root mode is
+			# active, so it cannot contribute a second scroll extent or paint stale
+			# pixels over an adjacent root page.
+			# Initial composition is hidden to prevent a transient child/root frame.
+			# During a back gesture, the current root page is already visible in this
+			# pager; keep it visible and replace only the off-screen slots.
+			if not preserve_visible:
+				self._set_page_visible(self._nav_pager, False)
+			try:
+				self._nav_content.add_flag(lv.obj.FLAG.HIDDEN)
+				self._nav_content.set_size(0, 0)
+			except Exception:
+				pass
+			for slot, root_key in enumerate(self._nav_root_order):
+				root_page = self._ensure_root_page(root_key)
+				if root_page is None:
+					continue
+				if not (preserve_visible and root_page is current[1]):
+					self._set_page_visible(root_page, False)
+				if not self._nav_reparent(root_page, self._nav_pager,
+							 slot * LCD_WIDTH,
+							 preserve_visible and root_page is current[1]):
+					return False
+			for item in self.pages.values():
+				if item.get_parent() is self._nav_content:
+					self._set_page_visible(item, False)
+					self._nav_reparent(item, self._root_screen, 0, False)
+			for root_key in self._nav_root_order:
+				root_page = self.pages.get(root_key)
+				if root_page is not None:
+					self._set_page_visible(root_page, True)
+			if not preserve_visible:
+				self._set_page_visible(self._nav_pager, True)
+			self._nav_pager.move_foreground()
+			self._nav_current = current
+			self._nav_previous = left
+			self._nav_next = right
+			self._nav_root_center_x = (
+				self._nav_root_order.index(key) * LCD_WIDTH)
+			self._nav_root_min_x = 0
+			self._nav_root_max_x = (
+				(len(self._nav_root_order) - 1) * LCD_WIDTH)
+			self._nav_target_on_left = True
+			self._nav_root_mode = True
+			self._nav_finish_pending = False
+			self._nav_finish_deadline = None
+			self._nav_requested = False
+			self._nav_user_scroll_pending = False
+			self._nav_trace_scroll_reported = False
+			self._nav_trace("一级pager已就绪 当前={} 槽位={} 左={} 右={}".format(
+				self._nav_page_name(key), self._nav_root_center_x,
+				self._nav_page_name(left[0]) if left else "无",
+				self._nav_page_name(right[0]) if right else "无"))
+			try:
+				# Keep the 90px application threshold observable at SCROLL_END;
+				# Python selects the destination slot and asks this same LVGL pager
+				# to settle there. No CST816D gesture path participates.
+				self._nav_pager.set_scroll_snap_x(
+					getattr(lv.SCROLL_SNAP, "NONE"))
+			except Exception:
+				pass
+			self._nav_pager.scroll_to_x(self._nav_root_center_x, lv.ANIM.OFF)
+			for target in (self._nav_pager, self._nav_content,
+						  current[1], left[1] if left else None,
+						  right[1] if right else None, self._root_screen):
+				if target is not None:
+					try:
+						target.invalidate()
+					except Exception:
+						pass
+			return True
+		except Exception as error:
+			print("[触摸] 一级原生三槽分页准备失败：{}".format(error))
+			self._nav_supported = False
+			return False
+	def _nav_request_back(self):
+		if self._nav_pager is None or self._nav_current is None:
+			return False
+		try:
+			self._mark_touch_sequence_swipe()
+			self._nav_pager.scroll_to_x(0, lv.ANIM.OFF)
+			return True
+		except Exception:
+			try:
+				lv.obj_scroll_to_x(self._nav_pager, 0, lv.ANIM.OFF)
+				return True
+			except Exception:
+				return False
+	def _process_native_nav(self):
+		if self._nav_requested:
+			self._nav_requested = False
+			self._nav_request_back()
+		if self._nav_pager is None or self._nav_current is None:
+			return
+		if not self._nav_finish_pending:
+			return
+		try:
+			if self._nav_finish_deadline is not None and utime.ticks_diff(
+					utime.ticks_ms(), self._nav_finish_deadline) < 0:
+				return
+			x = int(self._nav_pager.get_scroll_x())
+		except Exception:
+			try:
+				x = int(lv.obj_get_scroll_x(self._nav_pager))
+			except Exception:
+				self._nav_finish_pending = False
+				return
+		self._nav_finish_pending = False
+		if self._nav_root_mode:
+			center = self._nav_root_center_x
+			left_travel = center - x
+			right_travel = x - center
+			target = None
+			if (left_travel >= NATIVE_NAV_SWITCH_DISTANCE_PX and
+					self._nav_previous is not None):
+				target = self._nav_previous
+			elif (right_travel >= NATIVE_NAV_SWITCH_DISTANCE_PX and
+					self._nav_next is not None):
+				target = self._nav_next
+			if target is not None:
+				outgoing = self._nav_current
+				if NAV_DEBUG_LOG_ENABLED:
+					try:
+						print("[NAV] commit current={} target={} x={} left={} right={}".format(
+							outgoing[0] if outgoing else None, target[0], x,
+							left_travel, right_travel))
+					except Exception:
+						pass
+				self.current = target
+				self.stack = []
+				# Root pages remain direct pager children at fixed slots.  Do not
+				# hide/reparent the outgoing page: adjacent pages must stay available
+				# for the next native drag and cannot leave stale pixels behind.
+				self._nav_current = target
+				self._nav_previous = self._root_neighbor(target[0], -1)
+				self._nav_next = self._root_neighbor(target[0], 1)
+				self._nav_root_center_x = (
+					self._nav_root_order.index(target[0]) * LCD_WIDTH)
+				self._set_page_visible(target[1], True)
+				self._nav_finish_pending = False
+				self._nav_pager.scroll_to_x(
+					self._nav_root_center_x, lv.ANIM.OFF)
+				self._nav_user_scroll_pending = False
+				self._nav_trace_scroll_reported = False
+				self._nav_trace("一级页面切换完成 当前={} 目标槽位={} 左={} 右={}".format(
+					self._nav_page_name(outgoing[0] if outgoing else None),
+					self._nav_page_name(target[0]), self._nav_root_center_x,
+					self._nav_page_name(self._nav_previous[0])
+					if self._nav_previous else "无",
+					self._nav_page_name(self._nav_next[0])
+					if self._nav_next else "无"))
+				self._sync_police_status_visibility(target[0])
+				if target[0] == "location":
+					self._location_resync_clock()
+					self._refresh_location_page()
+				self._pending_gc = True
+			else:
+				try:
+					self._nav_pager.scroll_to_x(center, lv.ANIM.OFF)
+				except Exception:
+					pass
+				self._nav_trace("一级滑动未切换 当前={} left={} right={} 阈值={} 原因=到边界或位移不足".format(
+					self._nav_page_name(), left_travel, right_travel,
+					NATIVE_NAV_SWITCH_DISTANCE_PX))
+			return
+		if (x < LCD_WIDTH - NATIVE_NAV_SWITCH_DISTANCE_PX and
+				self._nav_previous is not None):
+			outgoing = self._nav_current
+			previous = self._nav_previous
+			# Hide the page that has just been left before changing pager
+			# parents/positions.  Reparenting first can leave the outgoing page
+			# drawable for one LVGL frame, which appears as a brief flash of the
+			# third-level page after returning to a settings page.
+			if outgoing is not None:
+				self._set_page_visible(outgoing[1], False)
+				try:
+					outgoing[1].invalidate()
+				except Exception:
+					pass
+			if self.stack and self.stack[-1][1] is previous[1]:
+				self.stack.pop()
+			self.current = previous
+			if self.stack:
+				# The destination page is already the left slot of the visible
+				# pager.  Keep it visible while refreshing only the off-screen slot;
+				# hiding the whole pager here causes a black frame on every back swipe.
+				if not self._nav_prepare(previous, self.stack[-1],
+								 preserve_visible=True):
+					self._nav_teardown()
+					self._set_page_visible(previous[1], True)
+			else:
+				# Returning from a child to a root page must re-arm the root
+				# carousel.  Keep the current root page visible while replacing the
+				# child-page slots so this is a direct native transition rather than
+				# a teardown-to-black followed by a rebuild.
+				if previous[0] in ("location", "root_shoulder",
+								  "root_intercom", "root_settings"):
+					if not self._prepare_root_nav(previous, None,
+										 preserve_visible=True):
+						self._nav_teardown()
+						self._nav_reparent(previous[1], self._root_screen,
+										 0, True)
+						self._prepare_root_nav(previous, None)
+				else:
+					self._nav_teardown()
+					self._nav_reparent(previous[1], self._root_screen, 0, True)
+			self._sync_police_status_visibility(previous[0])
+			if self._poc_client is not None:
+				setter = getattr(self._poc_client,
+						"set_location_detail_active", None)
+				if setter is not None:
+					try:
+						setter(previous[0] == "location_detail")
+					except Exception as error:
+						print("[定位] 地图页面状态同步失败：{}".format(error))
+			self._pending_gc = True
+			if previous[0] == "location":
+				self._location_resync_clock()
+				self._refresh_location_page()
+			elif previous[0] == "location_detail":
+				self._refresh_location_map()
+				self._sync_location_loading_overlay()
+			# The outgoing page was hidden before pager reconfiguration above;
+			# invalidate the final composition once more to discard any queued
+			# stale region from the old child page.
+			try:
+				self._nav_pager.invalidate()
+			except Exception:
+				pass
+		else:
+			try:
+				self._nav_pager.scroll_to_x(LCD_WIDTH, lv.ANIM.OFF)
+			except Exception:
+				pass
+			self._nav_trace("二级页面滑动未返回 当前={} scroll_x={} 阈值={} 原因=位移不足或无历史".format(
+				self._nav_page_name(), x, NATIVE_NAV_SWITCH_DISTANCE_PX))
 	def _bind_click(self, page, obj, callback):
 		self._click_targets.append((page, obj, callback))
 		press_state = [None, False]
@@ -2384,30 +2985,43 @@ class JingWuUI:
 				press_state[1] = True
 				return
 			if code == lv.EVENT.PRESSED:
+				self._click_trace("按下 页面={} 对象={}".format(
+					self._nav_page_name(self._page_key(page)),
+					type(obj).__name__))
 				self._begin_touch_sequence()
+				self._touch_sequence_preferred_obj = obj
 				point = self._get_pointer_point(event)
 				self._record_touch_point(point)
 				press_state[0] = point
 				press_state[1] = False
-				self._back_drag_press(point)
 			elif code == lv.EVENT.PRESSING:
-				self._back_drag_move(update_movement(event))
+				point = update_movement(event)
 			elif code == lv.EVENT.RELEASED:
 				self._touch_pressed = False
 				self._touch_sequence_active = False
 				self._touch_press_edge_pending = True
-				if self._back_drag_release(update_movement(event)):
-					press_state[1] = True
+				update_movement(event)
 			elif code == lv.EVENT.GESTURE:
-				press_state[1] = True
-				self._mark_touch_sequence_swipe()
+				# A plain tap can generate a synthetic LVGL gesture event on the
+				# device port.  Only real displacement may cancel a click here.
+				point = update_movement(event)
+				if (press_state[0] is not None and point is not None and
+						(abs(point[0] - press_state[0][0]) >
+						 self._click_move_limit() or
+						 abs(point[1] - press_state[0][1]) >
+						 self._click_move_limit())):
+					press_state[1] = True
+					self._mark_touch_sequence_swipe()
 			elif code == lv.EVENT.CLICKED:
 				point = update_movement(event)
 				if (not press_state[1] and
 						not self._touch_sequence_swipe and
-						not self._back_animating and
+						not self._native_nav_transition_active() and
 						not self._click_dispatched):
 					self._queue_click_dispatch(point, obj)
+					self._click_trace("收到LVGL点击 页面={} 对象={} 已排队".format(
+						self._nav_page_name(self._page_key(page)),
+						type(obj).__name__))
 				press_state[0] = None
 				press_state[1] = False
 		self._event_callbacks.append(pointer_event)
@@ -2427,23 +3041,18 @@ class JingWuUI:
 			return
 		if self._consume_gesture_for_wake() or self._consume_gesture_for_poc():
 			return
+		# When the native pager is active, LVGL receives the continuous pointer
+		# stream and performs the horizontal drag/momentum/snap itself.  The
+		# driver's release gesture is used only as a swipe marker; forcing a
+		# second animation here would fight LVGL's own scroll state.
+		if (self._nav_pager is not None and self._nav_current is not None):
+			if gesture in (0, 1, 2, 3, 4, 6):
+				self._mark_touch_sequence_swipe()
+				self._nav_trace("驱动手势交给LVGL原生分页 页面={} 手势码={}".format(
+					self._nav_page_name(), gesture))
+			return
 		if gesture in (0, 1, 2, 3, 4, 6):
 			self._mark_touch_sequence_swipe()
-		if (gesture in (0, 4, 6) and self.current and
-				not self._is_root_page()):
-			self._back_drag_hardware_confirmed = True
-			self._pending_back = True
-		if self.current and self._is_root_page() and gesture in (0, 1):
-			next_key = {
-				("location", 1): "root_shoulder",
-				("root_shoulder", 0): "location",
-				("root_shoulder", 1): "root_intercom",
-				("root_intercom", 0): "root_shoulder",
-				("root_intercom", 1): "root_settings",
-				("root_settings", 0): "root_intercom",
-			}.get((self.current[0], gesture))
-			if next_key:
-				self._pending_root_swipe = next_key
 	def _on_cst816d_gesture(self, name):
 		"""Convert the direct-driver gesture name to the legacy UI action."""
 		# The direct driver already reports normalized landscape directions.
@@ -2455,6 +3064,8 @@ class JingWuUI:
 			"单击": 5,
 		}.get(name)
 		if gesture is not None:
+			self._nav_trace("收到驱动手势 页面={} 手势={}".format(
+				self._nav_page_name(), name))
 			self._handle_touch_gesture(gesture)
 	def _poll_cst816d(self):
 		controller = self._touch_controller
@@ -2480,42 +3091,89 @@ class JingWuUI:
 		# consecutive short taps: LVGL may coalesce or omit a RELEASED event
 		# when the next press arrives before the previous frame is dispatched.
 		if is_pressed and not was_pressed:
+			# Native pager pages intentionally ignore their per-page callbacks, so
+			# keep the gesture sequence alive from the hardware edge in the LCD
+			# thread.  LVGL remains the sole owner of pager movement and release.
 			self._touch_sequence_active = False
 			self._touch_press_edge_pending = True
-			# Reset the click gate at the hardware edge as well.  On a fast
-			# keypad tap LVGL can deliver the next object's PRESSED event before
-			# the prior CLICKED callback has finished; leaving this gate set would
-			# make the button visibly press but suppress its callback.
-			self._touch_sequence_swipe = False
-			self._click_dispatched = False
-			self._pending_click_dispatch = None
+			self._begin_touch_sequence()
+			self._record_touch_point(self._touch_point_cache)
+			# A new press always starts a fresh interaction.  Clear any deferred
+			# SCROLL_END left by a previous native pager re-centering.
+			self._nav_finish_pending = False
+			self._nav_user_scroll_pending = bool(
+				self._nav_current is not None)
 		elif (is_pressed and
 				new_press_generation != self._touch_press_generation):
 			self._touch_sequence_active = False
 			self._touch_press_edge_pending = True
-			self._touch_sequence_swipe = False
-			self._click_dispatched = False
-			self._pending_click_dispatch = None
+			self._begin_touch_sequence()
+			self._record_touch_point(self._touch_point_cache)
+			self._nav_finish_pending = False
+			self._nav_user_scroll_pending = bool(
+				self._nav_current is not None)
+		elif is_pressed:
+			self._record_touch_point(self._touch_point_cache)
 		elif (not is_pressed) and was_pressed:
 			self._touch_sequence_active = False
 			self._touch_press_edge_pending = True
 		self._touch_pressed = is_pressed
 		self._touch_press_generation = new_press_generation
-	def _process_pending_back(self):
-		if self._pending_back:
-			self._pending_back = False
-			if (self._back_drag_tracking and self._back_drag_active and
-					self._back_drag_hardware_confirmed):
-				self._back_drag_release(self._get_pointer_point())
-			elif (self._back_drag_tracking and
-				  self._back_drag_hardware_confirmed and
-				  not self._back_animating):
-				self._activate_back_drag()
-				self._back_drag_release(self._get_pointer_point())
-			elif (not self._back_drag_tracking and
-				  not self._back_animating and self.current and
-				  not self._is_root_page()):
-				self._start_programmatic_back()
+		if is_pressed and not was_pressed:
+			self._nav_trace("触摸按下 页面={} 序列={} native={} 根分页={}".format(
+				self._nav_page_name(), self._touch_sequence_id,
+				self._nav_current is not None, self._nav_root_mode))
+		elif (not is_pressed) and was_pressed:
+			self._nav_trace("触摸释放 页面={} 序列={} 滑动={} 最大位移=({}, {}) 保护锁={}保护尾={}唤醒={}弹窗={}".format(
+				self._nav_page_name(), self._touch_sequence_id,
+				self._touch_sequence_swipe, self._touch_sequence_max_dx,
+				self._touch_sequence_max_dy, self._poc_touch_locked,
+				self._poc_touch_guard,
+				self._screen_sleeping or self._pending_display_wake,
+				self._selection_popup_visible))
+			# Some firmware versions deliver the hardware release but omit the
+			# child's CLICKED event after a native pager is reparented.  Queue a
+			# normal hit-tested click only for a stationary release; this never
+			# competes with LVGL for a swipe or a moving gesture.
+			stationary_pager = True
+			if self._nav_pager is not None and self._nav_current is not None:
+				try:
+					pager_x = int(self._nav_pager.get_scroll_x())
+					pager_center = (self._nav_root_center_x
+						if self._nav_root_mode else
+						(LCD_WIDTH if self._nav_target_on_left else 0))
+					stationary_pager = (
+						abs(pager_x - pager_center) <= self._click_move_limit())
+				except Exception:
+					pass
+			if (not self._touch_sequence_swipe and stationary_pager and
+					self._pending_click_dispatch is None and
+					self.current is not None):
+				release_point = (self._touch_point_cache
+					if self._touch_point_cache is not None else
+					self._touch_perf[8])
+				self._queue_click_dispatch(
+					release_point, self._touch_sequence_preferred_obj)
+				self._click_trace("硬件释放补发点击 页面={} 点={}".format(
+					self._nav_page_name(), release_point))
+	def _process_navigation_events(self):
+		"""Commit native pager navigation and process root-page swipes."""
+		deferred = self._root_nav_deferred_current
+		if deferred is not None and not self._touch_pressed:
+			ready = True
+			if self._root_nav_deferred_until_ms is not None:
+				try:
+					ready = utime.ticks_diff(
+						utime.ticks_ms(),
+						self._root_nav_deferred_until_ms) >= 0
+				except Exception:
+					ready = True
+			if ready:
+				self._root_nav_deferred_current = None
+				self._root_nav_deferred_until_ms = None
+				if self.current is deferred and self.current[0] != "login":
+					self._prepare_root_nav(self.current, None)
+		self._process_native_nav()
 		if self._pending_root_swipe:
 			key = self._pending_root_swipe
 			self._pending_root_swipe = None
@@ -2530,33 +3188,59 @@ class JingWuUI:
 			page.clear_flag(lv.obj.FLAG.HIDDEN)
 		else:
 			page.add_flag(lv.obj.FLAG.HIDDEN)
-	def _invalidate_page_transition(self, *pages):
-		targets = []
-		for page in pages:
-			if page is not None and page not in targets:
-				targets.append(page)
-		if (getattr(self, "_root_screen", None) is not None and
-				self._root_screen not in targets):
-			targets.append(self._root_screen)
-		for page in targets:
-			try:
-				page.invalidate()
-			except Exception:
-				pass
 	def _switch_page(self, key, page, push_history):
 		previous = self.current
 		if previous is not None and previous[0] == key:
 			self._sync_police_status_visibility(key)
 			return
 		self._set_location_ui_busy(True)
+		self._nav_trace("请求页面切换 来源={} 目标={} 入栈={}".format(
+			self._nav_page_name(previous[0] if previous else None),
+			self._nav_page_name(key), push_history))
 		if push_history and previous is not None:
 			self.stack.append(previous)
 		if previous is not None:
-			previous[1].set_x(0)
+			try:
+				previous[1].set_x(0)
+			except Exception:
+				pass
 			self._set_page_visible(previous[1], False)
-		page.set_x(0)
-		self._set_page_visible(page, True)
+		try:
+			page.set_x(0)
+		except Exception:
+			pass
+		# A pushed child page is about to be mounted into the native pager.  Keep
+		# it hidden while it is still a root-screen child; otherwise the old root
+		# carousel and the new child can each be painted for an intermediate frame.
+		target_is_root = key in ("home", "login", "location",
+							  "root_shoulder", "root_intercom", "root_settings")
+		native_child_transition = bool(
+			push_history and previous is not None and
+			self.stack and not target_is_root)
+		self._set_page_visible(page, not native_child_transition)
 		self.current = (key, page)
+		self._nav_trace("页面切换已生效 当前={} 历史层数={}".format(
+			self._nav_page_name(key), len(self.stack)))
+		if key == "login":
+			# A PTT notice can leave a one-release guard while the UI is
+			# returning to login.  Login must always start with an open touch
+			# path; otherwise every keypad tap is classified as consumed.
+			self._poc_touch_locked = False
+			self._poc_touch_guard = False
+			self._poc_touch_released = True
+			self._touch_sequence_swipe = False
+			self._click_dispatched = False
+		# Child pages use a native two-slot horizontal pager.  Root pages stay
+		# in the same native two-slot pager when they are part of the root
+		# carousel.  Login remains a standalone full-screen page.
+		if native_child_transition:
+			if not self._nav_prepare(self.current, self.stack[-1]):
+				self._nav_teardown()
+				# Preserve the non-pager fallback if native preparation is not
+				# supported on a particular LVGL build.
+				self._set_page_visible(page, True)
+		elif not push_history and self._nav_current is not None:
+			self._nav_teardown()
 		if self._poc_client is not None:
 			setter = getattr(
 				self._poc_client, "set_location_detail_active", None)
@@ -2587,7 +3271,18 @@ class JingWuUI:
 		page.set_size(LCD_WIDTH, PAGE_HEIGHT)
 		page.set_pos(0, STATUS_HEIGHT)
 		_fix_position(page)
-		_set_bg(page, BLACK)
+		# Set the page surface for every LVGL state.  A page receives PRESSED or
+		# FOCUSED briefly while a child-row tap is being dispatched; leaving those
+		# states to the default theme can expose a white rectangle in the native
+		# pager before the next frame is rendered.
+		for state in (lv.STATE.DEFAULT, lv.STATE.PRESSED,
+					  lv.STATE.FOCUSED, lv.STATE.CHECKED):
+			page.set_style_bg_opa(255, lv.PART.MAIN | state)
+			page.set_style_bg_color(
+				lv.color_hex(_lv_color(BLACK)), lv.PART.MAIN | state)
+			page.set_style_border_width(0, lv.PART.MAIN | state)
+			page.set_style_outline_width(0, lv.PART.MAIN | state)
+			page.set_style_shadow_width(0, lv.PART.MAIN | state)
 		try:
 			page.add_flag(lv.obj.FLAG.CLICKABLE)
 		except Exception:
@@ -2638,19 +3333,64 @@ class JingWuUI:
 		label = lv.label(page)
 		label.set_text("设置")
 		label.set_size(120, 24)
-		label.set_pos(42, 3)
+		# Match the status-bar left inset used by the police-number label.
+		label.set_pos(14, 3)
 		label.add_style(self._get_style(
 			FONT_SMALL, SETTINGS_TITLE_COLOR, lv.TEXT_ALIGN.LEFT),
 			lv.PART.MAIN)
 		return label
-	def _bind_native_scroll_guard(self, content):
+	def _bind_native_scroll_guard(self, content, scroll_content=None):
+		def snap_vertical_position():
+			"""Clamp and row-align a vertical menu after LVGL momentum ends."""
+			if scroll_content is None:
+				return
+			try:
+				current_y = int(content.get_scroll_y())
+			except Exception:
+				try:
+					current_y = int(lv.obj_get_scroll_y(content))
+				except Exception:
+					return
+			try:
+				viewport_h = int(content.get_height())
+			except Exception:
+				viewport_h = MENU_VIEWPORT_HEIGHT
+			try:
+				content_h = int(scroll_content.get_height())
+			except Exception:
+				content_h = viewport_h
+			max_y = max(0, content_h - viewport_h)
+			# Rows are laid out at y=6 with a fixed 66-pixel pitch.  Keep 0 as
+			# the top boundary, then choose the nearest row start; do not choose
+			# a non-aligned max_y so the last row remains complete.
+			targets = [0]
+			row_offset = MENU_ROW_STEP
+			while row_offset <= max_y:
+				targets.append(row_offset)
+				row_offset += MENU_ROW_STEP
+			if max_y == 0:
+				target = 0
+			else:
+				bounded_y = max(0, min(max_y, current_y))
+				target = min(targets, key=lambda value: abs(value - bounded_y))
+			try:
+				content.scroll_to_y(int(target), lv.ANIM.OFF)
+			except Exception:
+				try:
+					lv.obj_scroll_to_y(content, int(target), lv.ANIM.OFF)
+				except Exception:
+					pass
 		def _native_on_scroll(*args):
+			self._menu_scroll_active = True
 			self._last_menu_scroll_ms = utime.ticks_ms()
 			self._pending_scroll_redraw = None
-			if (self._touch_pressed or
-					self._pending_click_dispatch is not None):
-				self._mark_touch_sequence_swipe()
+			# A native scroll event is definitive evidence of movement.  Mark the
+			# sequence immediately, even if LVGL has not yet emitted PRESSED for
+			# the row, so fast drags cannot be reclassified as clicks.
+			self._mark_touch_sequence_swipe()
 		def _native_on_scroll_end(*args):
+			self._menu_scroll_active = False
+			snap_vertical_position()
 			now = utime.ticks_ms()
 			self._last_menu_scroll_ms = now
 			try:
@@ -2678,7 +3418,10 @@ class JingWuUI:
 				pass
 	def _vertical_scroll_area(self, page, y, height):
 		viewport = lv.obj(page)
-		viewport.set_size(LCD_WIDTH, height)
+		# Use a fixed three-row viewport for every vertical menu.  Extra content
+		# remains in ``content`` and is revealed only by scrolling.
+		viewport_height = min(int(height), MENU_VIEWPORT_HEIGHT)
+		viewport.set_size(LCD_WIDTH, viewport_height)
 		viewport.set_pos(0, y)
 		_fix_position(viewport)
 		try:
@@ -2690,15 +3433,25 @@ class JingWuUI:
 		except Exception:
 			pass
 		try:
-			viewport.set_scroll_snap_y(lv.SCROLL_SNAP.NONE)
+			# Snap the nearest menu row to the viewport's top edge when the
+			# finger is released.  Each row is marked SNAPPABLE below; START
+			# gives a consistent row-aligned landing position across settings,
+			# sleep and group/single menus.
+			viewport.set_scroll_snap_y(lv.SCROLL_SNAP.START)
 		except Exception:
 			pass
-		for flag_name in ("SCROLL_ELASTIC", "SCROLL_CHAIN_HOR",
-						  "SCROLL_CHAIN_VER", "SNAPPABLE"):
+		# Let horizontal motion chain to the navigation pager, while keeping
+		# vertical motion owned by this viewport.  Vertical chaining is disabled
+		# to prevent two nested menu containers from moving together.
+		for flag_name in ("SCROLL_ELASTIC", "SCROLL_CHAIN_VER", "SNAPPABLE"):
 			try:
 				viewport.clear_flag(getattr(lv.obj.FLAG, flag_name))
 			except Exception:
 				pass
+		try:
+			viewport.add_flag(getattr(lv.obj.FLAG, "SCROLL_CHAIN_HOR"))
+		except Exception:
+			pass
 		try:
 			viewport.add_flag(lv.obj.FLAG.SCROLL_MOMENTUM)
 		except Exception:
@@ -2720,7 +3473,7 @@ class JingWuUI:
 				viewport.set_style_pad_left(0, lv.PART.MAIN | state)
 				viewport.set_style_pad_right(0, lv.PART.MAIN | state)
 		content = lv.obj(viewport)
-		content.set_size(LCD_WIDTH, height)
+		content.set_size(LCD_WIDTH, max(int(height), MENU_VIEWPORT_HEIGHT))
 		content.set_pos(0, 0)
 		_fix_position(content)
 		for state in (lv.STATE.DEFAULT, lv.STATE.PRESSED,
@@ -2730,9 +3483,14 @@ class JingWuUI:
 			content.set_style_outline_width(0, lv.PART.MAIN | state)
 			content.set_style_shadow_width(0, lv.PART.MAIN | state)
 			content.set_style_radius(0, lv.PART.MAIN | state)
-		self._bind_page_swipe(viewport)
-		self._bind_native_scroll_guard(viewport)
+		# The viewport owns vertical gesture dispatch.  Binding the parent page
+		# as well caused both handlers to consume the same touch sequence and
+		# produced occasional row overlap/ghost press states on the settings
+		# page.
+		self._bind_native_scroll_guard(viewport, content)
 		self._scroll_containers.append(viewport)
+		if page not in self._vertical_scroll_pages:
+			self._vertical_scroll_pages.append(page)
 		return content
 	def _settings_row(self, page, parent, y, icon_path, text, callback):
 		row = lv.obj(parent)
@@ -2743,6 +3501,12 @@ class JingWuUI:
 		row.set_size(LCD_WIDTH - 8, SETTINGS_ROW_HEIGHT)
 		row.set_pos(4, y)
 		_fix_position(row)
+		try:
+			# _fix_position clears generic scrolling flags; add SNAPPABLE
+			# afterwards so LVGL can use each row as a vertical snap target.
+			row.add_flag(lv.obj.FLAG.SNAPPABLE)
+		except Exception:
+			pass
 		for state in (lv.STATE.DEFAULT, lv.STATE.PRESSED,
 					  lv.STATE.FOCUSED, lv.STATE.CHECKED):
 			row.set_style_bg_opa(255, lv.PART.MAIN | state)
@@ -2806,6 +3570,10 @@ class JingWuUI:
 		row.set_size(LCD_WIDTH - 8, SETTINGS_ROW_HEIGHT)
 		row.set_pos(4, y)
 		_fix_position(row)
+		try:
+			row.add_flag(lv.obj.FLAG.SNAPPABLE)
+		except Exception:
+			pass
 		for state in (lv.STATE.DEFAULT, lv.STATE.PRESSED,
 					  lv.STATE.FOCUSED, lv.STATE.CHECKED):
 			row.set_style_bg_opa(255, lv.PART.MAIN | state)
@@ -2859,6 +3627,10 @@ class JingWuUI:
 		radio.set_size(LCD_WIDTH, 58)
 		radio.set_pos(0, y)
 		_fix_position(radio)
+		try:
+			radio.add_flag(lv.obj.FLAG.SNAPPABLE)
+		except Exception:
+			pass
 		try:
 			radio.clear_flag(lv.obj.FLAG.CHECKABLE)
 		except Exception:
@@ -2939,6 +3711,8 @@ class JingWuUI:
 	def _set_radio_row_selected(self, radio, selected):
 		if radio is None:
 			return
+		if self._menu_scroll_active:
+			return
 		if selected:
 			radio.add_state(lv.STATE.CHECKED)
 		else:
@@ -3016,9 +3790,11 @@ class JingWuUI:
 	def _load(self, key, page):
 		self._switch_page(key, page, True)
 	def go_back(self):
-		if not self.stack or self._back_animating:
+		if not self.stack:
 			return
-		self._clear_back_drag_state()
+		if self._nav_current is not None:
+			self._nav_requested = True
+			return
 		previous = self.stack.pop()
 		self._switch_page(previous[0], previous[1], False)
 	def _get_obj_area(self, obj):
@@ -3062,12 +3838,39 @@ class JingWuUI:
 						callback()
 						return True
 			return True
+		# Root pages are direct children of the native pager.  A few LVGL
+		# bindings return a fresh Python wrapper for the page during an event,
+		# so ``page is current_page`` is not reliable there.  Route the only
+		# registered root-page controls explicitly by the current page key.
+		root_callback = {
+			"location": self.show_location_detail,
+			"root_shoulder": self.show_shoulder_menu,
+			"root_intercom": self.show_intercom,
+			"root_settings": self.show_settings,
+		}.get(self.current[0])
+		if root_callback is not None and preferred_obj is not None:
+			self._click_trace("一级页面直接路由 页面={} 对象={}".format(
+				self._nav_page_name(), type(preferred_obj).__name__))
+			try:
+				root_callback()
+			except Exception as error:
+				self._click_trace("回调异常 页面={} 错误={}".format(
+					self._nav_page_name(), error))
+			return True
 		if preferred_obj is not None:
 			for page, obj, callback in self._click_targets:
 				if page is current_page and obj is preferred_obj:
-					callback(None)
+					self._click_trace("命中回调 页面={} 方式=LVGL对象".format(
+						self._nav_page_name()))
+					try:
+						callback(None)
+					except Exception as error:
+						self._click_trace("回调异常 页面={} 错误={}".format(
+							self._nav_page_name(), error))
 					return True
 		if point is None:
+			self._click_trace("未命中回调 页面={} 原因=无坐标".format(
+				self._nav_page_name()))
 			return False
 		x, y = point
 		for page, obj, callback in self._click_targets:
@@ -3078,8 +3881,16 @@ class JingWuUI:
 				continue
 			if (area.x1 <= x <= area.x2 and
 					area.y1 <= y <= area.y2):
-				callback(None)
+				self._click_trace("命中回调 页面={} 方式=坐标".format(
+					self._nav_page_name()))
+				try:
+					callback(None)
+				except Exception as error:
+					self._click_trace("回调异常 页面={} 错误={}".format(
+						self._nav_page_name(), error))
 				return True
+		self._click_trace("未命中回调 页面={} 点={}".format(
+			self._nav_page_name(), point))
 		return False
 	def _login_button(self, page, x, y, width, height, text, callback,
 					  color=LOGIN_KEY_BG, font=FONT_LOGIN_TEXT,
@@ -3119,10 +3930,13 @@ class JingWuUI:
 		return button
 	def _set_login_prefix(self, prefix):
 		if self._login_identity_prompt:
+			self._click_trace("登录前缀忽略：身份确认弹窗中")
 			return
 		if prefix not in ("M", "F"):
+			self._click_trace("登录前缀忽略：值={} 无效".format(prefix))
 			return
 		self._login_prefix = prefix
+		self._click_trace("登录前缀已设置：{}".format(prefix))
 		for key, button in self._login_prefix_buttons.items():
 			color = LOGIN_SELECTED_BG if key == prefix else LOGIN_ROW_BG
 			for state in (lv.STATE.DEFAULT, lv.STATE.PRESSED,
@@ -3134,15 +3948,24 @@ class JingWuUI:
 		if self._login_number_label is None:
 			return
 		self._login_number_label.set_text(self._login_digits)
+		try:
+			self._login_number_label.invalidate()
+		except Exception:
+			pass
 	def _login_digit(self, digit):
 		if self._force_login_prompt or self._login_identity_prompt:
+			self._click_trace("登录数字忽略：弹窗中 digit={}".format(digit))
 			return
 		if len(self._login_digits) >= LOGIN_DIGIT_COUNT:
+			self._click_trace("登录数字忽略：已满6位 digit={}".format(digit))
 			return
 		self._login_digits += str(digit)
+		self._click_trace("登录数字已录入：{} 当前长度={}".format(
+			digit, len(self._login_digits)))
 		self._refresh_login_number()
 	def _login_delete(self):
 		if self._login_identity_prompt:
+			self._click_trace("登录删除忽略：身份确认弹窗中")
 			return
 		if self._force_login_prompt:
 			self._force_login_prompt = False
@@ -3150,6 +3973,8 @@ class JingWuUI:
 			return
 		if self._login_digits:
 			self._login_digits = self._login_digits[:-1]
+			self._click_trace("登录数字已删除：当前长度={}".format(
+				len(self._login_digits)))
 			self._refresh_login_number()
 	def _show_login_message(self, text, color=RED, duration_ms=None):
 		if self._login_status_label is None:
@@ -3260,6 +4085,8 @@ class JingWuUI:
 			self._show_login_message(
 				"登录失败", RED, LOGIN_MESSAGE_DURATION_MS)
 	def _confirm_login(self):
+		self._click_trace("登录确认：前缀={} 数字长度={}".format(
+			self._login_prefix, len(self._login_digits)))
 		if self._force_login_prompt or self._login_identity_prompt:
 			return
 		if self._login_message_until_ms is not None:
@@ -3485,11 +4312,18 @@ class JingWuUI:
 	def show_home(self):
 		self.show_location()
 	def show_location(self):
+		from_login = (self.current is not None and
+					  self.current[0] == "login")
 		page, created = self._screen("location", "")
 		if created:
 			image = lv.img(page)
 			image.set_size(92, 92); image.set_pos(192, 48); _fix_position(image)
-			try: image.set_src("E:/location_icon_92.png")
+			try:
+				image.add_flag(lv.obj.FLAG.CLICKABLE)
+				image.add_flag(lv.obj.FLAG.SCROLL_CHAIN_HOR)
+			except Exception:
+				pass
+			try: image.set_src("U:/location_icon_92.sjpg")
 			except Exception: pass
 			self._bind_click(
 				page, image, lambda obj: self.show_location_detail())
@@ -3529,6 +4363,18 @@ class JingWuUI:
 				widget.clear_flag(lv.obj.FLAG.HIDDEN)
 		self.stack = []
 		self._switch_page("location", page, False)
+		if from_login:
+			# The successful login callback can run in the same LVGL dispatch pass
+			# as the final keypad release.  Arm the root pager only after that input
+			# sequence has drained, so the login tap cannot become a root swipe.
+			self._root_nav_deferred_current = self.current
+			try:
+				self._root_nav_deferred_until_ms = utime.ticks_add(
+					utime.ticks_ms(), 120)
+			except Exception:
+				self._root_nav_deferred_until_ms = None
+		else:
+			self._prepare_root_nav(self.current, None)
 		self._location_resync_clock()
 		self._refresh_location_page()
 	def _apply_location_snapshot(self, snapshot):
@@ -3567,7 +4413,7 @@ class JingWuUI:
 				if self.current[0] == "location":
 					self._refresh_location_page()
 				elif (self.current[0] == "location_detail" and
-					  not self._back_transition_active()):
+					  not self._native_nav_transition_active()):
 					self._refresh_location_map()
 		refresh_revision = int(snapshot.get("location_refresh_revision") or 0)
 		if refresh_revision != self._location_refresh_revision_seen:
@@ -3649,10 +4495,10 @@ class JingWuUI:
 			except Exception:
 				pass
 			self._location_zoom_icon(
-				page, 10, "E:/location_zoom_in.png",
+				page, 10, "U:/location_zoom_in.png",
 				lambda obj: self._change_location_zoom(1))
 			self._location_zoom_icon(
-				page, 68, "E:/location_zoom_out.png",
+				page, 68, "U:/location_zoom_out.png",
 				lambda obj: self._change_location_zoom(-1))
 			self._location_refresh_control(
 				page, lambda obj: self._request_location_refresh(), 120)
@@ -3798,6 +4644,11 @@ class JingWuUI:
 		if created:
 			image = lv.img(page)
 			image.set_size(92, 92); image.set_pos(102, 34); _fix_position(image)
+			try:
+				image.add_flag(lv.obj.FLAG.CLICKABLE)
+				image.add_flag(lv.obj.FLAG.SCROLL_CHAIN_HOR)
+			except Exception:
+				pass
 			try: image.set_src(icon_path)
 			except Exception: pass
 			label = lv.label(page); label.set_size(LCD_WIDTH, FONT_MAIN[1] + 12); label.set_pos(0, 140)
@@ -3807,12 +4658,13 @@ class JingWuUI:
 			self._bind_click(page, label, lambda obj: callback())
 		self.stack = []
 		self._switch_page(key, page, False)
+		self._prepare_root_nav(self.current, None)
 	def show_shoulder_root(self):
-		self._show_root_icon_page("root_shoulder", "E:/shoulder_lamp.png", "肩灯", self.show_shoulder_menu)
+		self._show_root_icon_page("root_shoulder", "U:/shoulder_lamp.png", "肩灯", self.show_shoulder_menu)
 	def show_intercom_root(self):
-		self._show_root_icon_page("root_intercom", "E:/intercom.png", "对讲机", self.show_intercom)
+		self._show_root_icon_page("root_intercom", "U:/intercom.png", "对讲机", self.show_intercom)
 	def show_settings_root(self):
-		self._show_root_icon_page("root_settings", "E:/settings.png", "设置", self.show_settings)
+		self._show_root_icon_page("root_settings", "U:/settings.sjpg", "设置", self.show_settings)
 	def _refresh_location_page(self):
 		labels = self._location_labels
 		if not labels or self.current is None or self.current[0] != "location":
@@ -3867,10 +4719,10 @@ class JingWuUI:
 					page.set_style_pad_left(0, lv.PART.MAIN | state)
 					page.set_style_pad_right(0, lv.PART.MAIN | state)
 			self._settings_row(
-				page, page, 6, "E:/group_call.png", "组呼模式",
+				page, page, 6, "U:/group_call.png", "组呼模式",
 				lambda obj: self.show_group_mode())
 			self._settings_row(
-				page, page, 72, "E:/single_call.png", "单呼模式",
+				page, page, 72, "U:/single_call.png", "单呼模式",
 				lambda obj: self.show_single_mode())
 		self._load("intercom", page)
 		if self._poc_client is not None:
@@ -3936,7 +4788,8 @@ class JingWuUI:
 			none_radio.set_text("无/退出")
 		self._set_radio_row_layout(none_radio, 6, True)
 		row_index = 1
-		seen = {"__none_group__": True}
+		# Use a set for duplicate detection; ``.add`` below is a set API.
+		seen = {"__none_group__"}
 		for group in self._intercom_groups:
 			key = str(group.get("raw_id", ""))
 			if not key or key in seen:
@@ -3982,7 +4835,8 @@ class JingWuUI:
 		none_radio.set_text("无/解散")
 		self._set_radio_row_layout(none_radio, 6, True)
 		index = 1
-		seen = {self._single_none_key: True}
+		# Use a set for duplicate detection; ``.add`` below is a set API.
+		seen = {self._single_none_key}
 		for person in self._intercom_people:
 			if self._is_logged_in_person(person):
 				continue
@@ -4188,8 +5042,8 @@ class JingWuUI:
 	def show_shoulder_menu(self):
 		page, created = self._screen("shoulder_menu", "")
 		if created:
-			self._settings_row(page, page, 6, "E:/shoulder_mode.png", "肩灯模式", lambda obj: self.show_shoulder_mode())
-			self._settings_row(page, page, 72, "E:/double_click_mode.png", "双击模式", lambda obj: self.show_double_click_mode())
+			self._settings_row(page, page, 6, "U:/shoulder_mode.png", "肩灯模式", lambda obj: self.show_shoulder_mode())
+			self._settings_row(page, page, 72, "U:/double_click_mode.png", "双击模式", lambda obj: self.show_double_click_mode())
 		self._load("shoulder_menu", page)
 	def show_shoulder_mode(self):
 		self.show_shoulder()
@@ -4262,14 +5116,14 @@ class JingWuUI:
 			content = self._vertical_scroll_area(
 				page, STATUS_HEIGHT, PAGE_HEIGHT)
 			items = (
-				("E:/settings_device.png", "设备信息", self.show_device),
-				("E:/settings_brightness.png", "屏幕亮度", self.show_brightness),
-				("E:/settings_shoulder_brightness.png", "肩灯亮度",
+				("U:/settings_device.png", "设备信息", self.show_device),
+				("U:/settings_brightness.png", "屏幕亮度", self.show_brightness),
+				("U:/settings_shoulder_brightness.png", "肩灯亮度",
 				 self.show_shoulder_brightness),
-				("E:/settings_volume.png", "音量", self.show_volume),
-				("E:/settings_sleep.png", "息屏时间", self.show_sleep),
-				("E:/settings_network.png", "网络状态", self.show_network),
-				("E:/settings_fall_detection.png", "跌倒检测", self.show_fall_detection),
+				("U:/settings_volume.png", "音量", self.show_volume),
+				("U:/settings_sleep.png", "息屏时间", self.show_sleep),
+				("U:/settings_network.png", "网络状态", self.show_network),
+				("U:/settings_fall_detection.png", "跌倒检测", self.show_fall_detection),
 			)
 			for index, item in enumerate(items):
 				y = index * (SETTINGS_ROW_HEIGHT + SETTINGS_ROW_GAP)
@@ -4739,7 +5593,7 @@ class JingWuUI:
 			lv.PART.MAIN)
 		value_label.set_text(str(self.volume))
 		icon = lv.img(page)
-		icon.set_src("E:/settings_volume.png")
+		icon.set_src("U:/settings_volume.png")
 		icon.set_size(40, 40)
 		icon.set_pos(slider_x + (slider_width - 40) // 2, 164)
 		_fix_position(icon)
@@ -4973,18 +5827,38 @@ class JingWuUI:
 			self.status["battery"] = value
 		if (self._screen_sleeping or self._pending_display_wake or
 				self._is_audio_priority_active() or
-				self._back_transition_active() or
+				self._native_nav_transition_active() or
 				self._ui_interaction_active()):
 			if changed:
 				self._status_refresh_pending = True
 			return
 		self._refresh_status()
 		self._status_refresh_pending = False
-	def _back_transition_active(self):
-		return self._back_drag_active or self._back_animating
+	def _native_nav_transition_active(self):
+		return bool(self._nav_current is not None and
+					self._nav_finish_pending)
 	def _ui_interaction_active(self):
-		if self._touch_pressed or self._back_transition_active():
+		if (self._touch_pressed or self._native_nav_transition_active() or
+				self._menu_scroll_active):
 			return True
+		# The CST816D controller enters its dynamic session on the IRQ edge,
+		# before LVGL necessarily emits PRESSED/SCROLL.  Use that hardware state
+		# as part of the interaction gate as well; otherwise the TCP/HTTP workers
+		# can be woken during the first few drag frames and steal the interpreter.
+		# ``is_fast_path_active`` intentionally expires during the release tail,
+		# so deferred low-priority work is still resumed promptly after a real
+		# release while the 2-second IRQ confirmation continues in the driver.
+		controller = self._touch_controller
+		if controller is not None:
+			try:
+				fast_getter = getattr(controller, "is_fast_path_active", None)
+				if fast_getter is not None and fast_getter():
+					return True
+				if (fast_getter is None and
+						controller.is_dynamic_active()):
+					return True
+			except Exception:
+				pass
 		last_scroll = self._last_menu_scroll_ms
 		return bool(last_scroll is not None and
 					 self._ticks_since(last_scroll) < MENU_SCROLL_SETTLE_MS)
@@ -5004,7 +5878,7 @@ class JingWuUI:
 	def _process_deferred_status_refresh(self):
 		if (self._screen_sleeping or self._pending_display_wake or
 				self._is_audio_priority_active() or
-				self._back_transition_active() or
+				self._native_nav_transition_active() or
 				self._ui_interaction_active()):
 			return
 		if self._status_refresh_pending:
@@ -5038,7 +5912,7 @@ class JingWuUI:
 				return
 		if (self._touch_pressed or self._screen_sleeping or
 				self._pending_display_wake or self._is_audio_priority_active() or
-				self._back_transition_active()):
+				self._native_nav_transition_active()):
 			return
 		self._pending_scroll_redraw = None
 		try:
@@ -5050,20 +5924,33 @@ class JingWuUI:
 		except Exception:
 			self._invalidate_root_screen()
 	def _process_pending_gc(self):
-		if (not self._pending_gc or self._back_transition_active() or
+		if (not self._pending_gc or self._native_nav_transition_active() or
 				self._is_audio_priority_active()):
 			return
 		self._pending_gc = False
 		gc.collect()
-		try:
-			print("[内存] free={} pages={} stack={}".format(
-				gc.mem_free(), len(self.pages), len(self.stack)))
-		except Exception:
-			pass
+		if PERF_LOG_ENABLED:
+			try:
+				print("[内存] free={} pages={} stack={}".format(
+					gc.mem_free(), len(self.pages), len(self.stack)))
+			except Exception:
+				pass
 	def _touch_high_frequency_active(self):
-		"""Keep the LCD loop awake for the complete CST816D touch session."""
+		"""Keep the LCD loop fast for the complete CST816D dynamic session.
+
+		The controller deliberately keeps IRQ disabled until two seconds of
+		continuous no-touch samples have been observed.  Treat that short
+		release-confirmation tail as part of the fast session so an occasional
+		transition frame cannot switch the main loop back to expensive background
+		work and destroy the sampling cadence.  Pending clicks are still gated by
+		``_touch_pressed`` and therefore dispatch as soon as release is observed.
+		"""
 		try:
 			if self._touch_controller.is_dynamic_active():
+				fast_getter = getattr(self._touch_controller,
+						"is_fast_path_active", None)
+				if fast_getter is not None:
+					return bool(fast_getter())
 				return True
 		except Exception:
 			pass
@@ -5073,6 +5960,8 @@ class JingWuUI:
 					 not self._pending_display_wake and
 					 not self._is_audio_priority_active())
 	def _perf_add(self, index, elapsed):
+		if not self._fast_perf_active:
+			return
 		item = self._perf_stats[index]
 		item[0] += 1
 		item[1] += elapsed
@@ -5081,6 +5970,8 @@ class JingWuUI:
 		if elapsed >= 50: item[4] += 1
 		if elapsed >= 100: item[5] += 1
 	def _perf_add_post(self, index, elapsed):
+		if not self._fast_perf_active:
+			return
 		item = self._perf_post_stats[index]
 		item[0] += 1
 		item[1] += elapsed
@@ -5088,6 +5979,44 @@ class JingWuUI:
 		if elapsed >= 30: item[3] += 1
 		if elapsed >= 50: item[4] += 1
 		if elapsed >= 100: item[5] += 1
+	def _perf_extra_add(self, item, elapsed):
+		if not self._fast_perf_active:
+			return
+		item[0] += 1
+		item[1] += elapsed
+		if elapsed > item[2]:
+			item[2] = elapsed
+	def _begin_fast_perf(self, now):
+		"""Start an isolated performance window for one dynamic touch session."""
+		for item in self._perf_stats:
+			for i in range(6):
+				item[i] = 0
+		for item in self._perf_post_stats:
+			for i in range(6):
+				item[i] = 0
+		for item in (self._perf_touch_poll, self._perf_poc_floor_get,
+					self._perf_poc_full_get, self._perf_touch_i2c, self._perf_gap):
+			item[0] = item[1] = item[2] = 0
+		for i in range(8):
+			self._perf_yield[i] = 0
+		self._perf_yield[5] = None
+		for i in range(7):
+			self._touch_perf[i] = 0
+		self._touch_perf[7] = None
+		self._touch_perf[8] = None
+		self._perf_lvgl_no_flush = 0
+		self._perf_skip_cycle = False
+		self._perf_map_probe_counter = 0
+		self._fast_perf_started_ms = now
+		self._fast_lcd_cycles = 0
+		self._fast_lcd_started_ms = None
+		self._fast_lcd_last_ms = None
+		self._fast_perf_active = True
+	def _end_fast_perf(self, now):
+		if not self._fast_perf_active:
+			return
+		self._fast_perf_active = False
+		self._fast_perf_release_pending = True
 	def _location_map_io_active(self):
 		if self._poc_client is None:
 			return False
@@ -5100,9 +6029,41 @@ class JingWuUI:
 		except Exception:
 			return False
 	def _report_perf(self, now):
-		if utime.ticks_diff(now, self._perf_report_started_ms) < PERF_REPORT_MS:
+		global FLUSH_PERF
+		if self._fast_perf_active:
 			return
+		if not self._fast_perf_release_pending:
+			return
+		self._fast_perf_release_pending = False
 		self._perf_report_started_ms = now
+		if not PERF_LOG_ENABLED:
+			# Keep diagnostics from accumulating while output is disabled.  This
+			# path deliberately avoids all formatting, lock snapshots and console
+			# I/O, which are the expensive parts of the report.
+			for item in self._perf_stats:
+				for i in range(6):
+					item[i] = 0
+			for item in self._perf_post_stats:
+				for i in range(6):
+					item[i] = 0
+			for i in range(6):
+					FLUSH_PERF[i] = 0
+			for i in range(8):
+				self._perf_yield[i] = 0
+			for item in (self._perf_touch_poll, self._perf_touch_i2c,
+							self._perf_poc_floor_get, self._perf_poc_full_get,
+							self._perf_gap):
+				for i in range(3 if item is not self._perf_gap else 6):
+					item[i] = 0
+			for i in range(7):
+				self._touch_perf[i] = 0
+			self._touch_perf[7] = None
+			self._touch_perf[8] = None
+			self._perf_lvgl_no_flush = 0
+			self._fast_lcd_cycles = 0
+			self._fast_lcd_started_ms = None
+			self._fast_lcd_last_ms = None
+			return
 		labels = ("cycle", "pre", "ui", "lvgl", "shoulder",
 				  "battery", "network", "audio", "post", "sleep")
 		parts = []
@@ -5113,7 +6074,6 @@ class JingWuUI:
 				item[2], item[3], item[4], item[5]))
 			for i in range(6): item[i] = 0
 		print("[PERF] count/avg/max/30-50-100ms " + " ".join(parts))
-		global FLUSH_PERF
 		fc = FLUSH_PERF[0]
 		print("[PERF][LCD] flush={} copy_avg={:.1f} copy_max={} write_avg={:.1f} write_max={} bytes={} lvgl_no_flush={}".format(
 			fc, FLUSH_PERF[1] / fc if fc else 0, FLUSH_PERF[2],
@@ -5147,16 +6107,124 @@ class JingWuUI:
 		print("[PERF][TOUCH] points={} gap_count={} gap_avg={:.1f} gap_max={} gap30/50/100={}/{}/{}".format(
 			t[0], t[1], t[2] / t[1] if t[1] else 0, t[3],
 			t[4], t[5], t[6]))
+		p = self._perf_touch_poll
+		i2c = self._perf_touch_i2c
+		fg = self._perf_poc_floor_get
+		full = self._perf_poc_full_get
+		gap = self._perf_gap
+		print("[PERF][FAST] poll={}/{:.1f}/{} i2c_read={}/{:.3f}/{}ms floor_get={}/{:.1f}/{} full_get={}/{:.1f}/{}".format(
+			p[0], p[1] / p[0] if p[0] else 0, p[2],
+			i2c[0], i2c[1] / i2c[0] if i2c[0] else 0,
+			i2c[2],
+			fg[0], fg[1] / fg[0] if fg[0] else 0, fg[2],
+			full[0], full[1] / full[0] if full[0] else 0, full[2]))
+		print("[PERF][GAP] count={}/avg={:.1f}/max={} 30-50-100={}/{}/{}".format(
+			gap[0], gap[1] / gap[0] if gap[0] else 0, gap[2],
+			gap[3], gap[4], gap[5]))
+		lcd_cycles = self._fast_lcd_cycles
+		lcd_started = self._fast_lcd_started_ms
+		lcd_last = self._fast_lcd_last_ms
+		lcd_elapsed = (utime.ticks_diff(lcd_last, lcd_started)
+					   if lcd_started is not None and lcd_last is not None else 0)
+		lcd_rate = ((lcd_cycles - 1) * 1000.0 / lcd_elapsed
+					if lcd_cycles > 1 and lcd_elapsed > 0 else 0.0)
+		print("[PERF][LCD_FAST] cycles={} duration={}ms frequency={:.1f}Hz "
+			  "avg_cycle={:.2f}ms".format(
+				  lcd_cycles, lcd_elapsed, lcd_rate,
+				  lcd_elapsed / float(lcd_cycles - 1)
+				  if lcd_cycles > 1 and lcd_elapsed > 0 else 0.0))
+		self._fast_lcd_cycles = 0
+		self._fast_lcd_started_ms = None
+		self._fast_lcd_last_ms = None
+		for item in (p, i2c, fg, full, gap):
+			item[0] = item[1] = item[2] = 0
+		# Background-thread timings are sampled only at the end of a touch
+		# session; querying them every LCD cycle would reintroduce lock/snapshot
+		# overhead into the fast path.
+		try:
+			poc_perf = (self._poc_client.get_thread_perf_snapshot()
+						if self._poc_client is not None else None)
+		except Exception:
+			poc_perf = None
+		try:
+			audio = (getattr(self._poc_client, "audio_controller", None)
+					 if self._poc_client is not None else None)
+			audio_perf = (audio.get_thread_perf_snapshot()
+						  if audio is not None else None)
+		except Exception:
+			audio_perf = None
+		try:
+			monitor = (getattr(self._poc_client, "network_monitor", None)
+						if self._poc_client is not None else None)
+			net_perf = (monitor.get_thread_perf_snapshot()
+						if monitor is not None else None)
+		except Exception:
+			net_perf = None
+		def _fmt_perf(data):
+			if not data:
+				return "none"
+			parts = []
+			for name, item in data.items():
+				count, total, maximum, over30, over50, over100 = item
+				parts.append("{}={}/{:.1f}/{}/{}-{}-{}".format(
+					name, count, total / count if count else 0, maximum,
+					over30, over50, over100))
+			return " ".join(parts)
+		print("[PERF][THREAD][POC] " + _fmt_perf(poc_perf))
+		print("[PERF][THREAD][RTP] " + _fmt_perf(audio_perf))
+		print("[PERF][THREAD][NET] " + _fmt_perf(net_perf))
 		last_ms, last_point = t[7], t[8]
 		for i in range(7): t[i] = 0
 		t[7], t[8] = last_ms, last_point
 		self._perf_skip_cycle = True
 	def run(self):
 		last_tick_ms = utime.ticks_ms()
+		last_cycle_end_ms = last_tick_ms
 		last_lvgl_task_ms = last_tick_ms
 		while True:
 			now = utime.ticks_ms()
+			if self._fast_perf_active:
+				gap_ms = utime.ticks_diff(now, last_cycle_end_ms)
+				self._perf_extra_add(self._perf_gap, gap_ms)
+			was_dynamic = False
+			try:
+				was_dynamic = bool(self._touch_controller.is_dynamic_active())
+			except Exception:
+				pass
+			stage_poll = utime.ticks_ms()
 			self._poll_cst816d()
+			try:
+				dynamic_now = bool(self._touch_controller.is_dynamic_active())
+			except Exception:
+				dynamic_now = False
+			# Follow the actual fast-path state; the controller remains dynamic
+			# during release confirmation, which is intentionally excluded.
+			touch_fast_path = self._touch_high_frequency_active()
+			if touch_fast_path and not self._fast_perf_active:
+				self._begin_fast_perf(now)
+			elif (not touch_fast_path) and self._fast_perf_active:
+				self._end_fast_perf(now)
+			if touch_fast_path:
+				# Timestamp the loop itself after the path decision; this excludes
+				# CST816D's release-confirmation tail.
+				fast_loop_now = utime.ticks_ms()
+				if self._fast_lcd_started_ms is None:
+					self._fast_lcd_started_ms = fast_loop_now
+				self._fast_lcd_cycles += 1
+				self._fast_lcd_last_ms = fast_loop_now
+			self._perf_extra_add(
+				self._perf_touch_poll,
+				utime.ticks_diff(utime.ticks_ms(), stage_poll))
+			try:
+				i2c_us = int(self._touch_controller.get_last_i2c_read_us())
+			except Exception:
+				i2c_us = 0
+			if i2c_us > 0:
+				self._perf_extra_add(self._perf_touch_i2c, i2c_us / 1000.0)
+			# Decide the scheduling path immediately after sampling.  Previously
+			# this check happened near the end of the loop, after every background
+			# monitor had already run, so a touch session was not actually a fast
+			# path even when sleep_ms(1) was omitted.
 			try:
 				tick_elapsed = utime.ticks_diff(now, last_tick_ms)
 			except Exception:
@@ -5170,7 +6238,15 @@ class JingWuUI:
 				lv.tick_inc(int(tick_elapsed))
 			stage = utime.ticks_ms()
 			self._sync_poc_ui_interaction()
-			self._process_poc_client()
+			# TCP控制线程只在非触摸快速路径被定时唤醒；P0/P1事件由业务
+			# 入口自行唤醒，不在这里重复调度。
+			if self._poc_client is not None:
+				try:
+					self._poc_client.notify_low_priority_scheduler(
+						touch_fast_path)
+				except Exception:
+					pass
+			self._process_poc_client(touch_fast_path)
 			self._process_display_wake()
 			self._perf_add(1, utime.ticks_diff(utime.ticks_ms(), stage))
 			force_poc_frame = (
@@ -5188,10 +6264,15 @@ class JingWuUI:
 			if run_lvgl_task:
 				stage = utime.ticks_ms()
 				if not force_poc_frame:
-					self._process_back_drag_frame()
-					self._process_back_animation()
-					self._process_deferred_status_refresh()
-					self._process_pending_scroll_redraw()
+					# LVGL owns the active drag/momentum update.  Do not run the
+					# Python-side navigation commit/probe while the finger is still
+					# down; it is only needed after release and can occasionally
+					# reparent pages in the middle of a scroll frame.
+					if (not touch_fast_path or not self._touch_pressed):
+						self._process_native_nav()
+					if not touch_fast_path:
+						self._process_deferred_status_refresh()
+						self._process_pending_scroll_redraw()
 				self._perf_add(2, utime.ticks_diff(utime.ticks_ms(), stage))
 				flush_before = FLUSH_PERF[0]
 				stage = utime.ticks_ms()
@@ -5201,25 +6282,32 @@ class JingWuUI:
 					self._perf_lvgl_no_flush += 1
 				last_lvgl_task_ms = utime.ticks_ms()
 				self._confirm_poc_popup_frame()
+			# Non-urgent monitors are deferred while a finger is down or the
+			# CST816D dynamic session is active.  Their state is revision based,
+			# so skipping a few cycles cannot lose an update; the normal path below
+			# catches up as soon as the touch session ends.
+			if not touch_fast_path:
+				stage = utime.ticks_ms()
+				self._process_shoulder_lamp()
+				self._perf_add(4, utime.ticks_diff(utime.ticks_ms(), stage))
+				stage = utime.ticks_ms()
+				self._process_battery_monitor()
+				self._perf_add(5, utime.ticks_diff(utime.ticks_ms(), stage))
+				stage = utime.ticks_ms()
+				self._process_network_monitor()
+				self._perf_add(6, utime.ticks_diff(utime.ticks_ms(), stage))
+				stage = utime.ticks_ms()
+				self._process_audio_volume()
+				self._perf_add(7, utime.ticks_diff(utime.ticks_ms(), stage))
 			stage = utime.ticks_ms()
-			self._process_shoulder_lamp()
-			self._perf_add(4, utime.ticks_diff(utime.ticks_ms(), stage))
-			stage = utime.ticks_ms()
-			self._process_battery_monitor()
-			self._perf_add(5, utime.ticks_diff(utime.ticks_ms(), stage))
-			stage = utime.ticks_ms()
-			self._process_network_monitor()
-			self._perf_add(6, utime.ticks_diff(utime.ticks_ms(), stage))
-			stage = utime.ticks_ms()
-			self._process_audio_volume()
-			self._perf_add(7, utime.ticks_diff(utime.ticks_ms(), stage))
-			stage = utime.ticks_ms()
-			self._process_login_message()
+			if not touch_fast_path:
+				self._process_login_message()
 			elapsed = utime.ticks_diff(utime.ticks_ms(), stage)
 			self._perf_add_post(0, elapsed)
 			post_total = elapsed
 			stage = utime.ticks_ms()
-			if (self.current is not None and self.current[0] == "location" and
+			if (not touch_fast_path and self.current is not None and
+					self.current[0] == "location" and
 					(self._location_last_refresh_ms is None or
 					 utime.ticks_diff(now, self._location_last_refresh_ms) >= 1000)):
 				self._location_last_refresh_ms = now
@@ -5228,43 +6316,62 @@ class JingWuUI:
 			self._perf_add_post(1, elapsed)
 			post_total += elapsed
 			stage = utime.ticks_ms()
-			self._process_pending_back()
+			# Defer Python navigation callbacks until release.  Native LVGL
+			# scrolling remains active in the task handler above.
+			if (not touch_fast_path or not self._touch_pressed):
+				self._process_navigation_events()
 			elapsed = utime.ticks_diff(utime.ticks_ms(), stage)
 			self._perf_add_post(2, elapsed)
 			post_total += elapsed
 			stage = utime.ticks_ms()
-			self._process_pending_click()
+			# Do not run a queued page/business callback while the finger is still
+			# down: page construction or a selection dialog can block the sampling
+			# loop.  Once the pointer is released we dispatch immediately, even
+			# during CST816D's release-confirmation window, so keypad taps do not
+			# incur the full two-second controller tail.
+			if (not touch_fast_path) or (not self._touch_pressed):
+				self._process_pending_click()
 			elapsed = utime.ticks_diff(utime.ticks_ms(), stage)
 			self._perf_add_post(3, elapsed)
 			post_total += elapsed
 			stage = utime.ticks_ms()
-			self._process_pending_gc()
+			if not touch_fast_path:
+				self._process_pending_gc()
 			elapsed = utime.ticks_diff(utime.ticks_ms(), stage)
 			self._perf_add_post(4, elapsed)
 			post_total += elapsed
 			stage = utime.ticks_ms()
-			self._process_auto_sleep()
+			if not touch_fast_path:
+				self._process_auto_sleep()
 			elapsed = utime.ticks_diff(utime.ticks_ms(), stage)
 			self._perf_add_post(5, elapsed)
 			post_total += elapsed
 			self._perf_add(8, post_total)
 			stage = utime.ticks_ms()
-			map_io_active = self._location_map_io_active()
-			high_freq = self._touch_high_frequency_active()
+			high_freq = touch_fast_path
+			# Map I/O status is diagnostic only.  Probing it every high-frequency
+			# touch cycle would reacquire the POC worker lock and can itself delay
+			# the next CST816D sample.  Sample periodically during touch and every
+			# normal cycle otherwise.
+			if high_freq:
+				self._perf_map_probe_counter += 1
+				if self._perf_map_probe_counter >= 16:
+					self._perf_map_probe_counter = 0
+					map_io_active = self._location_map_io_active()
+				else:
+					map_io_active = False
+			else:
+				self._perf_map_probe_counter = 0
+				map_io_active = self._location_map_io_active()
 			y = self._perf_yield
 			if high_freq:
+				# The touch fast path is deliberately non-blocking: do not call
+				# sleep_ms(1), even periodically.  P0/P1 producers wake the TCP
+				# worker directly; yielding the LCD thread here would reintroduce
+				# the long scheduler tails seen in the performance logs.
 				yield_ms = 0
-				'''
 				y[6] += 1
-				self._touch_high_freq_yield_cycles += 1
-				if (self._touch_high_freq_yield_cycles >=
-						TOUCH_HIGH_FREQ_FORCE_YIELD_CYCLES):
-					self._touch_high_freq_yield_cycles = 0
-					y[7] += 1
-					yield_ms = LCD_LOOP_YIELD_MS
-				else:
-					yield_ms = 0
-				'''
+				self._touch_high_freq_yield_cycles = 0
 			else:
 				self._touch_high_freq_yield_cycles = 0
 				yield_ms = LCD_LOOP_YIELD_MS
@@ -5286,3 +6393,4 @@ class JingWuUI:
 			y[4] = max(y[4], elapsed if map_io_active else 0)
 			y[5] = map_io_active
 			self._report_perf(utime.ticks_ms())
+			last_cycle_end_ms = utime.ticks_ms()

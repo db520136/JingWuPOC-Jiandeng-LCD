@@ -45,9 +45,23 @@ GNSS_INIT_RETRY_INTERVAL_MS = 10000
 # Keep map I/O preemptible on the embedded scheduler.  The delay is applied
 # between response chunks, never while holding the business lock.
 LOCATION_MAP_IO_YIELD_MS = 1
-LOCATION_MAP_PAUSE_POLL_MS = 100
+# A paused low-priority HTTP worker must not wake every 100ms while the LCD
+# owns the interpreter.  One-second checkpoints are sufficient; release of
+# the UI gate is detected on the next checkpoint and no protocol deadline is
+# tied to this worker.
+LOCATION_MAP_PAUSE_POLL_MS = 1000
 # Touch/scroll may defer proactive work, but never indefinitely.
-UI_INTERACTION_DEFER_MAX_MS = 5000
+UI_INTERACTION_DEFER_MAX_MS = 30000
+TCP_RECEIVE_WAIT_TIMEOUT_S = 0.05
+# 接收线程使用None永久阻塞；该超时仅作为旧固件/线程启动失败时的兼容回退。
+# 仅用于兼容旧固件的接收超时；正常TCP接收线程使用None永久阻塞。
+# TCP接收线程永久阻塞；控制/发送线程由事件唤醒。
+TCP_TX_LOW_WAKE_INTERVAL_MS = 1000
+# Protocol diagnostics are useful during bring-up, but formatting and UART
+# output can hold the MicroPython interpreter for tens of milliseconds.  Keep
+# the normal control-frame logs available outside interaction and suppress
+# them while the LCD fast path is active; P0/P1 state is still processed.
+TCP_VERBOSE_LOG = True
 
 try:
     import _thread
@@ -193,7 +207,8 @@ class POCClient:
                  audio_controller=None, gnss_service=None,
                  gnss_upload_interval_ms=60000, tcp_max_retries=3,
                  tcp_retry_initial_timeout_ms=1000,
-                 tcp_retry_timeout_step_ms=500):
+                 tcp_retry_timeout_step_ms=500,
+                 enable_tx_worker=True):
         self.device_id = str(device_id)
         self.tcp_host = str(tcp_host)
         print("tcp host=",self.tcp_host)
@@ -210,6 +225,10 @@ class POCClient:
             100, int(tcp_retry_initial_timeout_ms))
         self.tcp_retry_timeout_step_ms = max(
             0, int(tcp_retry_timeout_step_ms))
+        # A/B switch for the TCP control/send worker.  The worker owns
+        # connection setup, outbound packets, retries and low-priority timers;
+        # disabling it is intended only for short performance experiments.
+        self.enable_tx_worker = bool(enable_tx_worker)
         self.audio_controller = None
         self.tcp_connected = False
         self.login_state = "idle"
@@ -229,6 +248,10 @@ class POCClient:
         self.last_error = None
         self._revision = 0
         self._reported_revision = -1
+        # LCD触摸快速路径只关心抢麦/远端占用状态，使用独立游标避免
+        # 每个循环复制完整登录、名单、定位和地图快照。
+        self._reported_floor_revision = -1
+        self._reported_floor_event_revision = -1
         self._running = False
         self._socket = None
         self._parser = FrameParser()
@@ -318,6 +341,46 @@ class POCClient:
         self._location_map_ui_busy = False
         self._ui_interaction_active = False
         self._ui_interaction_started_ms = None
+        self._worker_wake = False
+        self._worker_wake_lock = None
+        self._worker_waiting = False
+        self._worker_event = None
+        self._rx_worker_running = False
+        self._rx_error = None
+        self._rx_dedicated = False
+        self._tx_queue = []
+        self._tx_queue_limit = 32
+        self._rx_queue = []
+        self._rx_queue_limit = 32
+        self._rx_worker_running = False
+        self._rx_dispatching = False
+        self._tx_low_due = False
+        self._tx_last_low_wake_ms = None
+        self._send_lock = None
+        if _thread is not None:
+            try:
+                self._worker_wake_lock = _thread.allocate_lock()
+            except Exception:
+                self._worker_wake_lock = None
+            try:
+                self._worker_event = _thread.allocate_semphore(1)
+                try:
+                    self._worker_event.acquire()
+                except Exception:
+                    pass
+            except Exception:
+                try:
+                    self._worker_event = _thread.allocate_lock()
+                    self._worker_event.acquire()
+                except Exception:
+                    self._worker_event = None
+            try:
+                self._send_lock = _thread.allocate_lock()
+            except Exception:
+                self._send_lock = None
+        self._perf_worker = [0, 0, 0, 0, 0, 0]
+        self._perf_recv = [0, 0, 0, 0, 0, 0]
+        self._perf_send = [0, 0, 0, 0, 0, 0]
         self._location_map_cleanup_pending = []
         self._location_last_coordinates = None
         self.join_state = "idle"
@@ -446,8 +509,13 @@ class POCClient:
         """由LCD主线程确认麦权弹框首帧已提交，再放行音频业务。"""
         self._audio_notify("on_floor_ui_ready", event_revision)
 
-    def start(self):
+    def start(self, enable_tx_worker=None):
         if self._running:
+            return True
+        if enable_tx_worker is not None:
+            self.enable_tx_worker = bool(enable_tx_worker)
+        if not self.enable_tx_worker:
+            print("[POC] TCP发送/控制线程已按A/B开关关闭")
             return True
         if _thread is None:
             self.last_error = RuntimeError("QuecPython缺少_thread")
@@ -461,6 +529,7 @@ class POCClient:
             self.last_error = error
             print("[POC] 后台线程启动失败：{}".format(error))
             return False
+
 
     def submit_login(self, police_no):
         """用户确认登录后提交编号，TCP未就绪时等待连接。"""
@@ -494,6 +563,8 @@ class POCClient:
         finally:
             self._lock_release()
         print("[POC] 已提交登录：{}".format(value))
+        # 登录属于P1关键事务，立即提示worker，不等待下一轮20ms节拍。
+        self.wake_worker()
         return True
 
     def confirm_force_login(self):
@@ -507,6 +578,7 @@ class POCClient:
         self.login_state = "logging_in"
         self.login_error = None
         self._changed()
+        self.wake_worker()
         return True
 
     def request_logout(self):
@@ -522,8 +594,10 @@ class POCClient:
         self.logout_state = "cleaning"
         self._logout_changed()
         self._prepare_single_for_logout()
-        self._continue_logout_cleanup()
+        # 仅修改状态；清理步骤和0x0F发送统一由TCP控制worker执行，避免
+        # LCD/UI线程直接写socket，也避免清理过程中与接收线程并发发送。
         print("[POC] 已启动主动退出登录清理流程")
+        self.wake_worker()
         return True
 
     def _send_force_login(self):
@@ -607,8 +681,255 @@ class POCClient:
         self._ui_interaction_active = active
         self._ui_interaction_started_ms = (
             utime.ticks_ms() if active else None)
+        # Let the network monitor defer only its low-priority signal polling.
+        # The monitor does not hold this lock and does not abort an operation
+        # already in progress, so urgent TCP/RTP traffic remains unaffected.
+        monitor = self.network_monitor
+        setter = getattr(monitor, "set_ui_interaction_active", None)
+        if setter is not None:
+            try:
+                setter(active)
+            except Exception:
+                pass
         if not active:
             self._wake_location_cleanup_worker()
+            self.wake_worker()
+
+    def wake_worker(self):
+        """Wake the current worker for a P0/P1 event without losing a signal.
+
+        This is intentionally only a notification primitive.  The control
+        worker owns all TCP sends and protocol state; the dedicated receive
+        worker uses the same notification path for decoded P0/P1 frames.
+        """
+        should_signal = True
+        if self._worker_wake_lock is None:
+            should_signal = not self._worker_wake
+            self._worker_wake = True
+        else:
+            self._worker_wake_lock.acquire()
+            try:
+                should_signal = not self._worker_wake
+                self._worker_wake = True
+            finally:
+                self._worker_wake_lock.release()
+        if should_signal and self._worker_event is not None:
+            try:
+                self._worker_event.release()
+            except Exception:
+                pass
+
+    def notify_low_priority_scheduler(self, touch_active=False):
+        """Let the control worker run P2 timers only outside touch fast path.
+
+        The worker blocks when no P0/P1 transaction is pending.  A bounded
+        one-second nudge keeps heartbeat/GNSS/retry timers alive without
+        scheduling the worker on every LCD touch cycle.
+        """
+        now_ms = utime.ticks_ms()
+        if touch_active and self._ui_interaction_defer_active(now_ms):
+            return
+        if (self._tx_last_low_wake_ms is not None and
+                utime.ticks_diff(now_ms, self._tx_last_low_wake_ms) <
+                TCP_TX_LOW_WAKE_INTERVAL_MS):
+            return
+        self._tx_last_low_wake_ms = now_ms
+        self._tx_low_due = True
+        self.wake_worker()
+
+    def queue_priority_response(self, packet):
+        """Queue a P0/P1 response and wake the TCP worker immediately.
+
+        This API is used by the receive path for server control acknowledgements
+        and by key/PTT paths.  It is bounded so a malformed peer cannot grow
+        memory without limit.
+        """
+        if not packet:
+            return
+        self._lock_acquire()
+        try:
+            if len(self._tx_queue) >= self._tx_queue_limit:
+                self._tx_queue.pop(0)
+            self._tx_queue.append(bytes(packet))
+        finally:
+            self._lock_release()
+        self.wake_worker()
+
+    def _drain_priority_responses(self):
+        self._lock_acquire()
+        try:
+            pending = list(self._tx_queue)
+            self._tx_queue = []
+        finally:
+            self._lock_release()
+        for packet in pending:
+            self._send_all(packet)
+
+    def _enqueue_received_frames(self, frames):
+        """Queue decoded frames for the control worker.
+
+        The receive thread must not mutate protocol state or call business
+        callbacks.  Keeping frame dispatch in the control worker preserves the
+        existing state-machine ownership and avoids races with LCD snapshots.
+        """
+        if not frames:
+            return
+        immediate = False
+        self._lock_acquire()
+        try:
+            for frame in frames:
+                msg_type = frame.get("msg_type")
+                is_low = msg_type in (MSG_HEARTBEAT_ACK,
+                                      MSG_GNSS_UPLOAD_ACK)
+                if len(self._rx_queue) >= self._rx_queue_limit:
+                    # 优先丢弃已经过期的P2应答；P0/P1控制帧不能因对端
+                    # 突发数据而被普通心跳/GNSS帧挤掉。
+                    drop_index = None
+                    for index, queued in enumerate(self._rx_queue):
+                        queued_type = queued.get("msg_type")
+                        if queued_type in (MSG_HEARTBEAT_ACK,
+                                           MSG_GNSS_UPLOAD_ACK):
+                            drop_index = index
+                            break
+                    if drop_index is None and is_low:
+                        # 队列全是P0/P1时直接丢弃新到的P2，不能反过来
+                        # 淘汰尚未处理的高优先级控制帧。
+                        continue
+                    if drop_index is None:
+                        # 极端的P0/P1突发只能淘汰最旧一帧，正常队列深度
+                        # 足够大且不会影响常规控制时序。
+                        drop_index = 0
+                    self._rx_queue.pop(drop_index)
+                self._rx_queue.append(frame)
+                # 登录/组呼/单呼/麦权及服务器主动控制帧必须立即交给
+                # 控制worker；心跳和GNSS应答属于P2，在触摸快速路径期间
+                # 只入队，避免一次普通应答再次打断LCD循环。
+                if not is_low:
+                    immediate = True
+        finally:
+            self._lock_release()
+        if immediate or not self._ui_interaction_defer_active():
+            self.wake_worker()
+
+    def _drain_received_frames(self):
+        self._lock_acquire()
+        try:
+            frames = list(self._rx_queue)
+            self._rx_queue = []
+        finally:
+            self._lock_release()
+        deferred = []
+        defer_low = self._ui_interaction_defer_active()
+        for frame in frames:
+            msg_type = frame.get("msg_type")
+            if (defer_low and msg_type in (MSG_HEARTBEAT_ACK,
+                                           MSG_GNSS_UPLOAD_ACK)):
+                # 触摸快速路径期间，P2应答保留在队列中；即使控制worker
+                # 因P0/P1事务被唤醒，也不在此时执行低优先级状态更新。
+                deferred.append(frame)
+                continue
+            self._mark_tcp_activity()
+            self._handle_frame(frame)
+        if deferred:
+            self._lock_acquire()
+            try:
+                # 新到达帧已经追加在队列尾部，旧的P2帧放回队首，保持
+                # 同一连接上的应答处理顺序；队列仍受上限保护。
+                pending = deferred + self._rx_queue
+                if len(pending) > self._rx_queue_limit:
+                    pending = pending[-self._rx_queue_limit:]
+                self._rx_queue = pending
+            finally:
+                self._lock_release()
+
+    def _consume_worker_wake(self):
+        if self._worker_wake_lock is None:
+            value = bool(self._worker_wake)
+            self._worker_wake = False
+            return value
+        self._worker_wake_lock.acquire()
+        try:
+            value = bool(self._worker_wake)
+            self._worker_wake = False
+            return value
+        finally:
+            self._worker_wake_lock.release()
+
+    def _wait_worker_event(self):
+        """Block the control worker until a P0/P1 event arrives.
+
+        The event is only used when there is no outstanding high-priority
+        transaction.  Retry timers keep the worker on a short scheduler while
+        a request is in flight, so timeout/retry semantics remain unchanged.
+        """
+        if self._worker_event is None:
+            utime.sleep_ms(20)
+            return
+        # Close the check/signalling race: consume a pending flag immediately
+        # before blocking, then re-check it after acquiring the semaphore.
+        if self._consume_worker_wake():
+            return
+        try:
+            self._worker_waiting = True
+            if self._consume_worker_wake():
+                return
+            self._worker_event.acquire()
+        except Exception:
+            utime.sleep_ms(20)
+        finally:
+            self._worker_waiting = False
+        self._consume_worker_wake()
+
+    def _high_priority_pending(self):
+        """Return whether P0/P1 work must keep the control worker scheduled."""
+        rx_priority = False
+        try:
+            # The dedicated receive thread only queues decoded frames; inspect
+            # the queue here so a P0/P1 frame can wake the control worker even
+            # while the LCD touch gate is active.  Heartbeat/GNSS ACKs remain
+            # P2 and intentionally do not keep this worker scheduled.
+            for frame in self._rx_queue:
+                if frame.get("msg_type") not in (MSG_HEARTBEAT_ACK,
+                                                  MSG_GNSS_UPLOAD_ACK):
+                    rx_priority = True
+                    break
+        except Exception:
+            rx_priority = False
+        return bool(
+            self._pending_login or self._force_login_pending or
+            self._login_sent_ms is not None or
+            self._force_login_sent_ms is not None or
+            self._logout_request_cnt is not None or
+            self._logout_sent_ms is not None or
+            self._leave_group_pending or
+            self._leave_group_request_cnt is not None or
+            self._leave_group_sent_ms is not None or
+            self._join_sent_ms is not None or
+            self._pending_join_id is not None or
+            self._single_sent_ms is not None or
+            self._single_action is not None or
+            self._floor_request_action is not None or
+            self._floor_sent_ms is not None or
+            self._server_logout_pending or
+            self.logout_state == "cleaning" or
+            bool(self._tx_queue) or rx_priority or
+            # ``wake_worker`` is set by P0/P1 producers before releasing the
+            # semaphore.  Expose it to the LCD loop so the next cycle yields
+            # even when the event arrived just after the queue snapshot.
+            bool(self._worker_wake))
+
+    def has_high_priority_pending(self):
+        """Public, lock-free hint for the LCD fast path.
+
+        The LCD thread uses this only to decide whether a cooperative yield
+        is justified.  All authoritative state changes remain owned by the
+        TCP control worker; a false/true race is harmless because the worker
+        also wakes itself when a P0/P1 item is queued.
+        """
+        try:
+            return self._high_priority_pending()
+        except Exception:
+            return False
 
     def _ui_interaction_defer_active(self, now_ms=None):
         if not self._ui_interaction_active:
@@ -1726,8 +2047,13 @@ class POCClient:
                 finally:
                     self._lock_release()
 
-                while self._running and self._audio_priority_active():
-                    utime.sleep_ms(100)
+                # HTTP/name-list parsing is P2 work.  Keep the worker asleep
+                # for the complete LCD interaction instead of repeatedly
+                # waking it while a settings list is being dragged.
+                while (self._running and
+                       (self._audio_priority_active() or
+                        self._ui_interaction_defer_active())):
+                    utime.sleep_ms(1000)
                 if not self._running:
                     break
                 self._fetch_http_info(auto_join_first, reason)
@@ -1889,7 +2215,9 @@ class POCClient:
                     request_cnt, entry.get("msg_type", 0), msg_type))
                 return False
             if entry.get("state") == "done" and entry.get("ack_packet"):
-                self._send_all(entry["ack_packet"])
+                # 即使是重复服务器请求，也不能从接收/协议回调上下文
+                # 直接写socket；统一排队给TCP控制worker串行发送。
+                self.queue_priority_response(entry["ack_packet"])
                 print("[POC] 重复服务器请求，重发缓存应答：cnt={}, type=0x{:02X}".format(
                     request_cnt, msg_type))
             else:
@@ -1942,20 +2270,24 @@ class POCClient:
         sock.connect((self.tcp_host, self.tcp_port))
         #print("tcp connect over")
         try:
-            # 非阻塞接收配合20ms主循环，使1秒起步的重发计时保持准确。
-            sock.setblocking(False)
+            # 接收在线程中永久阻塞；发送/控制仍由主worker负责。
+            # 如果旧固件不接受None，则回退到已有短超时行为。
+            sock.settimeout(None)
         except Exception:
-            #print("tcp connect err")
             try:
-                sock.settimeout(0)
+                print("[POC] TCP连接服务器成功，但无法设置永久阻塞模式，尝试短超时模式")
+                sock.settimeout(TCP_RECEIVE_WAIT_TIMEOUT_S)
             except Exception:
-                # 极少数旧固件只接受整秒超时，保留1秒作为最后兼容方案。
-                try:
-                    sock.settimeout(1)
-                except Exception:
-                    pass
+                pass
         self._socket = sock
         self._parser = FrameParser()
+        self._rx_error = None
+        self._lock_acquire()
+        try:
+            self._rx_queue = []
+            self._tx_queue = []
+        finally:
+            self._lock_release()
         self._reset_request_tracking()
         self._lock_acquire()
         try:
@@ -1966,7 +2298,74 @@ class POCClient:
             self._changed()
         finally:
             self._lock_release()
+        self._rx_dedicated = self._start_rx_worker()
         print("[POC] TCP连接服务器成功：{}:{}".format(self.tcp_host, self.tcp_port))
+
+    def _start_rx_worker(self):
+        """Start the dedicated blocking TCP receive thread for this socket."""
+        if (_thread is None or self._socket is None or
+                self._rx_worker_running):
+            return False
+        self._rx_worker_running = True
+        try:
+            _thread.start_new_thread(self._rx_worker, (self._socket,))
+            return True
+        except Exception as error:
+            self._rx_worker_running = False
+            self._rx_error = error
+            try:
+                print("[POC] TCP接收线程启动失败，尝试短超时模式：{}".format(error))
+                self._socket.settimeout(TCP_RECEIVE_WAIT_TIMEOUT_S)
+            except Exception:
+                pass
+            print("[POC] TCP接收线程启动失败：{}".format(error))
+            return False
+
+    def _rx_worker(self, sock):
+        """Receive and parse TCP frames without occupying the control worker."""
+        try:
+            while self._running and self._socket is sock:
+                started_ms = utime.ticks_ms()
+                try:
+                    data = sock.recv(1024)
+                except Exception as error:
+                    # None/永久阻塞模式下只会在断链、socket关闭或固件异常时
+                    # 进入这里；兼容旧固件的短超时则继续轮询。
+                    name = str(error).lower()
+                    code = None
+                    try:
+                        code = int(error.args[0])
+                    except Exception:
+                        pass
+                    if (code in (11, 110, 116) or "timed out" in name or
+                            "timeout" in name or "eagain" in name):
+                        self._perf_add(
+                            self._perf_recv,
+                            utime.ticks_diff(utime.ticks_ms(), started_ms))
+                        continue
+                    # 旧socket在重连过程中被关闭时，recv异常不应污染新链路。
+                    if self._socket is sock:
+                        self._rx_error = error
+                        self.wake_worker()
+                    break
+                if not data:
+                    if self._socket is sock:
+                        self._rx_error = OSError("TCP服务器主动断开")
+                        self.wake_worker()
+                    break
+                # 收到任何字节都代表链路仍然活跃。即使完整帧属于触摸
+                # 期间延后的P2应答，也不能因此错误触发心跳重试。
+                self._mark_tcp_activity()
+                self._enqueue_received_frames(self._parser.feed(data))
+                self._perf_add(
+                    self._perf_recv,
+                    utime.ticks_diff(utime.ticks_ms(), started_ms))
+        except Exception as error:
+            if self._socket is sock:
+                self._rx_error = error
+                self.wake_worker()
+        finally:
+            self._rx_worker_running = False
 
     def _close_socket(self):
         forced_logout_interrupted = (
@@ -1978,13 +2377,22 @@ class POCClient:
             self.logout_state in ("cleaning", "waiting"))
         sock = self._socket
         self._socket = None
+        self._rx_dedicated = False
         if sock is not None:
+            try:
+                # 先打断接收线程中的永久阻塞recv；部分QuecPython固件
+                # 仅close不会立即唤醒另一线程，shutdown失败则继续close。
+                sock.shutdown(2)
+            except Exception:
+                pass
             try:
                 sock.close()
             except Exception:
                 pass
         self._lock_acquire()
         try:
+            self._rx_queue = []
+            self._tx_queue = []
             # TCP控制链路断开后麦权已经不可确认，立即停止所有RTP收发。
             self._audio_notify("on_floor_released", None)
             self.held_floor_group_id = None
@@ -2118,33 +2526,65 @@ class POCClient:
         except Exception:
             return str(data)
 
+    @staticmethod
+    def _perf_add(item, elapsed):
+        item[0] += 1
+        item[1] += elapsed
+        item[2] = max(item[2], elapsed)
+        if elapsed >= 30: item[3] += 1
+        if elapsed >= 50: item[4] += 1
+        if elapsed >= 100: item[5] += 1
+
+    def get_thread_perf_snapshot(self):
+        result = {}
+        for name, item in (("worker", self._perf_worker),
+                           ("recv", self._perf_recv),
+                           ("send", self._perf_send)):
+            result[name] = tuple(item)
+            for i in range(6): item[i] = 0
+        return result
+
     def _send_all(self, data):
+        if self._send_lock is not None:
+            self._send_lock.acquire()
+        started_ms = utime.ticks_ms()
         try:
-            msg_type = data[4]
-            payload = data[9:-2] if len(data) >= 11 else b""
-            print("[TCP发送] 信令=0x{:02X} {}，消息体={}".format(
-                msg_type, TCP_SIGNAL_NAMES.get(msg_type, "未知信令"),
-                self._hex(payload)))
-        except Exception:
-            pass
-        """兼容没有sendall()的QuecPython socket，确保完整发送一帧。"""
-        sender = getattr(self._socket, "sendall", None)
-        if sender is not None:
-            sender(data)
-            self._mark_tcp_activity()
-            return
-        sent = 0
-        while sent < len(data):
-            count = self._socket.send(data[sent:])
-            if count is None:
-                # 部分QuecPython固件以None表示本次数据已由底层接收。
+            if TCP_VERBOSE_LOG and not self._ui_interaction_defer_active():
+                try:
+                    msg_type = data[4]
+                    payload = data[9:-2] if len(data) >= 11 else b""
+                    print("[TCP发送] 信令=0x{:02X} {}，消息体={}".format(
+                        msg_type, TCP_SIGNAL_NAMES.get(msg_type, "未知信令"),
+                        self._hex(payload)))
+                except Exception:
+                    pass
+            """兼容没有sendall()的QuecPython socket，确保完整发送一帧。"""
+            sender = getattr(self._socket, "sendall", None)
+            if sender is not None:
+                sender(data)
                 self._mark_tcp_activity()
+                self._perf_add(self._perf_send,
+                               utime.ticks_diff(utime.ticks_ms(), started_ms))
                 return
-            count = int(count)
-            if count <= 0:
-                raise OSError("TCP发送返回0字节")
-            sent += count
-        self._mark_tcp_activity()
+            sent = 0
+            while sent < len(data):
+                count = self._socket.send(data[sent:])
+                if count is None:
+                    # 部分QuecPython固件以None表示本次数据已由底层接收。
+                    self._mark_tcp_activity()
+                    self._perf_add(self._perf_send,
+                                   utime.ticks_diff(utime.ticks_ms(), started_ms))
+                    return
+                count = int(count)
+                if count <= 0:
+                    raise OSError("TCP发送返回0字节")
+                sent += count
+            self._mark_tcp_activity()
+            self._perf_add(self._perf_send,
+                           utime.ticks_diff(utime.ticks_ms(), started_ms))
+        finally:
+            if self._send_lock is not None:
+                self._send_lock.release()
 
     def _elapsed_ms(self, started_ms, now_ms=None):
         if started_ms is None:
@@ -2271,6 +2711,8 @@ class POCClient:
         finally:
             self._lock_release()
         print("[POC] 请求进入组：{} (UINT32={})".format(raw_group_id, numeric))
+        # 入组是P1关键事务，即使LCD处于触摸快速路径也应立即处理。
+        self.wake_worker()
         return True
 
     def request_leave_group(self):
@@ -2280,6 +2722,7 @@ class POCClient:
         self.join_state = "waiting"
         self.join_error = None
         self._join_changed()
+        self.wake_worker()
         return True
 
     def request_select_single(self, person_key, target_device_id,
@@ -2345,6 +2788,8 @@ class POCClient:
             self._single_changed()
         finally:
             self._lock_release()
+        # 单呼邀请/解散属于P1关键事务，不能因触摸而延后。
+        self.wake_worker()
         return True
 
     def set_preferred_call_type(self, call_type):
@@ -2407,6 +2852,9 @@ class POCClient:
             self._floor_changed()
         finally:
             self._lock_release()
+        # 抢麦属于P0事务；无论入口来自物理按键还是其他业务调用，
+        # 都必须立即唤醒TCP控制worker。
+        self.wake_worker()
         return True
 
     def request_ptt_floor(self):
@@ -2424,6 +2872,8 @@ class POCClient:
         self._ptt_pressed = True
         self.preferred_call_type = call_type
         result = self.request_floor(call_type)
+        # PTT按键事件优先级高于触摸，立即唤醒TCP worker。
+        self.wake_worker()
         if not result:
             self._ptt_pressed = False
         return result
@@ -2444,12 +2894,15 @@ class POCClient:
                 self._floor_request_action = None
                 self.floor_state = "idle"
                 self._floor_changed()
+                self.wake_worker()
                 return True
             self._release_after_floor_grant = (
                 self._floor_request_action == "request")
             return False
         self._release_after_floor_grant = False
-        return self.release_floor()
+        result = self.release_floor()
+        self.wake_worker()
+        return result
 
     def release_floor(self):
         """公开释放麦权接口；释放包始终携带实际持有的组ID。"""
@@ -2466,6 +2919,8 @@ class POCClient:
             self._floor_changed()
         finally:
             self._lock_release()
+        # 释放麦权同样是P0事务，不能等LCD触摸结束或低优先级节拍。
+        self.wake_worker()
         return True
 
     def _group_audio_is_active(self):
@@ -2715,8 +3170,13 @@ class POCClient:
         if self._server_logout_pending:
             request_cnt = self._server_logout_request_cnt
             if request_cnt is not None:
-                self._send_server_ack(MSG_LOGOUT_ACK, request_cnt,
-                                      build_logout_ack_payload(0))
+                # 此函数只由TCP控制worker调用；强制退出完成后必须在关闭
+                # socket前把0x8F应答实际发出，不能仅入队后被_close_socket清掉。
+                packet = build_frame(
+                    MSG_LOGOUT_ACK, (int(request_cnt) + 1) & 0xFFFF,
+                    build_logout_ack_payload(0))
+                self._cache_server_response(request_cnt, packet)
+                self._send_all(packet)
             self._server_logout_pending = False
             self._server_logout_request_cnt = None
             self._login_session_active = False
@@ -2816,13 +3276,15 @@ class POCClient:
                              payload)
         # Mark done before sending so a retry can reuse the exact same frame.
         self._cache_server_response(request_cnt, packet)
-        self._send_all(packet)
-        print("[POC] 已发送应答0x{:02X}：{}".format(
+        # 接收线程不能直接写socket；交给控制worker串行发送。
+        self.queue_priority_response(packet)
+        print("[POC] 已排队应答0x{:02X}：{}".format(
             msg_type, self._hex(packet)))
 
     def _recv_once(self):
         if self._socket is None:
             return
+        started_ms = utime.ticks_ms()
         try:
             data = self._socket.recv(1024)
         except Exception as error:
@@ -2835,6 +3297,8 @@ class POCClient:
             # 不同QuecPython固件可能以EAGAIN、ETIMEDOUT或116表示轮询超时。
             if (code in (11, 110, 116) or "timed out" in name or
                     "timeout" in name or "eagain" in name):
+                self._perf_add(self._perf_recv,
+                               utime.ticks_diff(utime.ticks_ms(), started_ms))
                 return
             raise
         if not data:
@@ -2843,6 +3307,8 @@ class POCClient:
         self._mark_tcp_activity()
         for frame in self._parser.feed(data):
             self._handle_frame(frame)
+        self._perf_add(self._perf_recv,
+                       utime.ticks_diff(utime.ticks_ms(), started_ms))
 
     def _finish_single_failure(self, message):
         """结束当前单呼控制请求；真实临时组状态不因失败而伪造变化。"""
@@ -3530,17 +3996,24 @@ class POCClient:
         return True
 
     def _handle_frame(self, frame):
-        try:
-            print("[TCP接收] 信令=0x{:02X} {}，消息体={}".format(
-                frame["msg_type"],
-                TCP_SIGNAL_NAMES.get(frame["msg_type"], "未知信令"),
-                self._hex(frame["payload"])))
-        except Exception:
-            pass
-        print("[POC] 收到TCP完整帧：{}".format(self._hex(frame["raw"])))
-        print("[POC] 字段解析：type=0x{:02X}, length={}, request_cnt={}, payload={}".format(
-            frame["msg_type"], frame["packet_length"],
-            frame["request_cnt"], self._hex(frame["payload"])))
+        # Do not let diagnostic UART output preempt a touch sample.  The
+        # decoded frame still reaches the exact same handlers below.
+        if TCP_VERBOSE_LOG and not self._ui_interaction_defer_active():
+            try:
+                print("[TCP接收] 信令=0x{:02X} {}，消息体={}".format(
+                    frame["msg_type"],
+                    TCP_SIGNAL_NAMES.get(frame["msg_type"], "未知信令"),
+                    self._hex(frame["payload"])))
+            except Exception:
+                pass
+            try:
+                print("[POC] 收到TCP完整帧：{}".format(
+                    self._hex(frame["raw"])))
+                print("[POC] 字段解析：type=0x{:02X}, length={}, request_cnt={}, payload={}".format(
+                    frame["msg_type"], frame["packet_length"],
+                    frame["request_cnt"], self._hex(frame["payload"])))
+            except Exception:
+                pass
         if self._handle_control_frame(frame):
             return
         if frame["msg_type"] == MSG_GNSS_UPLOAD_ACK:
@@ -3928,7 +4401,42 @@ class POCClient:
         retry_ms = 1000
         try:
             while self._running:
-                self._process_prelogin_http_refresh()
+                worker_started_ms = utime.ticks_ms()
+                # 接收线程若因永久阻塞返回错误，由控制线程负责统一断链/重连。
+                if self._rx_error is not None:
+                    error = self._rx_error
+                    self._rx_error = None
+                    raise error
+                # A touch fast path must not be defeated by the control worker
+                # repeatedly walking its idle/reconnect state machine.  When
+                # there is no P0/P1 transaction, park this worker for a long
+                # slice; set_ui_interaction_active(False) wakes it immediately
+                # after the finger is released.  The bounded defer window is
+                # still respected by the one-second checkpoint below.
+                if (self._ui_interaction_defer_active() and
+                        not self._high_priority_pending()):
+                    if self._worker_event is not None:
+                        # Semaphore wait is interruptible by P0/P1 queue
+                        # notifications and therefore does not delay urgent
+                        # TCP traffic during a long touch.
+                        self._wait_worker_event()
+                    else:
+                        # Very old firmware fallback: keep the polling slice
+                        # short when no semaphore primitive is available.
+                        utime.sleep_ms(20)
+                    self._perf_add(self._perf_worker,
+                                   utime.ticks_diff(utime.ticks_ms(),
+                                                    worker_started_ms))
+                    continue
+                self._drain_received_frames()
+                # 优先处理接收线程投递的服务器控制应答，触摸状态不参与
+                # 这一判断，确保P0/P1应答及时发送。
+                self._drain_priority_responses()
+                # Pre-login HTTP/name refresh is proactive work.  Do not let
+                # its request setup compete with the LCD fast path; the
+                # revision remains pending and will be handled after release.
+                if not self._ui_interaction_defer_active():
+                    self._process_prelogin_http_refresh()
                 # Deferred map-bank cleanup belongs to the POC worker, so a
                 # transition out of audio/UI priority also releases stale
                 # Flash files even when the HTTP worker already exited.
@@ -3938,7 +4446,8 @@ class POCClient:
                         utime.sleep_ms(500)
                         continue
                     # 数据网络就绪后尽早启动GNSS搜星，不等待登录流程完成。
-                    self._ensure_gnss_initialized()
+                    if not self._ui_interaction_defer_active():
+                        self._ensure_gnss_initialized()
                     try:
                         self._connect()
                         retry_ms = 1000
@@ -3946,10 +4455,22 @@ class POCClient:
                         self.last_error = error
                         print("[POC] TCP连接服务器失败：{}".format(error))
                         self._close_socket()
-                        utime.sleep_ms(retry_ms)
+                        # P0/P1事件到达时不要被长重连退避拖住；当前固件
+                        # 没有可中断sleep，按20ms片段等待并检查唤醒标志。
+                        remaining = retry_ms
+                        while remaining > 0 and self._running:
+                            if self._consume_worker_wake():
+                                break
+                            delay = 20 if remaining > 20 else remaining
+                            utime.sleep_ms(delay)
+                            remaining -= delay
                         retry_ms = min(10000, retry_ms * 2)
                         continue
                 try:
+                    # 退出流程的清理步骤（解散单呼、退出组呼、发送0x0F）
+                    # 由控制worker推进；UI入口只发布状态并唤醒worker。
+                    if self.logout_state == "cleaning":
+                        self._continue_logout_cleanup()
                     self._send_login()
                     self._send_force_login()
                     self._send_join_group()
@@ -3957,18 +4478,38 @@ class POCClient:
                     # 服务器主动退出时，单呼清理完成后发送统一0x10退出组呼请求。
                     self._send_leave_group()
                     self._send_floor_control()
-                    self._recv_once()
+                    # TCP数据由独立的永久阻塞接收线程解析。若线程无法
+                    # 启动，则回退到旧的短超时接收，保证旧固件仍可工作。
+                    if not self._rx_dedicated:
+                        self._recv_once()
                     self._send_gnss_if_due()
                     self._send_heartbeat_if_due()
                     self._process_tcp_request_timeouts()
+                    # A touch session suppresses proactive work even when the
+                    # socket receive wait expires; only completion of the
+                    # interaction permits these tasks to run again.
                 except Exception as error:
                     self.last_error = error
                     print("[POC] TCP连接异常，将重连：{}".format(error))
                     self._close_socket()
-                    utime.sleep_ms(retry_ms)
+                    remaining = retry_ms
+                    while remaining > 0 and self._running:
+                        if self._consume_worker_wake():
+                            break
+                        delay = 20 if remaining > 20 else remaining
+                        utime.sleep_ms(delay)
+                        remaining -= delay
                     retry_ms = min(10000, retry_ms * 2)
                 else:
-                    utime.sleep_ms(20)
+                    # 没有P0/P1事务时等待事件；有在途请求时保持短周期，
+                    # 以便精确执行应答超时重试。
+                    if self._high_priority_pending():
+                        if not self._consume_worker_wake():
+                            utime.sleep_ms(20)
+                    else:
+                        self._wait_worker_event()
+                self._perf_add(self._perf_worker,
+                               utime.ticks_diff(utime.ticks_ms(), worker_started_ms))
         finally:
             self._close_socket()
             self._running = False
@@ -4098,8 +4639,52 @@ class POCClient:
         finally:
             self._lock_release()
 
+    def get_floor_snapshot_if_changed(self):
+        """返回触摸期间所需的最小抢麦快照。
+
+        动态触摸时LCD只需要及时处理远端占用、抢麦成功/失败和释放事件。
+        完整快照（名单、定位、地图等）会在触摸结束后的普通路径读取，
+        从而避免主循环频繁获取锁并复制大量容器。
+        """
+        revision = self._floor_revision
+        event_revision = self._floor_event_revision
+        if (revision == self._reported_floor_revision and
+                event_revision == self._reported_floor_event_revision):
+            return None
+        self._lock_acquire()
+        try:
+            revision = self._floor_revision
+            event_revision = self._floor_event_revision
+            if (revision == self._reported_floor_revision and
+                    event_revision == self._reported_floor_event_revision):
+                return None
+            snapshot = {
+                "confirmed_group_id": self.confirmed_group_id,
+                "single_call_group_id": self.single_call_group_id,
+                "floor_revision": revision,
+                "floor_event_revision": event_revision,
+                "floor_event": (dict(self._floor_event)
+                                if self._floor_event is not None else None),
+                "floor_state": self.floor_state,
+                "held_floor_group_id": self.held_floor_group_id,
+                "pending_floor_group_id": self.pending_floor_group_id,
+                "active_audio_group_id": self.active_audio_group_id,
+                "floor_udp_port": self.floor_udp_port,
+                "occupied_groups": [
+                    {"group_id": group_id,
+                     "police_name": item.get("police_name", "")}
+                    for group_id, item in self.occupied_group_ids.items()],
+            }
+            self._reported_floor_revision = revision
+            self._reported_floor_event_revision = event_revision
+            return snapshot
+        finally:
+            self._lock_release()
+
     def stop(self):
         self._running = False
+        # 唤醒可能阻塞在事件信号量上的控制线程；关闭socket唤醒recv线程。
+        self.wake_worker()
         self._close_socket()
         if self.audio_controller is not None:
             try:
