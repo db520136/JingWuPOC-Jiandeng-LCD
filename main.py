@@ -41,6 +41,9 @@ AB_ENABLE_POC_TCP = True
 # touch-performance experiment because TCP login/PTT/retry handling pauses.
 AB_ENABLE_POC_TCP_TX = True
 AB_ENABLE_HARDWARE_KEYS = True
+# The watchdog callback runs periodically; keep its old marker available for
+# board bring-up without adding unsolicited UART output in normal runs.
+WATCHDOG_DEBUG_LOG_ENABLED = False
 '''
 POC_TCP_HOST = "125.124.233.231"
 POC_HTTP_URL = (
@@ -107,7 +110,8 @@ def mount_external_flash():
             return False
         
 def feed(t):
-    print("11")
+    if WATCHDOG_DEBUG_LOG_ENABLED:
+        print("11")
     wdt.feed()
 
 # 设备启动入口：先打开外设 3.3V，再创建横屏界面并进入 LVGL 事件循环。

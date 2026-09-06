@@ -50,8 +50,11 @@ LOCATION_MAP_IO_YIELD_MS = 1
 # the UI gate is detected on the next checkpoint and no protocol deadline is
 # tied to this worker.
 LOCATION_MAP_PAUSE_POLL_MS = 1000
-# Touch/scroll may defer proactive work, but never indefinitely.
-UI_INTERACTION_DEFER_MAX_MS = 30000
+# Touch/scroll defers proactive work until the LCD explicitly reports release.
+# There is intentionally no timeout escape: a timer wake while a finger is
+# still down reintroduces the long TCP scheduling tails this path is meant to
+# remove.  P0/P1 producers still wake the worker immediately.
+UI_INTERACTION_DEFER_MAX_MS = None
 TCP_RECEIVE_WAIT_TIMEOUT_S = 0.05
 # 接收线程使用None永久阻塞；该超时仅作为旧固件/线程启动失败时的兼容回退。
 # 仅用于兼容旧固件的接收超时；正常TCP接收线程使用None永久阻塞。
@@ -722,12 +725,18 @@ class POCClient:
     def notify_low_priority_scheduler(self, touch_active=False):
         """Let the control worker run P2 timers only outside touch fast path.
 
-        The worker blocks when no P0/P1 transaction is pending.  A bounded
-        one-second nudge keeps heartbeat/GNSS/retry timers alive without
-        scheduling the worker on every LCD touch cycle.
+        The worker blocks when no P0/P1 transaction is pending.  The LCD loop
+        may call this every cycle, but the authoritative interaction flag is
+        checked here as well as in the worker so a release-tail race cannot
+        wake the worker for heartbeat/GNSS work while a native scroll is still
+        active.  The release edge wakes it through ``set_ui_interaction_active``.
         """
         now_ms = utime.ticks_ms()
-        if touch_active and self._ui_interaction_defer_active(now_ms):
+        # Do not rely solely on the caller's ``touch_active`` snapshot: the
+        # native pager/menu can remain active after the CST fast-path boolean
+        # has already changed.  The worker-owned interaction state is the
+        # single gate for all low-priority wakeups.
+        if self._ui_interaction_defer_active(now_ms):
             return
         if (self._tx_last_low_wake_ms is not None and
                 utime.ticks_diff(now_ms, self._tx_last_low_wake_ms) <
@@ -910,6 +919,11 @@ class POCClient:
             self._single_action is not None or
             self._floor_request_action is not None or
             self._floor_sent_ms is not None or
+            # Once a heartbeat/GNSS packet has actually been sent, its ACK
+            # timeout/retry is a live TCP transaction and must continue even
+            # during touch.  Only the initial low-priority send is deferred.
+            self._heartbeat_request_cnt is not None or
+            self._gnss_request_cnt is not None or
             self._server_logout_pending or
             self.logout_state == "cleaning" or
             bool(self._tx_queue) or rx_priority or
@@ -932,18 +946,14 @@ class POCClient:
             return False
 
     def _ui_interaction_defer_active(self, now_ms=None):
-        if not self._ui_interaction_active:
-            return False
-        started = self._ui_interaction_started_ms
-        if started is None:
-            return False
-        if now_ms is None:
-            now_ms = utime.ticks_ms()
-        deadline = self._add_ms(started, UI_INTERACTION_DEFER_MAX_MS)
-        return not self._time_reached(deadline, now_ms)
+        # Low-priority due flags are recorded by the control worker and are
+        # serviced after ``set_ui_interaction_active(False)`` wakes it.  Do not
+        # convert this into a timed poll: the release edge is the ownership
+        # boundary and a long touch must never wake the worker spuriously.
+        return bool(self._ui_interaction_active)
 
     def _low_priority_pause_active(self):
-        """Pause proactive work for realtime audio or bounded UI activity."""
+        """Pause proactive work for realtime audio or active UI interaction."""
         return bool(self._gnss_pause_active() or
                     self._ui_interaction_defer_active())
 
@@ -3794,8 +3804,10 @@ class POCClient:
                     self.join_error = "退出组呼应答超时"
                     self._join_changed()
 
-        if (self._heartbeat_sent_ms is not None and
-                not self._low_priority_pause_active()):
+        # A heartbeat that has already been sent is an active TCP transaction.
+        # Its timeout/retry must not be paused by touch/scroll; only creation
+        # of a new heartbeat is low priority and gated in _send_heartbeat_if_due.
+        if self._heartbeat_sent_ms is not None:
             (self._heartbeat_sent_ms, self._heartbeat_retry_count,
              timed_out) = self._retry_packet_if_due(
                 self._heartbeat_packet, self._heartbeat_sent_ms,
@@ -3809,8 +3821,9 @@ class POCClient:
                 self._tcp_last_activity_ms = utime.ticks_ms()
                 print("[POC] TCP心跳应答超时")
 
-        if (self._gnss_sent_ms is not None and
-                not self._low_priority_pause_active()):
+        # Same rule for a GNSS upload: once on the wire, finish its retry
+        # contract even while the LCD is in the touch fast path.
+        if self._gnss_sent_ms is not None:
             (self._gnss_sent_ms, self._gnss_retry_count,
              timed_out) = self._retry_packet_if_due(
                 self._gnss_packet, self._gnss_sent_ms,
@@ -4411,8 +4424,8 @@ class POCClient:
                 # repeatedly walking its idle/reconnect state machine.  When
                 # there is no P0/P1 transaction, park this worker for a long
                 # slice; set_ui_interaction_active(False) wakes it immediately
-                # after the finger is released.  The bounded defer window is
-                # still respected by the one-second checkpoint below.
+                # after the finger is released.  No timer-based escape is used
+                # here: the release edge is the ownership boundary.
                 if (self._ui_interaction_defer_active() and
                         not self._high_priority_pending()):
                     if self._worker_event is not None:
@@ -4482,6 +4495,10 @@ class POCClient:
                     # 启动，则回退到旧的短超时接收，保证旧固件仍可工作。
                     if not self._rx_dedicated:
                         self._recv_once()
+                    # P2 timers are gated inside these functions.  If a packet
+                    # is already in flight, _high_priority_pending() keeps the
+                    # worker on its retry cadence; a new timer expiry itself is
+                    # still deferred until the LCD releases the interaction.
                     self._send_gnss_if_due()
                     self._send_heartbeat_if_due()
                     self._process_tcp_request_timeouts()

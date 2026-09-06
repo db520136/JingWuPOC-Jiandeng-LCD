@@ -112,7 +112,7 @@ SETTINGS_ICON_BOX_SIZE = 48
 SETTINGS_ICON_BOX_X = 6
 SETTINGS_ICON_BOX_Y = (SETTINGS_ROW_HEIGHT - SETTINGS_ICON_BOX_SIZE) // 2
 SETTINGS_LABEL_X = SETTINGS_ICON_BOX_X + SETTINGS_ICON_BOX_SIZE + 4
-SETTINGS_SCROLL_THROW = 60
+SETTINGS_SCROLL_THROW = 12
 SETTINGS_SCROLL_LIMIT = 8
 MENU_SCROLL_SETTLE_MS = 100
 SETTINGS_CLICK_MOVE_LIMIT = 8
@@ -201,12 +201,8 @@ NETWORK_DISCONNECTED_COLOR = RED
 # Native LVGL pager parameters.  A two-slot pager is built while a root or
 # child page transition is active; it keeps existing page objects/callbacks
 # while LVGL provides drag, momentum and snap without custom set_x() animation.
-NATIVE_NAV_SCROLL_THROW = 3
+NATIVE_NAV_SCROLL_THROW = 12
 NATIVE_NAV_SCROLL_LIMIT = 8
-# Distance (in pixels) that the native page pager must travel before a
-# release is committed.  LVGL momentum may carry the pager past this point
-# even when the finger itself moved less than the threshold.
-NATIVE_NAV_SWITCH_DISTANCE_PX = 90
 # Navigation diagnostics are event-level only (press/release, click, and
 # pager settle); they do not print every sampled point or every LVGL frame.
 NAV_TRACE_LOG_ENABLED = True
@@ -495,6 +491,19 @@ class JingWuUI:
 		self._nav_clamp_active = False
 		self._nav_finish_pending = False
 		self._nav_finish_deadline = None
+		# (outgoing, destination) while LVGL animates a released back gesture.
+		# Pages are reconfigured only after this native settle completes.
+		self._nav_reconfigure_pending = None
+		self._nav_reconfigure_ready = False
+		self._nav_root_reconfigure_pending = None
+		self._nav_root_reconfigure_ready = False
+		# Root navigation settles to the adjacent slot first, then rotates the
+		# three mounted pages around the centered viewport.
+		# True while a programmatic LVGL settle (page entry or rejected swipe)
+		# is running.  Its SCROLL_END must never be interpreted as a new user
+		# gesture, and a second click is held until the native animation ends.
+		self._nav_programmatic_settle_pending = False
+		self._nav_programmatic_settle_deadline = None
 		self._nav_user_scroll_pending = False
 		self._nav_trace_scroll_reported = False
 		self._nav_requested = False
@@ -562,6 +571,10 @@ class JingWuUI:
 		self._last_menu_scroll_ms = None
 		self._menu_scroll_active = False
 		self._pending_scroll_redraw = None
+		# Delayed final row alignment for native vertical menus.  The correction
+		# runs after LVGL has finished momentum, never from inside SCROLL_END.
+		self._pending_menu_snap = None
+		self._menu_snap_in_progress = False
 		self._perf_stats = [[0, 0, 0, 0, 0, 0] for _ in range(10)]
 		self._perf_post_stats = [[0, 0, 0, 0, 0, 0] for _ in range(6)]
 		# count, elapsed, max, map cycles, map max, last map state,
@@ -1077,6 +1090,8 @@ class JingWuUI:
 			self._poc_touch_blocker.add_flag(lv.obj.FLAG.HIDDEN)
 	def _stop_menu_scrolling(self):
 		"""Stop native momentum on the LCD thread when PTT takes priority."""
+		self._pending_menu_snap = None
+		self._menu_snap_in_progress = False
 		for content in self._scroll_containers:
 			try:
 				y = content.get_scroll_y()
@@ -2002,9 +2017,11 @@ class JingWuUI:
 		}.get(key, str(key))
 	def _page_key(self, page):
 		# Avoid generator/next(default) on MicroPython ports where the native
-		# implementation accepts only one positional argument.
+		# implementation accepts only one positional argument.  Some QuecPython
+		# LVGL bindings return a fresh wrapper for an object on each callback, so
+		# identity alone is not sufficient here.
 		for key, value in self.pages.items():
-			if value is page:
+			if self._nav_obj_same(value, page):
 				return key
 		return None
 	def _nav_trace(self, message):
@@ -2237,6 +2254,13 @@ class JingWuUI:
 			wrapper = lambda target, event: page_event(event)
 			self._event_callbacks.append(wrapper)
 			page.set_event_cb(wrapper, lv.EVENT.ALL, None)
+	def _nav_obj_same(self, left, right):
+		if left is right:
+			return True
+		try:
+			return bool(left == right)
+		except Exception:
+			return False
 	def _nav_reparent(self, page, parent, x, visible=True):
 		"""Move an existing screen into/out of the native navigation pager."""
 		try:
@@ -2252,7 +2276,7 @@ class JingWuUI:
 		# so moves the real page on the root screen (the visible right/down jump)
 		# while the pager remains empty.
 		try:
-			if page.get_parent() is not parent:
+			if not self._nav_obj_same(page.get_parent(), parent):
 				if old_parent is not None:
 					try:
 						page.set_parent(old_parent)
@@ -2261,17 +2285,19 @@ class JingWuUI:
 				return False
 		except Exception:
 			pass
-		in_native_pager = parent in (self._nav_content, self._nav_pager)
+		in_native_pager = (
+			self._nav_obj_same(parent, self._nav_content) or
+			self._nav_obj_same(parent, self._nav_pager))
 		try:
 			y = 0 if in_native_pager else STATUS_HEIGHT
-			if parent is not self._nav_content:
+			if not self._nav_obj_same(parent, self._nav_content):
 				if page is self.pages.get("location_detail"):
 					y = STATUS_HEIGHT - 10
 				elif page is self.pages.get("settings"):
 					# Settings is a full-screen root page so its status-bar
 					# transparent layout must be restored when leaving the pager.
 					y = 0
-			if parent is self._nav_content:
+			if self._nav_obj_same(parent, self._nav_content):
 				if page is self.pages.get("location_detail"):
 					y = 0
 				elif page is self.pages.get("settings"):
@@ -2340,8 +2366,9 @@ class JingWuUI:
 			self._set_page_visible(page, False)
 		try:
 			page_key = self._page_key(page)
-			parent_name = ("一级pager" if parent is self._nav_pager else
-						   ("二级pager内容" if parent is self._nav_content else
+			parent_name = ("一级pager" if self._nav_obj_same(parent, self._nav_pager)
+						   else ("二级pager内容" if
+								 self._nav_obj_same(parent, self._nav_content) else
 							"主屏"))
 			self._nav_trace("页面挂载 key={} parent={} x={} visible={}".format(
 				page_key, parent_name, int(x), bool(visible)))
@@ -2352,7 +2379,9 @@ class JingWuUI:
 		if self._nav_pager is None or page is None:
 			return False
 		try:
-			return page.get_parent() in (self._nav_content, self._nav_pager)
+			parent = page.get_parent()
+			return (self._nav_obj_same(parent, self._nav_content) or
+					self._nav_obj_same(parent, self._nav_pager))
 		except Exception:
 			return False
 	def _nav_page_attached(self, page):
@@ -2360,7 +2389,9 @@ class JingWuUI:
 		if page is None:
 			return False
 		try:
-			return page.get_parent() in (self._nav_content, self._nav_pager)
+			parent = page.get_parent()
+			return (self._nav_obj_same(parent, self._nav_content) or
+					self._nav_obj_same(parent, self._nav_pager))
 		except Exception:
 			return False
 	def _event_in_scroll_container(self, event):
@@ -2369,8 +2400,9 @@ class JingWuUI:
 		except Exception:
 			return False
 		for _ in range(8):
-			if target in self._scroll_containers:
-				return True
+			for container in self._scroll_containers:
+				if self._nav_obj_same(target, container):
+					return True
 			try:
 				target = target.get_parent()
 			except Exception:
@@ -2410,6 +2442,12 @@ class JingWuUI:
 				pass
 			pager.set_scroll_dir(lv.DIR.HOR)
 			pager.add_flag(lv.obj.FLAG.SCROLL_MOMENTUM)
+			# Let LVGL choose and settle to one adjacent page per gesture.  This
+			# replaces the former Python displacement threshold/settle decision.
+			try:
+				pager.add_flag(lv.obj.FLAG.SCROLL_ONE)
+			except Exception:
+				pass
 			for name in ("SCROLL_ELASTIC", "SCROLL_CHAIN_HOR",
 						 "SCROLL_CHAIN_VER", "SNAPPABLE"):
 				try:
@@ -2418,13 +2456,16 @@ class JingWuUI:
 					pass
 			# Child-page navigation keeps its two screens in ``content``. Root-page
 			# navigation attaches three fixed-width screens directly to this pager.
-			# LVGL owns drag/momentum; the release position is checked against the
-			# configurable 90px threshold before a page state is committed.
+			# LVGL owns drag, momentum, center snapping, and one-page release settle.
 			try:
-				none_snap = getattr(lv.SCROLL_SNAP, "NONE")
-				pager.set_scroll_snap_x(none_snap)
+				pager.set_scroll_snap_x(getattr(lv.SCROLL_SNAP, "CENTER"))
 			except Exception:
-				pass
+				# Older ports may expose only START/END.  Keep native snapping enabled
+				# when CENTER is unavailable rather than reinstating Python thresholds.
+				try:
+					pager.set_scroll_snap_x(getattr(lv.SCROLL_SNAP, "START"))
+				except Exception:
+					pass
 			try:
 				pager.set_scroll_throw(NATIVE_NAV_SCROLL_THROW)
 			except Exception:
@@ -2478,7 +2519,10 @@ class JingWuUI:
 			# Reparenting pages during a click/commit can itself emit SCROLL;
 			# a release-confirmation ``dynamic_active`` state must not turn that
 			# programmatic event into a second navigation transition.
-			if self._nav_current is not None and self._touch_pressed:
+			if (self._nav_current is not None and self._touch_pressed and
+					not self._nav_programmatic_settle_pending and
+					self._nav_reconfigure_pending is None and
+					self._nav_root_reconfigure_pending is None):
 				self._nav_user_scroll_pending = True
 			if not self._nav_trace_scroll_reported:
 				self._nav_trace_scroll_reported = True
@@ -2489,6 +2533,61 @@ class JingWuUI:
 				self._nav_trace("LVGL开始滚动 页面={} scroll_x={} 根分页={}".format(
 					self._nav_page_name(), x, self._nav_root_mode))
 		elif code == getattr(lv.EVENT, "SCROLL_END", -2):
+			# A released navigation gesture first settles to its destination with
+			# LVGL animation.  Commit and update off-screen slots only when that
+			# programmatic settle emits SCROLL_END.  Root and child reconfiguration
+			# have separate markers because both may exist during a handoff.
+			pending = self._nav_reconfigure_pending
+			root_pending = self._nav_root_reconfigure_pending
+			if pending is not None or root_pending is not None:
+				# Defer page reconfiguration until the outer LCD loop.  Reparenting
+				# from inside LVGL's event callback is re-entrant on some ports.
+				# Some ports emit SCROLL_END for the user's first settle and then
+				# emit it again for the explicit destination animation.  Only the
+				# latter is allowed to reconfigure slots; committing at the first
+				# intermediate coordinate is the source of over-return/flash frames.
+				try:
+					x = int(self._nav_pager.get_scroll_x())
+					target_x = None
+					if pending is not None:
+						target_x = (0 if self._nav_target_on_left else LCD_WIDTH)
+					elif root_pending is not None:
+						outgoing, target = root_pending[0], root_pending[1]
+						left = (self._nav_previous is not None and
+								 target[0] == self._nav_previous[0])
+						target_x = 0 if left else 2 * LCD_WIDTH
+					ready = (target_x is not None and abs(x - target_x) <= 2)
+				except Exception:
+					ready = False
+				if pending is not None and ready:
+					self._nav_reconfigure_ready = True
+				elif root_pending is not None and ready:
+					self._nav_root_reconfigure_ready = True
+				else:
+					# Keep the pending transition armed.  LVGL remains the sole owner
+					# of the next settle event and no page object is moved here.
+					self._nav_trace("忽略中间滚动结束：等待LVGL到达目标槽位")
+				self._menu_scroll_active = False
+				self._last_menu_scroll_ms = utime.ticks_ms()
+				return
+			if self._nav_programmatic_settle_pending:
+				# Page entry and rejected swipes are native LVGL animations, but not
+				# user navigation commits.  Consume their SCROLL_END without changing
+				# page state or arming a second transition.
+				try:
+					x = int(self._nav_pager.get_scroll_x())
+				except Exception:
+					x = None
+				center = (self._nav_root_center_x if self._nav_root_mode else
+						  (LCD_WIDTH if self._nav_target_on_left else 0))
+				if x is not None and abs(x - center) <= 2:
+					self._nav_programmatic_settle_pending = False
+					self._nav_programmatic_settle_deadline = None
+					self._nav_user_scroll_pending = False
+					self._menu_scroll_active = False
+					self._last_menu_scroll_ms = utime.ticks_ms()
+					self._nav_trace("忽略滚动结束：程序化LVGL动画")
+				return
 			try:
 				x = int(self._nav_pager.get_scroll_x())
 			except Exception:
@@ -2525,7 +2624,7 @@ class JingWuUI:
 				utime.ticks_ms(), 20)
 			self._nav_trace_scroll_reported = False
 	def _nav_prepare(self, current, previous, target_on_left=True,
-					 preserve_visible=False):
+					 preserve_visible=False, animate_to_current=False):
 		if not self._init_native_nav_pager() or self._nav_content is None:
 			return False
 		# Unless the caller explicitly arms root mode after preparation, this is
@@ -2541,16 +2640,30 @@ class JingWuUI:
 		# the reparent operations below, which may themselves emit SCROLL_END.
 		self._nav_user_scroll_pending = False
 		self._nav_finish_pending = False
+		self._nav_reconfigure_pending = None
+		self._nav_reconfigure_ready = False
+		self._nav_root_reconfigure_pending = None
+		self._nav_root_reconfigure_ready = False
+		self._nav_programmatic_settle_pending = False
+		self._nav_programmatic_settle_deadline = None
 		try:
 			# Entering a child page uses a hidden batch composition.  A back gesture
 			# already has its destination page visible in this pager, so preserve that
 			# composition and update only the off-screen slot to avoid a black frame.
 			if not preserve_visible:
 				self._set_page_visible(self._nav_pager, False)
-			self._nav_content.clear_flag(lv.obj.FLAG.HIDDEN)
-			self._nav_content.set_size(LCD_WIDTH * 2, PAGE_HEIGHT)
-			self._set_page_visible(previous[1], False)
-			if not preserve_visible:
+			# Child pages are direct pager children as well as root pages.  This is
+			# required for LVGL's CENTER snap and SCROLL_ONE to see the individual
+			# pages; keeping them inside one intermediate content object would make
+			# native paging observe only a single child.
+			try:
+				self._nav_content.add_flag(lv.obj.FLAG.HIDDEN)
+				self._nav_content.set_size(0, 0)
+			except Exception:
+				pass
+			if not animate_to_current:
+				self._set_page_visible(previous[1], False)
+			if not preserve_visible and not animate_to_current:
 				self._set_page_visible(current[1], False)
 			# Only two screens are ever attached to the pager.  Return all stale
 			# screens to the root first so their cached resources remain intact.
@@ -2565,10 +2678,10 @@ class JingWuUI:
 					pass
 			previous_x = 0 if target_on_left else LCD_WIDTH
 			current_x = LCD_WIDTH if target_on_left else 0
-			if not self._nav_reparent(previous[1], self._nav_content,
+			if not self._nav_reparent(previous[1], self._nav_pager,
 								 previous_x, False):
 				return False
-			if not self._nav_reparent(current[1], self._nav_content,
+			if not self._nav_reparent(current[1], self._nav_pager,
 								 current_x, preserve_visible):
 				return False
 			self._set_page_visible(previous[1], True)
@@ -2583,8 +2696,33 @@ class JingWuUI:
 			self._nav_requested = False
 			self._nav_user_scroll_pending = False
 			self._nav_trace_scroll_reported = False
-			self._nav_pager.scroll_to_x(
-				LCD_WIDTH if target_on_left else 0, lv.ANIM.OFF)
+			final_x = LCD_WIDTH if target_on_left else 0
+			try:
+				self._nav_pager.set_scroll_snap_x(getattr(lv.SCROLL_SNAP, "CENTER"))
+			except Exception:
+				try:
+					self._nav_pager.set_scroll_snap_x(getattr(lv.SCROLL_SNAP, "START"))
+				except Exception:
+					pass
+			if animate_to_current and not preserve_visible:
+				start_x = 0 if target_on_left else LCD_WIDTH
+				self._nav_pager.scroll_to_x(start_x, lv.ANIM.OFF)
+				self._nav_programmatic_settle_pending = True
+				try:
+					self._nav_programmatic_settle_deadline = utime.ticks_add(
+						utime.ticks_ms(), 350)
+				except Exception:
+					self._nav_programmatic_settle_deadline = None
+				try:
+					self._nav_pager.scroll_to_x(final_x, lv.ANIM.ON)
+				except Exception:
+					self._nav_programmatic_settle_pending = False
+					self._nav_programmatic_settle_deadline = None
+					self._nav_pager.scroll_to_x(final_x, lv.ANIM.OFF)
+			else:
+				self._nav_programmatic_settle_pending = False
+				self._nav_programmatic_settle_deadline = None
+				self._nav_pager.scroll_to_x(final_x, lv.ANIM.OFF)
 			# Reparenting does not always invalidate the old and new coordinates on
 			# QuecPython's LVGL port.  Explicitly invalidate the pager and both
 			# pages so a stale frame (or the pager theme's white background) cannot
@@ -2605,6 +2743,14 @@ class JingWuUI:
 			return
 		self._nav_user_scroll_pending = False
 		self._nav_finish_pending = False
+		self._nav_reconfigure_pending = None
+		self._nav_reconfigure_ready = False
+		self._nav_root_reconfigure_pending = None
+		self._nav_root_reconfigure_ready = False
+		self._nav_programmatic_settle_pending = False
+		self._nav_programmatic_settle_deadline = None
+		self._pending_menu_snap = None
+		self._menu_snap_in_progress = False
 		# Hide before returning child pages to the root screen.  Reparenting can
 		# invalidate and redraw synchronously on the target port.
 		try:
@@ -2636,6 +2782,8 @@ class JingWuUI:
 		self._nav_finish_deadline = None
 		self._nav_user_scroll_pending = False
 		self._nav_trace_scroll_reported = False
+		self._nav_programmatic_settle_pending = False
+		self._nav_programmatic_settle_deadline = None
 	def _ensure_root_page(self, key):
 		"""Create one of the fixed root pages without changing the current page."""
 		page = self.pages.get(key)
@@ -2691,12 +2839,12 @@ class JingWuUI:
 		return None
 	def _prepare_root_nav(self, current, direction_hint=None,
 						 preserve_visible=False):
-		"""Arm the fixed root-page pager and center the current root page.
+		"""Arm a centered three-slot native pager for the root pages.
 
-		The old implementation selected one adjacent page before the gesture was
-		known. Root navigation keeps all four root pages attached at stable slots;
-		LVGL owns the drag and momentum, while the LCD thread only commits the
-		settled slot.
+		Only the current page and its immediate neighbors are mounted.  Empty edge
+		slots are left black, so dragging at the first/last page cannot expose a
+		second page or move the parent screen.  LVGL owns the drag and momentum;
+		the LCD thread only commits the settled adjacent slot.
 		"""
 		if (current is None or current[0] == "login" or
 				not self._is_root_page()):
@@ -2717,11 +2865,18 @@ class JingWuUI:
 		key = current[0]
 		left = self._root_neighbor(key, -1)
 		right = self._root_neighbor(key, 1)
+		mounted = (left, current, right)
 		try:
 			# Rebuilding the fixed root pager is a programmatic operation.  Do not
 			# let SCROLL_END generated by reparenting commit another root page.
 			self._nav_user_scroll_pending = False
 			self._nav_finish_pending = False
+			self._nav_reconfigure_pending = None
+			self._nav_reconfigure_ready = False
+			self._nav_root_reconfigure_pending = None
+			self._nav_root_reconfigure_ready = False
+			self._nav_programmatic_settle_pending = False
+			self._nav_programmatic_settle_deadline = None
 			# Root pages are direct children of the pager at fixed absolute slots.
 			# The child-page content object is kept empty/hidden while root mode is
 			# active, so it cannot contribute a second scroll extent or paint stale
@@ -2732,39 +2887,65 @@ class JingWuUI:
 			if not preserve_visible:
 				self._set_page_visible(self._nav_pager, False)
 			try:
-				self._nav_content.add_flag(lv.obj.FLAG.HIDDEN)
-				self._nav_content.set_size(0, 0)
+				# During a back transition the current root page may still be the
+				# visible child of ``content``.  Keep content drawable until that page
+				# is moved to the root pager; otherwise the handoff produces a black
+				# frame.  It is hidden after all root pages are mounted below.
+				if not preserve_visible:
+					self._nav_content.add_flag(lv.obj.FLAG.HIDDEN)
+					self._nav_content.set_size(0, 0)
 			except Exception:
 				pass
-			for slot, root_key in enumerate(self._nav_root_order):
+			# First remove pages that are outside the three active slots.  Keeping a
+			# fourth direct child in the pager lets a fast drag reveal two pages at
+			# once and is the source of the old edge/overlap artefact.
+			for root_key in self._nav_root_order:
 				root_page = self._ensure_root_page(root_key)
 				if root_page is None:
 					continue
-				if not (preserve_visible and root_page is current[1]):
+				if not any(item is not None and
+						self._nav_obj_same(item[1], root_page)
+						for item in mounted):
 					self._set_page_visible(root_page, False)
-				if not self._nav_reparent(root_page, self._nav_pager,
-							 slot * LCD_WIDTH,
-							 preserve_visible and root_page is current[1]):
+					if self._nav_page_attached(root_page):
+						self._nav_reparent(root_page, self._root_screen,
+										0, False)
+			for slot, item in enumerate(mounted):
+				if item is None:
+					continue
+				root_page = item[1]
+				if not (preserve_visible and
+						self._nav_obj_same(root_page, current[1])):
+					self._set_page_visible(root_page, False)
+				if not self._nav_reparent(
+						root_page, self._nav_pager, slot * LCD_WIDTH,
+						preserve_visible and
+						self._nav_obj_same(root_page, current[1])):
 					return False
 			for item in self.pages.values():
-				if item.get_parent() is self._nav_content:
+				if self._nav_obj_same(item.get_parent(), self._nav_content):
 					self._set_page_visible(item, False)
 					self._nav_reparent(item, self._root_screen, 0, False)
-			for root_key in self._nav_root_order:
-				root_page = self.pages.get(root_key)
-				if root_page is not None:
-					self._set_page_visible(root_page, True)
+			for item in mounted:
+				if item is not None:
+					self._set_page_visible(item[1], True)
+			if preserve_visible:
+				try:
+					self._nav_content.add_flag(lv.obj.FLAG.HIDDEN)
+					self._nav_content.set_size(0, 0)
+				except Exception:
+					pass
 			if not preserve_visible:
 				self._set_page_visible(self._nav_pager, True)
 			self._nav_pager.move_foreground()
 			self._nav_current = current
 			self._nav_previous = left
 			self._nav_next = right
-			self._nav_root_center_x = (
-				self._nav_root_order.index(key) * LCD_WIDTH)
+			# The current page is always the center slot.  The pager therefore has a
+			# stable 0..2*LCD_WIDTH scroll range for every root page.
+			self._nav_root_center_x = LCD_WIDTH
 			self._nav_root_min_x = 0
-			self._nav_root_max_x = (
-				(len(self._nav_root_order) - 1) * LCD_WIDTH)
+			self._nav_root_max_x = 2 * LCD_WIDTH
 			self._nav_target_on_left = True
 			self._nav_root_mode = True
 			self._nav_finish_pending = False
@@ -2777,13 +2958,18 @@ class JingWuUI:
 				self._nav_page_name(left[0]) if left else "无",
 				self._nav_page_name(right[0]) if right else "无"))
 			try:
-				# Keep the 90px application threshold observable at SCROLL_END;
-				# Python selects the destination slot and asks this same LVGL pager
-				# to settle there. No CST816D gesture path participates.
+				# Keep horizontal paging native for every root-page composition.
 				self._nav_pager.set_scroll_snap_x(
-					getattr(lv.SCROLL_SNAP, "NONE"))
+					getattr(lv.SCROLL_SNAP, "CENTER"))
 			except Exception:
-				pass
+				try:
+					self._nav_pager.set_scroll_snap_x(
+						getattr(lv.SCROLL_SNAP, "START"))
+				except Exception:
+					pass
+			# A programmatic initial centering must not be reported as a user scroll.
+			self._nav_programmatic_settle_pending = False
+			self._nav_programmatic_settle_deadline = None
 			self._nav_pager.scroll_to_x(self._nav_root_center_x, lv.ANIM.OFF)
 			for target in (self._nav_pager, self._nav_content,
 						  current[1], left[1] if left else None,
@@ -2799,23 +2985,91 @@ class JingWuUI:
 			self._nav_supported = False
 			return False
 	def _nav_request_back(self):
-		if self._nav_pager is None or self._nav_current is None:
+		if (self._nav_pager is None or self._nav_current is None or
+				self._nav_previous is None):
 			return False
+		# A physical back key or a second release can arrive while the native
+		# settle animation is still running.  Keep the first request authoritative;
+		# overwriting its pending tuple would pop the history twice.
+		if self._nav_reconfigure_pending is not None:
+			return True
+		if (self._nav_root_reconfigure_pending is not None or
+				self._nav_programmatic_settle_pending):
+			return True
+		outgoing = self._nav_current
+		previous = self._nav_previous
+		# The native pager owns the complete settle lifecycle.  Do not use a
+		# wall-clock timeout to reparent pages: on a busy frame the LVGL animation
+		# can legitimately take longer than the old 350 ms guard, and committing
+		# from that guard causes the visible over-return/flash reported on device.
 		try:
 			self._mark_touch_sequence_swipe()
-			self._nav_pager.scroll_to_x(0, lv.ANIM.OFF)
+		except Exception:
+			pass
+		deadline = None
+		self._nav_user_scroll_pending = False
+		self._nav_reconfigure_pending = (outgoing, previous, deadline)
+		self._nav_reconfigure_ready = False
+		try:
+			target_x = (0 if self._nav_target_on_left else LCD_WIDTH)
+			self._nav_pager.scroll_to_x(target_x, lv.ANIM.ON)
 			return True
 		except Exception:
+			self._nav_reconfigure_pending = None
 			try:
-				lv.obj_scroll_to_x(self._nav_pager, 0, lv.ANIM.OFF)
+				target_x = (0 if self._nav_target_on_left else LCD_WIDTH)
+				lv.obj_scroll_to_x(self._nav_pager, target_x, lv.ANIM.ON)
 				return True
 			except Exception:
+				self._nav_reconfigure_pending = None
+				self._nav_trace("原生返回滚动不可用，保持当前LVGL组合")
 				return False
 	def _process_native_nav(self):
 		if self._nav_requested:
 			self._nav_requested = False
 			self._nav_request_back()
 		if self._nav_pager is None or self._nav_current is None:
+			return
+		root_pending = self._nav_root_reconfigure_pending
+		if root_pending is not None:
+			# Reconfiguration is committed only from LVGL SCROLL_END.  The tuple's
+			# third field is retained for compatibility with older state snapshots,
+			# but is intentionally not treated as a commit deadline.
+			if self._nav_root_reconfigure_ready:
+				self._nav_root_reconfigure_pending = None
+				self._nav_root_reconfigure_ready = False
+				self._nav_programmatic_settle_pending = False
+				self._nav_programmatic_settle_deadline = None
+				self._nav_user_scroll_pending = False
+				self._nav_finish_pending = False
+				self._complete_root_nav(root_pending[0], root_pending[1])
+			return
+		pending = self._nav_reconfigure_pending
+		if pending is not None:
+			# Never reparent on a timer.  SCROLL_END is the sole ownership boundary
+			# between LVGL's animation and the next pager composition.
+			if self._nav_reconfigure_ready:
+				self._nav_reconfigure_pending = None
+				self._nav_reconfigure_ready = False
+				self._nav_user_scroll_pending = False
+				self._nav_finish_pending = False
+				self._complete_nav_back(pending[0], pending[1])
+			return
+		if self._nav_programmatic_settle_pending:
+			# SCROLL_END normally clears this guard.  A few QuecPython releases omit
+			# the event when the target is already at the requested slot; coordinate
+			# convergence is a safe non-visual compatibility check in that case.
+			try:
+				x = int(self._nav_pager.get_scroll_x())
+			except Exception:
+				x = None
+			center = (self._nav_root_center_x if self._nav_root_mode else
+					  (LCD_WIDTH if self._nav_target_on_left else 0))
+			if (x is not None and abs(x - center) <= 1 and
+					not self._touch_pressed):
+				self._nav_programmatic_settle_pending = False
+				self._nav_programmatic_settle_deadline = None
+				self._nav_user_scroll_pending = False
 			return
 		if not self._nav_finish_pending:
 			return
@@ -2833,132 +3087,309 @@ class JingWuUI:
 		self._nav_finish_pending = False
 		if self._nav_root_mode:
 			center = self._nav_root_center_x
-			left_travel = center - x
-			right_travel = x - center
+			# SCROLL_END is emitted after LVGL's native snap/SCROLL_ONE settle.
+			# A root transition is therefore recognized only at an actual adjacent
+			# slot (0 or 2*LCD_WIDTH); no application pixel threshold is applied.
 			target = None
-			if (left_travel >= NATIVE_NAV_SWITCH_DISTANCE_PX and
-					self._nav_previous is not None):
+			if (self._nav_previous is not None and
+					x <= self._nav_root_min_x + NATIVE_NAV_SCROLL_LIMIT):
 				target = self._nav_previous
-			elif (right_travel >= NATIVE_NAV_SWITCH_DISTANCE_PX and
-					self._nav_next is not None):
+			elif (self._nav_next is not None and
+					x >= self._nav_root_max_x - NATIVE_NAV_SCROLL_LIMIT):
 				target = self._nav_next
 			if target is not None:
 				outgoing = self._nav_current
 				if NAV_DEBUG_LOG_ENABLED:
 					try:
+						left_travel = center - x
+						right_travel = x - center
 						print("[NAV] commit current={} target={} x={} left={} right={}".format(
 							outgoing[0] if outgoing else None, target[0], x,
 							left_travel, right_travel))
 					except Exception:
 						pass
-				self.current = target
-				self.stack = []
-				# Root pages remain direct pager children at fixed slots.  Do not
-				# hide/reparent the outgoing page: adjacent pages must stay available
-				# for the next native drag and cannot leave stale pixels behind.
-				self._nav_current = target
-				self._nav_previous = self._root_neighbor(target[0], -1)
-				self._nav_next = self._root_neighbor(target[0], 1)
-				self._nav_root_center_x = (
-					self._nav_root_order.index(target[0]) * LCD_WIDTH)
-				self._set_page_visible(target[1], True)
-				self._nav_finish_pending = False
-				self._nav_pager.scroll_to_x(
-					self._nav_root_center_x, lv.ANIM.OFF)
+				# Let LVGL first animate the old adjacent page to the edge.  The
+				# three-slot rotation below is deferred until SCROLL_END, avoiding a
+				# visible reparent while the native animation is still painting.
 				self._nav_user_scroll_pending = False
-				self._nav_trace_scroll_reported = False
-				self._nav_trace("一级页面切换完成 当前={} 目标槽位={} 左={} 右={}".format(
-					self._nav_page_name(outgoing[0] if outgoing else None),
-					self._nav_page_name(target[0]), self._nav_root_center_x,
-					self._nav_page_name(self._nav_previous[0])
-					if self._nav_previous else "无",
-					self._nav_page_name(self._nav_next[0])
-					if self._nav_next else "无"))
-				self._sync_police_status_visibility(target[0])
-				if target[0] == "location":
-					self._location_resync_clock()
-					self._refresh_location_page()
-				self._pending_gc = True
+				deadline = None
+				self._nav_root_reconfigure_pending = (outgoing, target, deadline)
+				self._nav_root_reconfigure_ready = False
+				try:
+					self._nav_finish_deadline = None
+					settle_x = (self._nav_root_min_x if
+							target is self._nav_previous else self._nav_root_max_x)
+					if abs(x - settle_x) <= 2:
+						self._nav_root_reconfigure_ready = True
+					else:
+						self._nav_pager.scroll_to_x(settle_x, lv.ANIM.ON)
+				except Exception:
+					self._nav_root_reconfigure_pending = None
+					self._nav_trace("原生一级分页收尾滚动不可用，保持当前LVGL组合")
 			else:
 				try:
-					self._nav_pager.scroll_to_x(center, lv.ANIM.OFF)
+					self._nav_programmatic_settle_pending = True
+					self._nav_programmatic_settle_deadline = utime.ticks_add(
+						utime.ticks_ms(), 350)
+					self._nav_pager.scroll_to_x(center, lv.ANIM.ON)
 				except Exception:
+					self._nav_programmatic_settle_pending = False
+					self._nav_programmatic_settle_deadline = None
 					pass
-				self._nav_trace("一级滑动未切换 当前={} left={} right={} 阈值={} 原因=到边界或位移不足".format(
-					self._nav_page_name(), left_travel, right_travel,
-					NATIVE_NAV_SWITCH_DISTANCE_PX))
+				self._nav_trace("一级滑动未切换 当前={} scroll_x={} 原因=LVGL吸附回当前页或到边界".format(
+					self._nav_page_name(), x))
 			return
-		if (x < LCD_WIDTH - NATIVE_NAV_SWITCH_DISTANCE_PX and
-				self._nav_previous is not None):
+		center = LCD_WIDTH if self._nav_target_on_left else 0
+		# Child-page back navigation likewise trusts LVGL's snapped slot.  The
+		# destination is at x=0 for a left-mounted previous page and x=LCD_WIDTH
+		# for a right-mounted previous page.
+		target_x = 0 if self._nav_target_on_left else LCD_WIDTH
+		if (self._nav_previous is not None and
+				abs(x - target_x) <= NATIVE_NAV_SCROLL_LIMIT):
 			outgoing = self._nav_current
 			previous = self._nav_previous
-			# Hide the page that has just been left before changing pager
-			# parents/positions.  Reparenting first can leave the outgoing page
-			# drawable for one LVGL frame, which appears as a brief flash of the
-			# third-level page after returning to a settings page.
-			if outgoing is not None:
-				self._set_page_visible(outgoing[1], False)
-				try:
-					outgoing[1].invalidate()
-				except Exception:
-					pass
-			if self.stack and self.stack[-1][1] is previous[1]:
-				self.stack.pop()
-			self.current = previous
-			if self.stack:
-				# The destination page is already the left slot of the visible
-				# pager.  Keep it visible while refreshing only the off-screen slot;
-				# hiding the whole pager here causes a black frame on every back swipe.
-				if not self._nav_prepare(previous, self.stack[-1],
-								 preserve_visible=True):
-					self._nav_teardown()
-					self._set_page_visible(previous[1], True)
-			else:
-				# Returning from a child to a root page must re-arm the root
-				# carousel.  Keep the current root page visible while replacing the
-				# child-page slots so this is a direct native transition rather than
-				# a teardown-to-black followed by a rebuild.
-				if previous[0] in ("location", "root_shoulder",
-								  "root_intercom", "root_settings"):
-					if not self._prepare_root_nav(previous, None,
-										 preserve_visible=True):
-						self._nav_teardown()
-						self._nav_reparent(previous[1], self._root_screen,
-										 0, True)
-						self._prepare_root_nav(previous, None)
-				else:
-					self._nav_teardown()
-					self._nav_reparent(previous[1], self._root_screen, 0, True)
-			self._sync_police_status_visibility(previous[0])
-			if self._poc_client is not None:
-				setter = getattr(self._poc_client,
-						"set_location_detail_active", None)
-				if setter is not None:
-					try:
-						setter(previous[0] == "location_detail")
-					except Exception as error:
-						print("[定位] 地图页面状态同步失败：{}".format(error))
-			self._pending_gc = True
-			if previous[0] == "location":
-				self._location_resync_clock()
-				self._refresh_location_page()
-			elif previous[0] == "location_detail":
-				self._refresh_location_map()
-				self._sync_location_loading_overlay()
-			# The outgoing page was hidden before pager reconfiguration above;
-			# invalidate the final composition once more to discard any queued
-			# stale region from the old child page.
+			# First let LVGL animate the already-mounted destination page all the
+			# way into view.  Reparenting is deferred until that native animation
+			# finishes, so the release cannot cause a second visible displacement.
+			self._nav_user_scroll_pending = False
 			try:
-				self._nav_pager.invalidate()
+				deadline = utime.ticks_add(utime.ticks_ms(), 350)
 			except Exception:
-				pass
+				deadline = None
+			self._nav_reconfigure_pending = (outgoing, previous, deadline)
+			self._nav_reconfigure_ready = False
+			try:
+				target_x = (0 if self._nav_target_on_left else LCD_WIDTH)
+				if abs(x - target_x) <= NATIVE_NAV_SCROLL_LIMIT:
+					# Native snap may already have landed exactly on the destination;
+					# do not wait for an optional no-op animation event on ports that
+					# suppress SCROLL_END for unchanged coordinates.
+					self._nav_reconfigure_ready = True
+				else:
+					self._nav_pager.scroll_to_x(target_x, lv.ANIM.ON)
+			except Exception:
+				self._nav_reconfigure_pending = None
+				self._nav_trace("原生二级分页收尾滚动不可用，保持当前LVGL组合")
 		else:
 			try:
-				self._nav_pager.scroll_to_x(LCD_WIDTH, lv.ANIM.OFF)
+				if abs(x - center) <= NATIVE_NAV_SCROLL_LIMIT:
+					self._nav_programmatic_settle_pending = False
+					self._nav_programmatic_settle_deadline = None
+				else:
+					self._nav_programmatic_settle_pending = True
+					self._nav_programmatic_settle_deadline = utime.ticks_add(
+						utime.ticks_ms(), 350)
+					self._nav_pager.scroll_to_x(center, lv.ANIM.ON)
+			except Exception:
+				self._nav_programmatic_settle_pending = False
+				self._nav_programmatic_settle_deadline = None
+				pass
+			self._nav_trace("二级页面滑动未返回 当前={} scroll_x={} 原因=LVGL吸附回当前页或无历史".format(
+				self._nav_page_name(), x))
+	def _complete_root_nav(self, outgoing, target):
+		"""Rotate the centered three-slot root pager after native settle."""
+		if target is None or self._nav_pager is None:
+			return False
+		left = self._root_neighbor(target[0], -1)
+		right = self._root_neighbor(target[0], 1)
+		mounted = (left, target, right)
+		try:
+			# Keep the destination visible while replacing only pages outside the
+			# new three-slot window.  The target is then centered together with the
+			# pager offset in one LCD-thread turn.
+			for root_key in self._nav_root_order:
+				root_page = self._ensure_root_page(root_key)
+				if root_page is None:
+					continue
+				if not any(item is not None and
+						self._nav_obj_same(item[1], root_page)
+						for item in mounted):
+					self._set_page_visible(root_page, False)
+					if self._nav_page_attached(root_page):
+						self._nav_reparent(root_page, self._root_screen,
+										0, False)
+			for slot, item in enumerate(mounted):
+				if item is None:
+					continue
+				root_page = item[1]
+				if not self._nav_reparent(root_page, self._nav_pager,
+								 slot * LCD_WIDTH, True):
+					return False
+			self.current = target
+			self.stack = []
+			self._nav_current = target
+			self._nav_previous = left
+			self._nav_next = right
+			self._nav_root_mode = True
+			self._nav_root_center_x = LCD_WIDTH
+			self._nav_root_min_x = 0
+			self._nav_root_max_x = 2 * LCD_WIDTH
+			self._nav_target_on_left = True
+			self._nav_finish_pending = False
+			self._nav_finish_deadline = None
+			self._nav_user_scroll_pending = False
+			self._nav_programmatic_settle_pending = False
+			self._nav_programmatic_settle_deadline = None
+			self._nav_trace_scroll_reported = False
+			self._nav_pager.scroll_to_x(LCD_WIDTH, lv.ANIM.OFF)
+			self._set_page_visible(self._nav_pager, True)
+			self._nav_pager.move_foreground()
+			for obj in (self._nav_pager, self._root_screen,
+						left[1] if left else None, target[1],
+						right[1] if right else None):
+				if obj is not None:
+					try:
+						obj.invalidate()
+					except Exception:
+						pass
+			self._nav_trace("一级页面切换完成 当前={} 左={} 右={}".format(
+				self._nav_page_name(target[0]),
+				self._nav_page_name(left[0]) if left else "无",
+				self._nav_page_name(right[0]) if right else "无"))
+			self._sync_police_status_visibility(target[0])
+			if target[0] == "location":
+				self._location_resync_clock()
+				self._refresh_location_page()
+			self._pending_gc = True
+			return True
+		except Exception as error:
+			self._nav_trace("一级页面切换收尾失败：{}".format(error))
+			return False
+	def _complete_nav_back(self, outgoing, previous):
+		"""Commit a native back transition after LVGL reaches the target slot."""
+		if outgoing is not None:
+			self._set_page_visible(outgoing[1], False)
+			try:
+				outgoing[1].invalidate()
 			except Exception:
 				pass
-			self._nav_trace("二级页面滑动未返回 当前={} scroll_x={} 阈值={} 原因=位移不足或无历史".format(
-				self._nav_page_name(), x, NATIVE_NAV_SWITCH_DISTANCE_PX))
+			if self.stack and self._nav_obj_same(self.stack[-1][1], previous[1]):
+				self.stack.pop()
+		self.current = previous
+		if self.stack:
+			# The destination is already visible after the native settle.  Rebuild
+			# the standard parent-left/current-right composition with a compensated
+			# scroll offset so the next back gesture keeps the same direction.
+			if not self._nav_prepare_back(previous, self.stack[-1]):
+				# Keep the destination in the native pager exactly where LVGL left it.
+				# Do not tear it down or move it through the root screen: that fallback
+				# was the source of black frames and visible jumps on the device.
+				self._nav_current = previous
+				self._nav_previous = self.stack[-1]
+				self._nav_next = None
+				self._nav_trace("返回分页重组失败，保持LVGL原生组合")
+		else:
+			if previous[0] in ("location", "root_shoulder",
+								  "root_intercom", "root_settings"):
+				if not self._prepare_root_nav(previous, None,
+										 preserve_visible=True):
+					# The settled destination remains visible in the existing LVGL
+					# pager.  Never replace it with a Python-side root-screen fallback.
+					self._nav_current = previous
+					self._nav_previous = None
+					self._nav_next = None
+					self._nav_root_mode = False
+					self._nav_trace("一级分页重组失败，保持LVGL原生组合")
+			else:
+				# Non-root pages without history are already at their native settled
+				# slot; keep that composition and avoid a custom teardown/reparent.
+				self._nav_current = previous
+				self._nav_previous = None
+				self._nav_next = None
+				self._nav_trace("页面返回完成，保持LVGL原生组合")
+		self._sync_police_status_visibility(previous[0])
+		if self._poc_client is not None:
+			setter = getattr(self._poc_client,
+								"set_location_detail_active", None)
+			if setter is not None:
+				try:
+					setter(previous[0] == "location_detail")
+				except Exception as error:
+					print("[定位] 地图页面状态同步失败：{}".format(error))
+		self._pending_gc = True
+		if previous[0] == "location":
+			self._location_resync_clock()
+			self._refresh_location_page()
+		elif previous[0] == "location_detail":
+			self._refresh_location_map()
+			self._sync_location_loading_overlay()
+		try:
+			self._nav_pager.invalidate()
+		except Exception:
+			pass
+		self._nav_trace("页面返回完成 当前={} 历史层数={}".format(
+			self._nav_page_name(previous[0]), len(self.stack)))
+	def _nav_prepare_back(self, current, previous):
+		"""Arm the next native back gesture without moving the visible page.
+
+		After a native back settle the destination is visible at content x=0 and
+		the pager scroll offset is 0.  Rebuild the normal two-slot composition as
+		parent-at-left/current-at-right, then compensate the pager offset to one
+		page width.  The destination therefore stays at the same screen coordinate
+		while the next right swipe has the same direction and threshold semantics.
+		"""
+		if (current is None or previous is None or
+				not self._init_native_nav_pager() or
+				self._nav_pager is None):
+			return False
+		try:
+			if not self._nav_obj_same(current[1].get_parent(), self._nav_pager):
+				return False
+			# The destination is currently visible at content x=0.  Keep the
+			# reconfiguration in one LCD cycle: place the grandparent at x=0,
+			# move the destination to x=LCD_WIDTH, then compensate the pager scroll
+			# to LCD_WIDTH.  No LVGL task handler runs between these assignments, so
+			# the visible destination remains stationary without a custom animation.
+			self._set_page_visible(current[1], True)
+			try:
+				self._nav_content.add_flag(lv.obj.FLAG.HIDDEN)
+				self._nav_content.set_size(0, 0)
+			except Exception:
+				pass
+			self._set_page_visible(previous[1], False)
+			for item in self.pages.values():
+				if item is current[1] or item is previous[1]:
+					continue
+				if self._nav_page_attached(item):
+					self._set_page_visible(item, False)
+					self._nav_reparent(item, self._root_screen, 0, False)
+			# Place the grandparent at the left slot and the destination at the
+			# right slot, then compensate the pager offset to keep the destination
+			# stationary.  All assignments occur in this LCD turn before LVGL paints.
+			if not self._nav_reparent(previous[1], self._nav_pager,
+									 0, False):
+				return False
+			if not self._nav_reparent(current[1], self._nav_pager,
+									 LCD_WIDTH, True):
+				return False
+			self._nav_current = current
+			self._nav_previous = previous
+			self._nav_next = None
+			self._nav_root_mode = False
+			self._nav_target_on_left = True
+			self._nav_root_center_x = LCD_WIDTH
+			self._nav_root_min_x = 0
+			self._nav_root_max_x = LCD_WIDTH
+			self._nav_finish_pending = False
+			self._nav_finish_deadline = None
+			self._nav_user_scroll_pending = False
+			self._nav_reconfigure_pending = None
+			self._nav_reconfigure_ready = False
+			self._nav_root_reconfigure_pending = None
+			self._nav_root_reconfigure_ready = False
+			self._nav_programmatic_settle_pending = False
+			self._nav_programmatic_settle_deadline = None
+			self._nav_trace_scroll_reported = False
+			self._nav_pager.scroll_to_x(LCD_WIDTH, lv.ANIM.OFF)
+			for target in (self._nav_pager, self._nav_content,
+							  current[1], previous[1], self._root_screen):
+				try:
+					target.invalidate()
+				except Exception:
+					pass
+			return True
+		except Exception:
+			return False
 	def _bind_click(self, page, obj, callback):
 		self._click_targets.append((page, obj, callback))
 		press_state = [None, False]
@@ -3091,6 +3522,10 @@ class JingWuUI:
 		# consecutive short taps: LVGL may coalesce or omit a RELEASED event
 		# when the next press arrives before the previous frame is dispatched.
 		if is_pressed and not was_pressed:
+			# A new hardware press may clear a stale programmatic guard only when
+			# LVGL is already at its native resting slot.  Do not interrupt an active
+			# animation merely because a second press arrived.
+			self._clear_programmatic_nav_guard_if_settled()
 			# Native pager pages intentionally ignore their per-page callbacks, so
 			# keep the gesture sequence alive from the hardware edge in the LCD
 			# thread.  LVGL remains the sole owner of pager movement and release.
@@ -3102,16 +3537,21 @@ class JingWuUI:
 			# SCROLL_END left by a previous native pager re-centering.
 			self._nav_finish_pending = False
 			self._nav_user_scroll_pending = bool(
-				self._nav_current is not None)
+				self._nav_current is not None and
+				self._nav_reconfigure_pending is None and
+				self._nav_root_reconfigure_pending is None)
 		elif (is_pressed and
 				new_press_generation != self._touch_press_generation):
+			self._clear_programmatic_nav_guard_if_settled()
 			self._touch_sequence_active = False
 			self._touch_press_edge_pending = True
 			self._begin_touch_sequence()
 			self._record_touch_point(self._touch_point_cache)
 			self._nav_finish_pending = False
 			self._nav_user_scroll_pending = bool(
-				self._nav_current is not None)
+				self._nav_current is not None and
+				self._nav_reconfigure_pending is None and
+				self._nav_root_reconfigure_pending is None)
 		elif is_pressed:
 			self._record_touch_point(self._touch_point_cache)
 		elif (not is_pressed) and was_pressed:
@@ -3199,24 +3639,36 @@ class JingWuUI:
 			self._nav_page_name(key), push_history))
 		if push_history and previous is not None:
 			self.stack.append(previous)
-		if previous is not None:
-			try:
-				previous[1].set_x(0)
-			except Exception:
-				pass
-			self._set_page_visible(previous[1], False)
-		try:
-			page.set_x(0)
-		except Exception:
-			pass
-		# A pushed child page is about to be mounted into the native pager.  Keep
-		# it hidden while it is still a root-screen child; otherwise the old root
-		# carousel and the new child can each be painted for an intermediate frame.
 		target_is_root = key in ("home", "login", "location",
 							  "root_shoulder", "root_intercom", "root_settings")
 		native_child_transition = bool(
 			push_history and previous is not None and
 			self.stack and not target_is_root)
+		if previous is not None:
+			# A page already owned by a native pager may currently be at the
+			# visible slot (normally x=LCD_WIDTH).  Moving it to x=0 before hiding
+			# it creates a transient frame and makes the next page appear to jump.
+			# The pager preparation below assigns its final slot while the viewport
+			# is hidden; standalone pages still need their normal root position.
+			if not self._nav_page_attached(previous[1]):
+				try:
+					previous[1].set_x(0)
+				except Exception:
+					pass
+			if not native_child_transition:
+				self._set_page_visible(previous[1], False)
+		# A pushed child page is about to be mounted into the native pager.  Keep
+		# it hidden while it is still a root-screen child; otherwise the old root
+		# carousel and the new child can each be painted for an intermediate frame.
+		# The native pager assigns the child's final slot atomically below.  Do not
+		# move a child to x=0 while it is still owned by the root screen: that move
+		# is visible on ports that redraw immediately and produces the characteristic
+		# right/down jump before the pager takes over.
+		if not native_child_transition:
+			try:
+				page.set_x(0)
+			except Exception:
+				pass
 		self._set_page_visible(page, not native_child_transition)
 		self.current = (key, page)
 		self._nav_trace("页面切换已生效 当前={} 历史层数={}".format(
@@ -3234,11 +3686,12 @@ class JingWuUI:
 		# in the same native two-slot pager when they are part of the root
 		# carousel.  Login remains a standalone full-screen page.
 		if native_child_transition:
-			if not self._nav_prepare(self.current, self.stack[-1]):
-				self._nav_teardown()
-				# Preserve the non-pager fallback if native preparation is not
-				# supported on a particular LVGL build.
-				self._set_page_visible(page, True)
+			if not self._nav_prepare(self.current, self.stack[-1],
+								 animate_to_current=True):
+				# Native paging is required by the UI contract.  Leave the page in its
+				# existing composition and report the failure; do not run a competing
+				# Python move/visibility fallback that can flash or reparent mid-frame.
+				self._nav_trace("原生分页准备失败，保留当前LVGL组合")
 		elif not push_history and self._nav_current is not None:
 			self._nav_teardown()
 		if self._poc_client is not None:
@@ -3340,59 +3793,30 @@ class JingWuUI:
 			lv.PART.MAIN)
 		return label
 	def _bind_native_scroll_guard(self, content, scroll_content=None):
-		def snap_vertical_position():
-			"""Clamp and row-align a vertical menu after LVGL momentum ends."""
-			if scroll_content is None:
-				return
-			try:
-				current_y = int(content.get_scroll_y())
-			except Exception:
-				try:
-					current_y = int(lv.obj_get_scroll_y(content))
-				except Exception:
-					return
-			try:
-				viewport_h = int(content.get_height())
-			except Exception:
-				viewport_h = MENU_VIEWPORT_HEIGHT
-			try:
-				content_h = int(scroll_content.get_height())
-			except Exception:
-				content_h = viewport_h
-			max_y = max(0, content_h - viewport_h)
-			# Rows are laid out at y=6 with a fixed 66-pixel pitch.  Keep 0 as
-			# the top boundary, then choose the nearest row start; do not choose
-			# a non-aligned max_y so the last row remains complete.
-			targets = [0]
-			row_offset = MENU_ROW_STEP
-			while row_offset <= max_y:
-				targets.append(row_offset)
-				row_offset += MENU_ROW_STEP
-			if max_y == 0:
-				target = 0
-			else:
-				bounded_y = max(0, min(max_y, current_y))
-				target = min(targets, key=lambda value: abs(value - bounded_y))
-			try:
-				content.scroll_to_y(int(target), lv.ANIM.OFF)
-			except Exception:
-				try:
-					lv.obj_scroll_to_y(content, int(target), lv.ANIM.OFF)
-				except Exception:
-					pass
 		def _native_on_scroll(*args):
 			self._menu_scroll_active = True
 			self._last_menu_scroll_ms = utime.ticks_ms()
 			self._pending_scroll_redraw = None
 			# A native scroll event is definitive evidence of movement.  Mark the
-			# sequence immediately, even if LVGL has not yet emitted PRESSED for
-			# the row, so fast drags cannot be reclassified as clicks.
-			self._mark_touch_sequence_swipe()
+			# sequence immediately when a real touch is active, even if LVGL has
+			# not yet emitted PRESSED for the row, so fast drags cannot be
+			# reclassified as clicks.  Programmatic scroll/initial layout events
+			# must not poison the next stationary tap's sequence state.
+			if self._touch_pressed or self._touch_sequence_active:
+				self._mark_touch_sequence_swipe()
 		def _native_on_scroll_end(*args):
 			self._menu_scroll_active = False
-			snap_vertical_position()
 			now = utime.ticks_ms()
 			self._last_menu_scroll_ms = now
+			# The instant correction below can itself emit SCROLL_END on some
+			# QuecPython builds.  Do not schedule a second correction in that case.
+			if scroll_content is not None and not self._menu_snap_in_progress:
+				try:
+					deadline = utime.ticks_add(now, 20)
+				except Exception:
+					deadline = now + 20
+				self._pending_menu_snap = (
+					content, scroll_content, self.current, deadline)
 			try:
 				deadline = utime.ticks_add(now, 20)
 			except Exception:
@@ -3416,6 +3840,110 @@ class JingWuUI:
 				content.add_event_cb(_native_on_scroll_end, scroll_end, None)
 			except Exception:
 				pass
+	def _menu_snap_target(self, viewport, scroll_content):
+		"""Return the nearest row-aligned scroll offset inside native bounds.
+
+		Rows are laid out from a 6-pixel inset at a fixed 66-pixel pitch.  The
+		content heights are deliberately constructed so the last complete three-row
+		window is reachable; flooring the last partial pitch preserves that inset
+		instead of exposing a half-row at the bottom.
+		"""
+		try:
+			current_y = int(viewport.get_scroll_y())
+		except Exception:
+			try:
+				current_y = int(lv.obj_get_scroll_y(viewport))
+			except Exception:
+				return None
+		try:
+			viewport_h = int(viewport.get_height())
+		except Exception:
+			viewport_h = MENU_VIEWPORT_HEIGHT
+		try:
+			content_h = int(scroll_content.get_height())
+		except Exception:
+			content_h = viewport_h
+		max_y = max(0, content_h - viewport_h)
+		if max_y <= 0:
+			return 0
+		bounded = max(0, min(max_y, current_y))
+		step = max(1, int(MENU_ROW_STEP))
+		# Round to the nearest row.  The last complete three-row window can have
+		# a residual top inset (6 px), so always include max_y as an explicit
+		# endpoint candidate; otherwise the final row would be clipped by that
+		# inset on menus whose rows start at y=6.
+		lower = (bounded // step) * step
+		upper = min(max_y, lower + step)
+		target = lower if (bounded - lower) <= (upper - bounded) else upper
+		if abs(max_y - bounded) < abs(target - bounded):
+			target = max_y
+		return max(0, min(max_y, int(target)))
+	def _process_pending_menu_snap(self):
+		pending = self._pending_menu_snap
+		if pending is None:
+			return
+		viewport, scroll_content, page, deadline = pending
+		if (self.current is None or page is None or
+				not self._nav_obj_same(page[1], self.current[1])):
+			self._pending_menu_snap = None
+			return
+		try:
+			if utime.ticks_diff(utime.ticks_ms(), deadline) < 0:
+				return
+		except Exception:
+			if utime.ticks_ms() < deadline:
+				return
+		if (self._touch_pressed or self._native_nav_transition_active() or
+				self._screen_sleeping or self._pending_display_wake or
+				self._is_audio_priority_active()):
+			return
+		self._pending_menu_snap = None
+		target = self._menu_snap_target(viewport, scroll_content)
+		if target is None:
+			return
+		try:
+			current_y = int(viewport.get_scroll_y())
+		except Exception:
+			current_y = target
+		if abs(current_y - target) <= 0:
+			return
+		self._menu_snap_in_progress = True
+		try:
+			try:
+				viewport.scroll_to_y(int(target), lv.ANIM.OFF)
+			except Exception:
+				lv.obj_scroll_to_y(viewport, int(target), lv.ANIM.OFF)
+		finally:
+			self._menu_snap_in_progress = False
+		self._menu_scroll_active = False
+		self._last_menu_scroll_ms = utime.ticks_ms()
+	def _menu_content_height(self, row_count, first_y=0):
+		"""Return a height whose final snap shows the last three rows.
+
+		The viewport is 196px high while a row starts every 66px.  The
+		content must therefore include the viewport itself plus the offset of
+		the first row in the final three-row window.  Using only the last row's
+		bottom edge is 6px short when rows start at y=0 (the settings page),
+		which clips the final row after the native snap.  Menus whose rows start
+		at y=6 naturally have that inset in their last-row bottom edge; the same
+		formula handles both layouts.
+		"""
+		try:
+			count = max(0, int(row_count))
+			first = max(0, int(first_y))
+		except Exception:
+			count, first = 0, 0
+		if count <= 0:
+			return MENU_VIEWPORT_HEIGHT
+		if count <= MENU_VISIBLE_ROWS:
+			total_end = first + (count - 1) * MENU_ROW_STEP + SETTINGS_ROW_HEIGHT
+			return max(MENU_VIEWPORT_HEIGHT, total_end)
+		last_end = first + (count - 1) * MENU_ROW_STEP + SETTINGS_ROW_HEIGHT
+		# Compensate for the viewport's fixed 6px bottom fill when the first row
+		# starts at y=0.  For y=6 the compensation is zero because the inset is
+		# already included in ``last_end``.
+		inset_compensation = max(0, MENU_VIEWPORT_TOP_INSET - first)
+		return max(MENU_VIEWPORT_HEIGHT, last_end + inset_compensation)
 	def _vertical_scroll_area(self, page, y, height):
 		viewport = lv.obj(page)
 		# Use a fixed three-row viewport for every vertical menu.  Extra content
@@ -3456,6 +3984,17 @@ class JingWuUI:
 			viewport.add_flag(lv.obj.FLAG.SCROLL_MOMENTUM)
 		except Exception:
 			pass
+		try:
+			# Keep list inertia in LVGL.  This is intentionally configured on the
+			# viewport, not on the CST816D driver, so it participates in native
+			# scroll/snap handling.
+			viewport.set_scroll_throw(SETTINGS_SCROLL_THROW)
+		except Exception:
+			pass
+		try:
+			viewport.set_scroll_limit(SETTINGS_SCROLL_LIMIT)
+		except Exception:
+			pass
 		for state in (lv.STATE.DEFAULT, lv.STATE.PRESSED,
 					  lv.STATE.FOCUSED, lv.STATE.CHECKED):
 			viewport.set_style_bg_opa(255, lv.PART.MAIN | state)
@@ -3483,6 +4022,13 @@ class JingWuUI:
 			content.set_style_outline_width(0, lv.PART.MAIN | state)
 			content.set_style_shadow_width(0, lv.PART.MAIN | state)
 			content.set_style_radius(0, lv.PART.MAIN | state)
+			try:
+				content.set_style_pad_all(0, lv.PART.MAIN | state)
+			except Exception:
+				content.set_style_pad_top(0, lv.PART.MAIN | state)
+				content.set_style_pad_bottom(0, lv.PART.MAIN | state)
+				content.set_style_pad_left(0, lv.PART.MAIN | state)
+				content.set_style_pad_right(0, lv.PART.MAIN | state)
 		# The viewport owns vertical gesture dispatch.  Binding the parent page
 		# as well caused both handlers to consume the same touch sequence and
 		# produced occasional row overlap/ghost press states on the settings
@@ -3824,7 +4370,8 @@ class JingWuUI:
 				preferred_matches = preferred_obj is obj
 				if not preferred_matches and preferred_obj is not None:
 					try:
-						preferred_matches = preferred_obj.get_parent() is obj
+						preferred_matches = self._nav_obj_same(
+							preferred_obj.get_parent(), obj)
 					except Exception:
 						preferred_matches = False
 				if preferred_matches:
@@ -3859,7 +4406,8 @@ class JingWuUI:
 			return True
 		if preferred_obj is not None:
 			for page, obj, callback in self._click_targets:
-				if page is current_page and obj is preferred_obj:
+				if (self._nav_obj_same(page, current_page) and
+						self._nav_obj_same(obj, preferred_obj)):
 					self._click_trace("命中回调 页面={} 方式=LVGL对象".format(
 						self._nav_page_name()))
 					try:
@@ -3874,7 +4422,7 @@ class JingWuUI:
 			return False
 		x, y = point
 		for page, obj, callback in self._click_targets:
-			if page is not current_page:
+			if not self._nav_obj_same(page, current_page):
 				continue
 			area = self._get_obj_area(obj)
 			if area is None:
@@ -4812,9 +5360,7 @@ class JingWuUI:
 		for key, radio in self._group_rows.items():
 			if key not in active_keys:
 				self._set_radio_row_layout(radio, visible=False)
-		content_height = max(
-			PAGE_HEIGHT,
-			6 + row_index * (SETTINGS_ROW_HEIGHT + SETTINGS_ROW_GAP))
+		content_height = self._menu_content_height(row_index, 6)
 		try:
 			self._group_content.set_height(content_height)
 		except Exception:
@@ -4871,9 +5417,7 @@ class JingWuUI:
 		for key, radio in self._single_rows.items():
 			if key not in active_keys:
 				self._set_radio_row_layout(radio, visible=False)
-		content_height = max(
-			PAGE_HEIGHT,
-			6 + index * (SETTINGS_ROW_HEIGHT + SETTINGS_ROW_GAP))
+		content_height = self._menu_content_height(index, 6)
 		try:
 			self._single_content.set_height(content_height)
 		except Exception:
@@ -5131,9 +5675,7 @@ class JingWuUI:
 					page, content, y, item[0], item[1],
 					lambda obj, cb=item[2]: cb())
 			try:
-				content.set_height(max(
-					PAGE_HEIGHT,
-					len(items) * (SETTINGS_ROW_HEIGHT + SETTINGS_ROW_GAP)))
+				content.set_height(self._menu_content_height(len(items), 0))
 			except Exception:
 				pass
 		self._load("settings", page)
@@ -5641,10 +6183,8 @@ class JingWuUI:
 					self.select_sleep_timeout, self._sleep_rows,
 					owner_page=page)
 			try:
-				content.set_height(max(
-					PAGE_HEIGHT,
-					6 + len(SLEEP_OPTIONS) *
-					(SETTINGS_ROW_HEIGHT + SETTINGS_ROW_GAP)))
+				content.set_height(self._menu_content_height(
+					len(SLEEP_OPTIONS), 6))
 			except Exception:
 				pass
 		else:
@@ -5836,7 +6376,24 @@ class JingWuUI:
 		self._status_refresh_pending = False
 	def _native_nav_transition_active(self):
 		return bool(self._nav_current is not None and
-					self._nav_finish_pending)
+					(self._nav_finish_pending or
+					 self._nav_reconfigure_pending is not None or
+					 self._nav_root_reconfigure_pending is not None or
+					 self._nav_programmatic_settle_pending))
+	def _clear_programmatic_nav_guard_if_settled(self):
+		"""Clear only a stale no-op animation guard at a native rest position."""
+		if not self._nav_programmatic_settle_pending or self._nav_pager is None:
+			return
+		try:
+			x = int(self._nav_pager.get_scroll_x())
+			center = (self._nav_root_center_x if self._nav_root_mode else
+					  (LCD_WIDTH if self._nav_target_on_left else 0))
+		except Exception:
+			return
+		if abs(x - center) <= 2:
+			self._nav_programmatic_settle_pending = False
+			self._nav_programmatic_settle_deadline = None
+			self._nav_user_scroll_pending = False
 	def _ui_interaction_active(self):
 		if (self._touch_pressed or self._native_nav_transition_active() or
 				self._menu_scroll_active):
@@ -6272,6 +6829,7 @@ class JingWuUI:
 						self._process_native_nav()
 					if not touch_fast_path:
 						self._process_deferred_status_refresh()
+						self._process_pending_menu_snap()
 						self._process_pending_scroll_redraw()
 				self._perf_add(2, utime.ticks_diff(utime.ticks_ms(), stage))
 				flush_before = FLUSH_PERF[0]

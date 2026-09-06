@@ -36,8 +36,14 @@ POC_RTP_JITTER_PACKETS = 5
 AB_ENABLE_NETWORK_MONITOR = True
 AB_ENABLE_RTP_AUDIO = True
 AB_ENABLE_POC_TCP = True
+# Independent A/B switch for the TCP outbound/control worker.  Keep the
+# receive/control path enabled for normal operation; disable only for a short
+# touch-performance experiment because TCP login/PTT/retry handling pauses.
 AB_ENABLE_POC_TCP_TX = True
 AB_ENABLE_HARDWARE_KEYS = True
+# The watchdog callback runs periodically; keep its old marker available for
+# board bring-up without adding unsolicited UART output in normal runs.
+WATCHDOG_DEBUG_LOG_ENABLED = False
 
 POC_TCP_HOST = "125.124.233.231"
 POC_HTTP_URL = (
@@ -104,7 +110,8 @@ def mount_external_flash():
             return False
         
 def feed(t):
-    print("11")
+    if WATCHDOG_DEBUG_LOG_ENABLED:
+        print("11")
     wdt.feed()
 
 # 设备启动入口：先打开外设 3.3V，再创建横屏界面并进入 LVGL 事件循环。
@@ -112,7 +119,6 @@ if __name__ == "__main__":
     print("网络监控线程={},RTP音频线程={},POC/TCP线程={},TCP发送控制线程={},物理按键线程={}".format(
         AB_ENABLE_NETWORK_MONITOR, AB_ENABLE_RTP_AUDIO, AB_ENABLE_POC_TCP,
         AB_ENABLE_POC_TCP_TX, AB_ENABLE_HARDWARE_KEYS))
-
     # LCD 供电恢复前先关闭背光，避免 ST7789 尚未刷新时显示历史 GRAM 内容。
     lcd_touch.prepare_backlight_off()
     #EN_3V3 = Pin(Pin.GPIO12, Pin.OUT, Pin.PULL_DISABLE, 1)

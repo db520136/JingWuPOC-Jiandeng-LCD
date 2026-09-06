@@ -42,10 +42,15 @@ NETWORK_RETRY_INTERVAL_MS = 5000
 # is retained only as a compatibility fallback when a firmware does not
 # expose a recognizable status shape.
 NETWORK_DIRECT_STATUS = True
-# During an active touch/scroll, signal and other proactive network work may
-# be deferred for a bounded period.  The bound prevents a continuously held
-# finger from starving network state refresh forever.
-UI_INTERACTION_DEFER_MAX_MS = 30000
+# During an active touch/scroll, signal and readiness probes are deferred until
+# the LCD explicitly reports release.  A timer escape would wake this worker
+# during a long drag and reintroduce the interpreter stalls being measured.
+UI_INTERACTION_DEFER_MAX_MS = None
+# Raw modem signal tuples are useful when bringing up a new firmware, but
+# formatting them on every refresh adds console/interpreter work.  Keep the
+# diagnostic print available behind an explicit switch and leave it off by
+# default for performance measurements.
+NETWORK_SIGNAL_DEBUG_ENABLED = False
 _DEFAULT_MONITOR = None
 
 # 返回给界面的固定等级名称，颜色由 lcd_touch.py 根据等级决定。
@@ -158,8 +163,8 @@ class NetworkMonitor:
 
         This only changes a flag; it never acquires the monitor lock and never
         interrupts an in-progress modem operation.  The worker checks the flag
-        before starting the next signal read and automatically resumes after
-        ``UI_INTERACTION_DEFER_MAX_MS``.
+        before starting the next signal read and resumes when the LCD reports
+        that the interaction has ended.
         """
         active = bool(active)
         if active == self._ui_interaction_active:
@@ -169,14 +174,7 @@ class NetworkMonitor:
             utime.ticks_ms() if active else None)
 
     def _ui_interaction_deferred(self, now_ms=None):
-        if not self._ui_interaction_active:
-            return False
-        started = self._ui_interaction_started_ms
-        if started is None:
-            return False
-        if now_ms is None:
-            now_ms = utime.ticks_ms()
-        return _ticks_diff(now_ms, started) < UI_INTERACTION_DEFER_MAX_MS
+        return bool(self._ui_interaction_active)
 
     def start_network_worker(self):
         """启动唯一网络检测线程；重复调用不会创建多个线程。"""
@@ -213,11 +211,10 @@ class NetworkMonitor:
                 # steal the interpreter for tens/hundreds of milliseconds.
                 # Defer the *whole* probe (not just signal sampling) until
                 # the interaction ends.  The cached state remains valid for
-                # the bounded 30-second interaction window.
+                # the duration of the interaction window.
                 if self._ui_interaction_deferred(now_ms):
-                    # Use a coarse one-second checkpoint rather than a
-                    # 100-ms polling loop.  This preserves the 30-second
-                    # starvation bound while keeping scheduler wakeups rare.
+                # Park until the LCD clears the interaction flag.  This avoids
+                # repeatedly scheduling the monitor during a long gesture.
                     utime.sleep_ms(1000)
                     self._perf_add(self._perf_worker,
                                    _ticks_diff(utime.ticks_ms(),
@@ -358,7 +355,8 @@ class NetworkMonitor:
             return None
         try:
             value = net.getSignal()
-            print("信号值=", value)
+            if NETWORK_SIGNAL_DEBUG_ENABLED:
+                print("信号值=", value)
             # EC800M返回：
             # ([rssi, bitErrorRate, rscp, ecno],
             #  [rssi, rsrp, rsrq, cqi, sinr])。

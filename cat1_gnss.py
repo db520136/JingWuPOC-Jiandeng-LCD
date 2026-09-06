@@ -12,6 +12,9 @@ except Exception:
 
 GNSS_READ_SIZE = 4096
 GNSS_MAX_PAYLOAD_SIZE = 255
+# Keep bring-up markers in the source, but do not emit them during normal
+# operation.  Enable temporarily when diagnosing GNSS read sequencing.
+GNSS_DEBUG_MARKERS_ENABLED = False
 
 
 class CAT1_GNSS:
@@ -121,7 +124,8 @@ class CAT1_GNSS:
         """读取并打印定位结果；成功返回ASCII GGA，失败返回空字节。"""
         self.last_gga = b""
         self.last_success = False
-        print("run111111111")
+        if GNSS_DEBUG_MARKERS_ENABLED:
+            print("run111111111")
         if not self.initialize():
             print("[GNSS] 定位信息：无")
             print("[GNSS] 定位结果：定位失败")
@@ -138,7 +142,8 @@ class CAT1_GNSS:
             raw = self._read_bytes(quecgnss.read(self.read_size))
             text = raw.decode("ascii").strip("\x00") if raw else ""
             gga = self._find_last_gga(text)
-            print("***************88111***********")
+            if GNSS_DEBUG_MARKERS_ENABLED:
+                print("***************88111***********")
             if self.test_a == 1:
                 #gga = "$GNGGA,100601.00,2758.75564,N,12044.39540,E,1,05,2.21,172.9,M,,M,,*58"
                 self.test_a = 0
