@@ -76,8 +76,11 @@ class NavigationTestApp:
             self.nav_host.set_scroll_chain(lv.DIR.NONE)
         except Exception:
             pass
-        # 根槽位允许向右进入第一个子层；子槽位允许左右在相邻层之间移动。
-        root_tile = self.nav_host.add_tile(0, 0, lv.DIR.RIGHT)
+        # 禁止越界时的横向弹性回弹。有效方向仍由每个 tile 的 dir 控制。
+        self._disable_horizontal_elastic(self.nav_host)
+        # 根槽位不接受用户横向拖动；一级页面由内部 root_content 独立处理。
+        # 子槽位通过 DIR.LEFT 提供向右返回根页面的路径。
+        root_tile = self.nav_host.add_tile(0, 0, lv.DIR.NONE)
         self.nav_tiles[0] = root_tile
         self.root_content = lv.tileview(root_tile)
         self.root_content.set_size(self.width, self.height)
@@ -87,8 +90,17 @@ class NavigationTestApp:
             self.root_content.set_scroll_chain(lv.DIR.NONE)
         except Exception:
             pass
+        self._disable_horizontal_elastic(self.root_content)
         for index, name in enumerate(ROOT_NAMES):
-            tile = self.root_content.add_tile(index, 0, lv.DIR.LEFT | lv.DIR.RIGHT)
+            # tileview 的 dir 表示该 tile 可前往的方向：
+            # 第一个只允许向右（手指左滑进入下一页），最后一个只允许向左。
+            if index == 0:
+                tile_dir = lv.DIR.RIGHT
+            elif index == len(ROOT_NAMES) - 1:
+                tile_dir = lv.DIR.LEFT
+            else:
+                tile_dir = lv.DIR.LEFT | lv.DIR.RIGHT
+            tile = self.root_content.add_tile(index, 0, tile_dir)
             # 页面在创建时直接属于对应 tile，运行期间不再重挂载。
             self.root_pages[name] = self.pages.root(
                 name, ROOT_TITLES[index], parent=tile)
@@ -97,6 +109,16 @@ class NavigationTestApp:
         self.root_view = 0
         lv.scr_load(self.root_screen)
         self.root_screen.invalidate()
+
+    @staticmethod
+    def _disable_horizontal_elastic(obj):
+        """关闭 tileview 边界横向弹性，避免无效方向出现晃动回弹。"""
+        try:
+            obj.clear_flag(lv.obj.FLAG.SCROLL_ELASTIC)
+        except Exception:
+            # 某些 QuecPython LVGL 版本没有导出该 flag；tile 的方向限制
+            # 仍然生效，因此不阻断启动。
+            pass
 
     def _begin_touch_session(self):
         self.touch_start_point = tuple(self.touch.point)
@@ -192,10 +214,12 @@ class NavigationTestApp:
 
     def _make_child_tile(self, depth, page_info):
         self._remove_route_tiles_from(depth)
-        tile = self.nav_host.add_tile(depth, 0, lv.DIR.LEFT | lv.DIR.RIGHT)
+        # 子页面只允许手指向右返回上一级；向左不会产生任何位移。
+        tile = self.nav_host.add_tile(depth, 0, lv.DIR.LEFT)
         self.nav_tiles[depth] = tile
         self.child_screen = tile
         self.pages.child(page_info[0], page_info[2], parent=tile)
+        self._disable_horizontal_elastic(tile)
         return tile
 
     def _show_child(self, page_info, direction="forward"):
