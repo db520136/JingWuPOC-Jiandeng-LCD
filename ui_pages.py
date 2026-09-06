@@ -45,6 +45,7 @@ def _button(parent, text, x, y, w=260, h=48, callback=None, host=None):
 class PageFactory:
     def __init__(self, app):
         self.app = app
+        self._root_state_labels = {}
 
     def root(self, name, title, parent=None):
         page = lv.obj(parent if parent is not None else self.app.root_content)
@@ -58,6 +59,9 @@ class PageFactory:
         page.set_style_bg_opa(255, lv.PART.MAIN)
         _label(page, title, 0, 22, self.app.width, 42, CYAN)
         _label(page, "一级页面：左右滑动", 0, 70, self.app.width, 30, WHITE)
+        state_label = _label(page, "业务状态准备中", 0, 96,
+                             self.app.width, 24, GREEN)
+        self._root_state_labels[name] = state_label
         if name == "location":
             _button(page, "进入定位详情", 18, 125, 260, 50,
                     lambda e: self.app.open_child("location_detail"),
@@ -76,6 +80,15 @@ class PageFactory:
                     host=self.app)
         _label(page, "点击按钮进入二级页面", 0, 205, self.app.width, 26, WHITE)
         return page
+
+    def refresh_state(self, snapshot):
+        text = "网络:{} 电量:{}%".format(
+            "在线" if snapshot["network_connected"] else "离线",
+            "--" if snapshot["battery_percent"] is None else
+            snapshot["battery_percent"])
+        for label in self._root_state_labels.values():
+            label.set_text(text)
+            label.invalidate()
 
     def child(self, name, params=None, parent=None):
         page = lv.obj(parent if parent is not None else self.app.child_screen)

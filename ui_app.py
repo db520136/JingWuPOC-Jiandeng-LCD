@@ -10,11 +10,17 @@ try:
     from usr.touch_port import TouchPort
     from usr.ui_pages import PageFactory
     from usr.ui_router import Router
+    from usr.ui_commands import UICommandClient, UICommandQueue
+    from usr.ui_messages import UIMessageBus
+    from usr.ui_state import get_default_state_store
 except Exception:
     from display_port import DisplayPort
     from touch_port import TouchPort
     from ui_pages import PageFactory
     from ui_router import Router
+    from ui_commands import UICommandClient, UICommandQueue
+    from ui_messages import UIMessageBus
+    from ui_state import get_default_state_store
 
 
 ROOT_NAMES = ("location", "shoulder", "intercom", "settings")
@@ -30,6 +36,10 @@ class NavigationTestApp:
         self.width = 296
         self.height = 240
         self.display = DisplayPort(self.width, self.height)
+        self.command_queue = UICommandQueue()
+        self.command_client = UICommandClient(self.command_queue)
+        self.state_store = get_default_state_store()
+        self.message_bus = UIMessageBus()
         # 延后 I2C/触摸对象创建，确保 LCD 与 LVGL 已先完成初始化。
         self.touch = None
         self.router = Router(self)
@@ -51,6 +61,7 @@ class NavigationTestApp:
         self.touch_horizontal_swipe = False
         self.touch_session_click_allowed = True
         self._root_session_index = 0
+        self._ui_state_revision = -1
 
     def _make_root(self):
         self.root_screen = lv.obj()
@@ -238,9 +249,18 @@ class NavigationTestApp:
                 # 保留本次会话结果到本轮 task_handler，按钮 CLICKED 回调
                 # 才能据此区分点击和滑动。
                 self._update_touch_session()
+            self._refresh_page_state()
             self.display.tick(elapsed)
             self.display.task_handler()
             utime.sleep_ms(1)
+
+    def _refresh_page_state(self):
+        changed = self.state_store.get_snapshot_if_changed()
+        if changed is None:
+            return
+        revision, snapshot = changed
+        self._ui_state_revision = revision
+        self.pages.refresh_state(snapshot)
 
 
 def main():
