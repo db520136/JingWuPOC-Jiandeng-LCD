@@ -38,8 +38,6 @@ class TouchPort:
         self.started = False
         self._indev_driver = None
         self.indev = None
-        self.poll_count = 0
-        self._last_reported_pressed = None
 
     def configure_scroll(self, throw_value=TOUCH_SCROLL_THROW,
                          limit_value=TOUCH_SCROLL_LIMIT):
@@ -118,11 +116,8 @@ class TouchPort:
                 self.pressed = True
             else:
                 self.pressed = False
-            self.poll_count += 1
-            self._last_reported_pressed = self.pressed
             return True
-        except Exception as error:
-            print("[TouchPort] 读取失败：{}".format(error))
+        except Exception:
             self.pressed = False
             return False
 

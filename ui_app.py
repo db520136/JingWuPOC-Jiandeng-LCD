@@ -27,13 +27,10 @@ ROOT_SCROLL_LIMIT = 5
 
 class NavigationTestApp:
     def __init__(self):
-        print("[NavTest] app init begin")
         self.width = 296
         self.height = 240
         self.display = DisplayPort(self.width, self.height)
-        print("[NavTest] display object ready")
-        # 延后 I2C/触摸对象创建，确保 LCD 与 LVGL 已先完成初始化；
-        # 避免在应用构造阶段卡在底层 I2C 初始化而没有任何启动信息。
+        # 延后 I2C/触摸对象创建，确保 LCD 与 LVGL 已先完成初始化。
         self.touch = None
         self.router = Router(self)
         self.pages = PageFactory(self)
@@ -47,10 +44,6 @@ class NavigationTestApp:
         self.root_pages = {}
         self.last_ms = utime.ticks_ms()
         self._last_pressed = False
-        self._touch_session_start_ms = None
-        self._touch_session_task_count = 0
-        self._touch_session_poll_count = 0
-        self._lv_task_count = 0
         self.touch_start_point = None
         self.touch_dx = 0
         self.touch_dy = 0
@@ -225,37 +218,19 @@ class NavigationTestApp:
         self.router.push(name, params={})
 
     def start(self):
-        print("[NavTest] start begin")
-        print("[NavTest] display start begin")
         self.display.start()
-        print("[NavTest] display start done")
-        print("[NavTest] touch object begin")
         self.touch = TouchPort()
-        print("[NavTest] touch object done")
-        print("[NavTest] touch start begin")
         self.touch.start()
-        print("[NavTest] touch start done")
-        throw_ok, limit_ok = self.touch.configure_scroll(
-            ROOT_SCROLL_THROW, ROOT_SCROLL_LIMIT)
-        print("[NavTest] root scroll throw={}({}) limit={}({})".format(
-            ROOT_SCROLL_THROW, "set" if throw_ok else "default",
-            ROOT_SCROLL_LIMIT, "set" if limit_ok else "default"))
-        print("[NavTest] root create begin")
+        self.touch.configure_scroll(ROOT_SCROLL_THROW, ROOT_SCROLL_LIMIT)
         self._make_root()
-        print("[NavTest] root create done")
         self.last_ms = utime.ticks_ms()
-        loop_count = 0
         while True:
-            loop_count += 1
             now = utime.ticks_ms()
             elapsed = utime.ticks_diff(now, self.last_ms)
             self.last_ms = now
             was_pressed = self.touch.pressed
             self.touch.poll()
             if self.touch.pressed and not was_pressed:
-                self._touch_session_start_ms = now
-                self._touch_session_task_count = self._lv_task_count
-                self._touch_session_poll_count = self.touch.poll_count
                 self._begin_touch_session()
             if self.touch.pressed:
                 self._update_touch_session()
@@ -265,20 +240,6 @@ class NavigationTestApp:
                 self._update_touch_session()
             self.display.tick(elapsed)
             self.display.task_handler()
-            self._lv_task_count += 1
-            if (not self.touch.pressed) and was_pressed:
-                start_ms = self._touch_session_start_ms
-                if start_ms is not None:
-                    duration_ms = max(1, utime.ticks_diff(now, start_ms))
-                    task_count = (self._lv_task_count -
-                                  self._touch_session_task_count)
-                    poll_count = (self.touch.poll_count -
-                                  self._touch_session_poll_count)
-                    lv_hz = task_count * 1000.0 / duration_ms
-                    touch_hz = poll_count * 1000.0 / duration_ms
-                    print("[NavTest] touch end duration={}ms lvgl_task={} lvgl_hz={:.1f} touch_samples={} touch_hz={:.1f}".format(
-                        duration_ms, task_count, lv_hz, poll_count, touch_hz))
-                    self._touch_session_start_ms = None
             utime.sleep_ms(1)
 
 
