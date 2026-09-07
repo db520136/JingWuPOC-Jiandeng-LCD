@@ -2,8 +2,8 @@
 """SC7A20H 加速度计驱动与双击/跌倒业务服务。
 
 SC7A20H 与 ET6312B 共用 EC800M 硬件 I2C0。底层驱动只负责寄存器和
-采样数据，``SC7A20HService`` 在独立线程中处理 GPIO 中断、双击切换和
-跌倒状态机，避免把传感器 I2C 操作塞进 LCD/LVGL 主循环。
+采样数据；当前验证入口使用 ``SC7A20HDoubleClickAdapter``，不创建加速度
+业务线程，双击寄存器读取由统一低优先级 Worker 执行。
 
 SD0 接地时默认 7 位地址为 0x18，也可以通过构造参数改为 0x19。
 """
@@ -332,6 +332,39 @@ class SC7A20H:
         return self.read_register(REG_AOI2_SRC)
 
 
+class SC7A20HDoubleClickAdapter:
+    """无业务线程的双击中断适配器。"""
+
+    def __init__(self, sensor, on_interrupt, int1_pin=25):
+        self.sensor = sensor
+        self.on_interrupt = on_interrupt
+        self.int1_pin = int1_pin
+        self.irq = None
+        self.started = False
+
+    def _on_int1(self, *args):
+        self.on_interrupt()
+
+    def start(self):
+        if self.started:
+            return True
+        self.sensor.initialize()
+        self.sensor.set_fall_interrupts_enabled(False)
+        self.sensor.set_double_click_interrupt_enabled(True)
+        self.irq = ExtInt(
+            self.int1_pin, ExtInt.IRQ_RISING, ExtInt.PULL_DISABLE,
+            self._on_int1)
+        self.irq.enable()
+        self.started = True
+        return True
+
+    def stop(self):
+        if self.irq is not None:
+            self.irq.disable()
+        self.irq = None
+        self.started = False
+
+
 _default_sensor = None
 
 
@@ -378,7 +411,7 @@ GPIO25（物理 Pin17）接 INT1，GPIO26（物理 Pin18）接 INT2。中断回�
                  address=SC7A20H_ADDR_SDO_GND,
                  int1_pin=17, int2_pin=18,
                  sample_interval_ms=SAMPLE_INTERVAL_MS,
-                 extint_factory=None):
+                 extint_factory=None, on_double_click=None):
         self.controller = controller
         self.sensor = sensor if sensor is not None else SC7A20H(
             address=address, scale=SCALE_4G)
@@ -386,6 +419,7 @@ GPIO25（物理 Pin17）接 INT1，GPIO26（物理 Pin18）接 INT2。中断回�
         self.int2_pin_number = int2_pin
         self.sample_interval_ms = max(5, int(sample_interval_ms))
         self.extint_factory = extint_factory if extint_factory is not None else ExtInt
+        self.on_double_click = on_double_click
         self._running = False
         self._thread_started = False
         self._int1_pending = False
@@ -619,8 +653,10 @@ GPIO25（物理 Pin17）接 INT1，GPIO26（物理 Pin18）接 INT2。中断回�
                             self._ticks_diff(now_ms, self._last_double_click_ms) >=
                             self.DOUBLE_CLICK_GUARD_MS):
                         self._last_double_click_ms = now_ms
-                        mode = self.controller.cycle_mode()
-                        print("[加速度] 双击，肩灯模式切换为 {}".format(mode))
+                        if self.on_double_click is not None:
+                            self.on_double_click()
+                        else:
+                            self.controller.cycle_mode()
             if int2:
                 aoi1_source = self.sensor.read_aoi1_source()
                 aoi2_source = self.sensor.read_aoi2_source()

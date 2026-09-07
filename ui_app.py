@@ -29,17 +29,41 @@ CLICK_MAX_DISTANCE_PX = 6
 PAGE_SWITCH_DISTANCE_PX = 40
 ROOT_SCROLL_THROW = 40
 ROOT_SCROLL_LIMIT = 5
+LOW_PRIORITY_POLL_INTERVAL_MS = 100
 
 
 class NavigationTestApp:
-    def __init__(self):
+    def __init__(self, battery=None, network=None, lamp=None,
+                 low_priority_worker=None, low_priority_worker_factory=None,
+                 sensor_service=None, command_queue=None,
+                 state_store=None, message_bus=None):
         self.width = 296
         self.height = 240
         self.display = DisplayPort(self.width, self.height)
-        self.command_queue = UICommandQueue()
+        self.command_queue = (command_queue if command_queue is not None
+                              else UICommandQueue())
         self.command_client = UICommandClient(self.command_queue)
-        self.state_store = get_default_state_store()
-        self.message_bus = UIMessageBus()
+        self.state_store = (state_store if state_store is not None
+                            else get_default_state_store())
+        self.message_bus = (message_bus if message_bus is not None
+                            else UIMessageBus())
+        # 业务对象由启动入口显式创建并注入；UI 不创建硬件对象，也不访问
+        # ADC、网络或 I2C。未注入 Worker 时仍可作为纯导航验证程序运行。
+        self.battery = battery
+        self.network = network
+        self.lamp = lamp
+        self.low_priority_worker = low_priority_worker
+        self.sensor_service = sensor_service
+        if (self.low_priority_worker is None and
+                low_priority_worker_factory is not None):
+            self.low_priority_worker = low_priority_worker_factory(
+                command_queue=self.command_queue,
+                state_store=self.state_store,
+                message_bus=self.message_bus,
+                battery=battery,
+                network=network,
+                lamp=lamp,
+            )
         # 延后 I2C/触摸对象创建，确保 LCD 与 LVGL 已先完成初始化。
         self.touch = None
         self.router = Router(self)
@@ -62,6 +86,7 @@ class NavigationTestApp:
         self.touch_session_click_allowed = True
         self._root_session_index = 0
         self._ui_state_revision = -1
+        self._next_worker_poll_ms = utime.ticks_ms()
 
     def _make_root(self):
         self.root_screen = lv.obj()
@@ -92,16 +117,11 @@ class NavigationTestApp:
             pass
         self._disable_horizontal_elastic(self.root_content)
         for index, name in enumerate(ROOT_NAMES):
-            # tileview 的 dir 表示该 tile 可前往的方向：
-            # 第一个只允许向右（手指左滑进入下一页），最后一个只允许向左。
-            if index == 0:
-                tile_dir = lv.DIR.RIGHT
-            elif index == len(ROOT_NAMES) - 1:
-                tile_dir = lv.DIR.LEFT
-            else:
-                tile_dir = lv.DIR.LEFT | lv.DIR.RIGHT
+            # 第一阶段仅放开 tileview 对当前触摸会话的双向处理；实际
+            # 是否能切换仍由相邻 tile 拓扑决定，首尾页面没有相邻页时
+            # 仍保持在边界。这样不引入自定义页面位移控制。
+            tile_dir = lv.DIR.LEFT | lv.DIR.RIGHT
             tile = self.root_content.add_tile(index, 0, tile_dir)
-            # 页面在创建时直接属于对应 tile，运行期间不再重挂载。
             self.root_pages[name] = self.pages.root(
                 name, ROOT_TITLES[index], parent=tile)
         self.root_content.add_event_cb(self._root_changed, lv.EVENT.VALUE_CHANGED, None)
@@ -152,10 +172,8 @@ class NavigationTestApp:
             tile = event.get_target().get_tile_act()
             index = int(tile.get_x() / self.width)
             self.root_view = index
-            # 小于页面切换阈值的水平拖动不应被吸附到另一页。
             if (self._root_session_index is not None and
-                    not self.touch_horizontal_swipe and
-                    self.touch_moved):
+                    not self.touch_horizontal_swipe and self.touch_moved):
                 try:
                     self.root_content.set_tile_id(
                         int(self._root_session_index), 0, lv.ANIM.OFF)
@@ -214,8 +232,10 @@ class NavigationTestApp:
 
     def _make_child_tile(self, depth, page_info):
         self._remove_route_tiles_from(depth)
-        # 子页面只允许手指向右返回上一级；向左不会产生任何位移。
-        tile = self.nav_host.add_tile(depth, 0, lv.DIR.LEFT)
+        # 子页面同样允许 tileview 在当前触摸会话中双向处理；当前路径
+        # 没有下一级 tile 时，向左仍没有可切换目标，页面保持不动。
+        tile = self.nav_host.add_tile(
+            depth, 0, lv.DIR.LEFT | lv.DIR.RIGHT)
         self.nav_tiles[depth] = tile
         self.child_screen = tile
         self.pages.child(page_info[0], page_info[2], parent=tile)
@@ -258,6 +278,10 @@ class NavigationTestApp:
         self.touch.start()
         self.touch.configure_scroll(ROOT_SCROLL_THROW, ROOT_SCROLL_LIMIT)
         self._make_root()
+        if self.low_priority_worker is not None:
+            self.low_priority_worker.start()
+        if self.sensor_service is not None:
+            self.sensor_service.start()
         self.last_ms = utime.ticks_ms()
         while True:
             now = utime.ticks_ms()
@@ -273,6 +297,11 @@ class NavigationTestApp:
                 # 保留本次会话结果到本轮 task_handler，按钮 CLICKED 回调
                 # 才能据此区分点击和滑动。
                 self._update_touch_session()
+            if (utime.ticks_diff(now, self._next_worker_poll_ms) >= 0 and
+                    self.low_priority_worker is not None):
+                self.low_priority_worker.request_periodic(now)
+                self._next_worker_poll_ms = utime.ticks_add(
+                    now, LOW_PRIORITY_POLL_INTERVAL_MS)
             self._refresh_page_state()
             self.display.tick(elapsed)
             self.display.task_handler()
@@ -287,5 +316,18 @@ class NavigationTestApp:
         self.pages.refresh_state(snapshot)
 
 
-def main():
-    NavigationTestApp().start()
+def main(battery=None, network=None, lamp=None,
+         low_priority_worker=None, low_priority_worker_factory=None,
+         sensor_service=None, command_queue=None, state_store=None,
+         message_bus=None):
+    NavigationTestApp(
+        battery=battery,
+        network=network,
+        lamp=lamp,
+        low_priority_worker=low_priority_worker,
+        low_priority_worker_factory=low_priority_worker_factory,
+        sensor_service=sensor_service,
+        command_queue=command_queue,
+        state_store=state_store,
+        message_bus=message_bus,
+    ).start()

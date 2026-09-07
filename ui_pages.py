@@ -3,12 +3,20 @@
 
 import lvgl as lv
 
+try:
+    from usr.font_port import (text_style_blue, text_style_green,
+                               text_style_red, text_style_white)
+except Exception:
+    from font_port import (text_style_blue, text_style_green,
+                           text_style_red, text_style_white)
+
 
 BLACK = lv.color_hex(0x000000)
 WHITE = lv.color_hex(0xFFFFFF)
 CYAN = lv.color_hex(0x00D7FF)
 GRAY = lv.color_hex(0x303840)
 GREEN = lv.color_hex(0x168A45)
+RED = lv.color_hex(0xC93434)
 
 
 def _label(parent, text, x, y, w=296, h=34, color=WHITE):
@@ -16,8 +24,18 @@ def _label(parent, text, x, y, w=296, h=34, color=WHITE):
     obj.set_pos(x, y)
     obj.set_size(w, h)
     obj.set_text(text)
-    obj.set_style_text_color(color, lv.PART.MAIN)
     obj.set_style_text_align(lv.TEXT_ALIGN.CENTER, lv.PART.MAIN)
+    if color is WHITE:
+        style = text_style_white(color)
+    elif color is GREEN:
+        style = text_style_green(color)
+    elif color is CYAN:
+        style = text_style_blue(color)
+    elif color is RED:
+        style = text_style_red(color)
+    else:
+        style = text_style_white(color)
+    obj.add_style(style, lv.PART.MAIN)
     return obj
 
 
@@ -82,10 +100,10 @@ class PageFactory:
         return page
 
     def refresh_state(self, snapshot):
-        text = "网络:{} 电量:{}%".format(
+        text = "网络:{} 电量:{}% 肩灯:{}".format(
             "在线" if snapshot["network_connected"] else "离线",
             "--" if snapshot["battery_percent"] is None else
-            snapshot["battery_percent"])
+            snapshot["battery_percent"], snapshot["lamp_mode"])
         for label in self._root_state_labels.values():
             label.set_text(text)
             label.invalidate()

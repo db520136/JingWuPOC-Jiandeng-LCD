@@ -29,6 +29,7 @@ CMD_SET_LAMP_BRIGHTNESS = "set_lamp_brightness"
 CMD_REFRESH_NETWORK = "refresh_network"
 CMD_REFRESH_GNSS = "refresh_gnss"
 CMD_DOUBLE_CLICK = "double_click"
+CMD_ACCEL_DOUBLE_CLICK_IRQ = "accel_double_click_irq"
 
 
 class UICommandQueue:
@@ -40,6 +41,8 @@ class UICommandQueue:
         self._wake = _thread.allocate_semphore(1)
         self._wake.acquire()
         self._wake_pending = False
+        self._isr_event_pending = False
+        self._isr_event = None
         self._sequence = 0
         self._items = []
 
@@ -65,6 +68,58 @@ class UICommandQueue:
             self._wake.release()
         return True
 
+    def put_coalesced(self, command_type, payload=None, priority=PRIORITY_P2):
+        """投递可合并事件；队列中已有同类事件时不重复唤醒。"""
+        self._lock.acquire()
+        try:
+            for item in self._items:
+                if item["type"] == command_type:
+                    return True
+            if len(self._items) >= self.max_length:
+                return False
+            item = {"type": str(command_type), "payload": payload,
+                    "priority": int(priority), "sequence": self._sequence}
+            self._sequence += 1
+            self._items.append(item)
+            should_wake = not self._wake_pending
+            if should_wake:
+                self._wake_pending = True
+        finally:
+            self._lock.release()
+        if should_wake:
+            self._wake.release()
+        return True
+
+    def signal_isr(self, command_type, payload=None, priority=PRIORITY_P2):
+        """ISR 安全的单类事件通知；只写标志并最多 release 一次。
+
+        中断上下文不获取 Python 锁、不创建对象、不访问硬件。Worker 被
+        唤醒后在普通线程上下文把该事件合并进有界队列。
+        """
+        if self._isr_event_pending:
+            return True
+        self._isr_event = (str(command_type), payload, int(priority))
+        self._isr_event_pending = True
+        if not self._wake_pending:
+            self._wake_pending = True
+            self._wake.release()
+        return True
+
+    def _merge_isr_event_locked(self):
+        if not self._isr_event_pending:
+            return
+        if len(self._items) < self.max_length:
+            command_type, payload, priority = self._isr_event
+            self._items.append({
+                "type": command_type,
+                "payload": payload,
+                "priority": priority,
+                "sequence": self._sequence,
+            })
+            self._sequence += 1
+        self._isr_event = None
+        self._isr_event_pending = False
+
     def wait_and_drain(self, max_items=0):
         """阻塞等待命令并一次性取出当前批次。"""
         self._wake.acquire()
@@ -87,6 +142,7 @@ class UICommandQueue:
     def drain_nowait(self, max_items=0):
         self._lock.acquire()
         try:
+            self._merge_isr_event_locked()
             if max_items is None or int(max_items) <= 0:
                 items = self._items
                 self._items = []
@@ -114,6 +170,7 @@ class UICommandQueue:
         self._wake.acquire()
         self._lock.acquire()
         try:
+            self._merge_isr_event_locked()
             self._wake_pending = False
         finally:
             self._lock.release()
