@@ -29,7 +29,6 @@ CLICK_MAX_DISTANCE_PX = 6
 PAGE_SWITCH_DISTANCE_PX = 40
 ROOT_SCROLL_THROW = 40
 ROOT_SCROLL_LIMIT = 5
-LOW_PRIORITY_POLL_INTERVAL_MS = 100
 
 
 class NavigationTestApp:
@@ -86,15 +85,33 @@ class NavigationTestApp:
         self.touch_session_click_allowed = True
         self._root_session_index = 0
         self._ui_state_revision = -1
-        self._next_worker_poll_ms = utime.ticks_ms()
+        self._ui_busy = False
+        self._release_ui_after_task = False
+
+    @staticmethod
+    def _remove_frame(obj):
+        """移除LVGL默认边框和外轮廓，不改变对象布局或滚动行为。"""
+        obj.set_style_border_width(0, lv.PART.MAIN)
+        obj.set_style_border_opa(0, lv.PART.MAIN)
+        obj.set_style_outline_width(0, lv.PART.MAIN)
+        obj.set_style_outline_opa(0, lv.PART.MAIN)
+
+    def _set_ui_busy(self, busy, reason):
+        busy = bool(busy)
+        if busy == self._ui_busy:
+            return
+        self._ui_busy = busy
+        released_periodic = self.command_queue.set_ui_busy(busy)
 
     def _make_root(self):
         self.root_screen = lv.obj()
         self.root_screen.set_size(self.width, self.height)
+        self._remove_frame(self.root_screen)
         self.root_screen.set_style_bg_color(lv.color_hex(0), lv.PART.MAIN)
         self.root_screen.set_style_bg_opa(255, lv.PART.MAIN)
         self.nav_host = lv.tileview(self.root_screen)
         self.nav_host.set_size(self.width, self.height)
+        self._remove_frame(self.nav_host)
         self.nav_host.set_scroll_dir(lv.DIR.HOR)
         self.nav_host.set_scrollbar_mode(lv.SCROLLBAR_MODE.OFF)
         try:
@@ -106,9 +123,11 @@ class NavigationTestApp:
         # 根槽位不接受用户横向拖动；一级页面由内部 root_content 独立处理。
         # 子槽位通过 DIR.LEFT 提供向右返回根页面的路径。
         root_tile = self.nav_host.add_tile(0, 0, lv.DIR.NONE)
+        self._remove_frame(root_tile)
         self.nav_tiles[0] = root_tile
         self.root_content = lv.tileview(root_tile)
         self.root_content.set_size(self.width, self.height)
+        self._remove_frame(self.root_content)
         self.root_content.set_scroll_dir(lv.DIR.HOR)
         self.root_content.set_scrollbar_mode(lv.SCROLLBAR_MODE.OFF)
         try:
@@ -122,6 +141,7 @@ class NavigationTestApp:
             # 仍保持在边界。这样不引入自定义页面位移控制。
             tile_dir = lv.DIR.LEFT | lv.DIR.RIGHT
             tile = self.root_content.add_tile(index, 0, tile_dir)
+            self._remove_frame(tile)
             self.root_pages[name] = self.pages.root(
                 name, ROOT_TITLES[index], parent=tile)
         self.root_content.add_event_cb(self._root_changed, lv.EVENT.VALUE_CHANGED, None)
@@ -141,6 +161,8 @@ class NavigationTestApp:
             pass
 
     def _begin_touch_session(self):
+        self._set_ui_busy(True, "触摸开始")
+        self._release_ui_after_task = False
         self.touch_start_point = tuple(self.touch.point)
         self.touch_dx = 0
         self.touch_dy = 0
@@ -236,6 +258,7 @@ class NavigationTestApp:
         # 没有下一级 tile 时，向左仍没有可切换目标，页面保持不动。
         tile = self.nav_host.add_tile(
             depth, 0, lv.DIR.LEFT | lv.DIR.RIGHT)
+        self._remove_frame(tile)
         self.nav_tiles[depth] = tile
         self.child_screen = tile
         self.pages.child(page_info[0], page_info[2], parent=tile)
@@ -297,14 +320,13 @@ class NavigationTestApp:
                 # 保留本次会话结果到本轮 task_handler，按钮 CLICKED 回调
                 # 才能据此区分点击和滑动。
                 self._update_touch_session()
-            if (utime.ticks_diff(now, self._next_worker_poll_ms) >= 0 and
-                    self.low_priority_worker is not None):
-                self.low_priority_worker.request_periodic(now)
-                self._next_worker_poll_ms = utime.ticks_add(
-                    now, LOW_PRIORITY_POLL_INTERVAL_MS)
+                self._release_ui_after_task = True
             self._refresh_page_state()
             self.display.tick(elapsed)
             self.display.task_handler()
+            if self._release_ui_after_task:
+                self._release_ui_after_task = False
+                self._set_ui_busy(False, "触摸/点击本轮LVGL处理完成")
             utime.sleep_ms(1)
 
     def _refresh_page_state(self):

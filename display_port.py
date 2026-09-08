@@ -120,7 +120,7 @@ class DisplayPort:
         self.display_driver = lv.disp_drv_t()
         self.display_driver.init()
         self.display_driver.draw_buf = self.draw_buffer
-        self.display_driver.flush_cb = self._flush
+        self.display_driver.flush_cb = self.lcd.lcd_write   #self._flush
         self.display_driver.hor_res = self.width
         self.display_driver.ver_res = self.height
         self.display = self.display_driver.register()

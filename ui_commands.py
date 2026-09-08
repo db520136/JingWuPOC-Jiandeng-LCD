@@ -33,7 +33,7 @@ CMD_ACCEL_DOUBLE_CLICK_IRQ = "accel_double_click_irq"
 
 
 class UICommandQueue:
-    """有界命令队列；多次唤醒请求合并为一次信号量 release。"""
+    """有界命令队列和独立事件槽；所有事件共用一次唤醒闸门。"""
 
     def __init__(self, max_length=24):
         self.max_length = max(1, int(max_length))
@@ -41,10 +41,23 @@ class UICommandQueue:
         self._wake = _thread.allocate_semphore(1)
         self._wake.acquire()
         self._wake_pending = False
-        self._isr_event_pending = False
-        self._isr_event = None
+        self._double_click_signal_count = 0
+        self._double_click_taken_count = 0
+        self._periodic_signal_count = 0
+        self._periodic_taken_count = 0
+        self._periodic_deferred = False
+        self._stop_pending = False
+        self._ui_busy = False
         self._sequence = 0
         self._items = []
+
+    def _release_once_isr(self):
+        """中断/Timer回调使用；不分配对象，最多释放一次信号量。"""
+        if self._wake_pending:
+            return False
+        self._wake_pending = True
+        self._wake.release()
+        return True
 
     def put(self, command_type, payload=None, priority=PRIORITY_P2):
         item = {
@@ -91,58 +104,104 @@ class UICommandQueue:
         return True
 
     def signal_isr(self, command_type, payload=None, priority=PRIORITY_P2):
-        """ISR 安全的单类事件通知；只写标志并最多 release 一次。
+        """兼容旧调用；当前ISR只允许投递加速度双击事件。"""
+        if command_type != CMD_ACCEL_DOUBLE_CLICK_IRQ:
+            return False
+        return self.signal_double_click_isr()
 
-        中断上下文不获取 Python 锁、不创建对象、不访问硬件。Worker 被
-        唤醒后在普通线程上下文把该事件合并进有界队列。
-        """
-        if self._isr_event_pending:
-            return True
-        self._isr_event = (str(command_type), payload, int(priority))
-        self._isr_event_pending = True
-        if not self._wake_pending:
-            self._wake_pending = True
-            self._wake.release()
+    def signal_double_click_isr(self):
+        """GPIO中断投递双击；同类事件未处理前自动合并。"""
+        self._double_click_signal_count += 1
+        self._release_once_isr()
         return True
 
-    def _merge_isr_event_locked(self):
-        if not self._isr_event_pending:
-            return
-        if len(self._items) < self.max_length:
-            command_type, payload, priority = self._isr_event
-            self._items.append({
-                "type": command_type,
-                "payload": payload,
-                "priority": priority,
-                "sequence": self._sequence,
-            })
-            self._sequence += 1
-        self._isr_event = None
-        self._isr_event_pending = False
+    def signal_periodic_isr(self):
+        """5秒Timer投递周期任务；UI忙时保留事件但不唤醒Worker。"""
+        self._periodic_signal_count += 1
+        if self._ui_busy:
+            self._periodic_deferred = True
+            return True
+        self._release_once_isr()
+        return True
+
+    def signal_stop(self):
+        """保留独立停止事件，并确保阻塞中的Worker能够退出。"""
+        self._stop_pending = True
+        self._release_once_isr()
+        return True
+
+    def set_ui_busy(self, busy):
+        """更新UI忙闲状态；转为空闲时只在有延后任务时唤醒。"""
+        busy = bool(busy)
+        should_wake = False
+        self._lock.acquire()
+        try:
+            self._ui_busy = busy
+            if (not busy and
+                    self._periodic_signal_count != self._periodic_taken_count and
+                    not self._wake_pending):
+                self._wake_pending = True
+                should_wake = True
+        finally:
+            self._lock.release()
+        if should_wake:
+            self._wake.release()
+        return should_wake
+
+    def take_events(self):
+        """Worker醒来后原子取得不同事件和普通有界队列。"""
+        self._lock.acquire()
+        try:
+            stop_pending = self._stop_pending
+            double_click_signal_count = self._double_click_signal_count
+            double_click_count = (double_click_signal_count -
+                                  self._double_click_taken_count)
+            double_click_pending = double_click_count > 0
+            periodic_signal_count = self._periodic_signal_count
+            periodic_count = (periodic_signal_count -
+                              self._periodic_taken_count)
+            periodic_pending = periodic_count > 0 and not self._ui_busy
+            periodic_deferred = self._periodic_deferred
+            self._stop_pending = False
+            if double_click_pending:
+                self._double_click_taken_count = double_click_signal_count
+            if periodic_pending:
+                self._periodic_taken_count = periodic_signal_count
+                self._periodic_deferred = False
+            items = self._items
+            self._items = []
+            self._wake_pending = False
+            items.sort(key=lambda item: (item["priority"],
+                                         item["sequence"]))
+            result = (stop_pending, double_click_pending,
+                    periodic_pending, periodic_deferred,
+                    double_click_count, periodic_count, items)
+            # An ISR/Timer may have signalled while this batch was being
+            # captured.  Keep the pending counter as the source of truth and
+            # arm one follow-up wake after releasing the queue lock.
+            follow_up = (self._stop_pending or
+                         self._double_click_signal_count !=
+                         self._double_click_taken_count or
+                         (self._periodic_signal_count !=
+                          self._periodic_taken_count and not self._ui_busy) or
+                         bool(self._items))
+            if follow_up:
+                self._wake_pending = True
+        finally:
+            self._lock.release()
+        if follow_up:
+            self._wake.release()
+        return result
 
     def wait_and_drain(self, max_items=0):
         """阻塞等待命令并一次性取出当前批次。"""
         self._wake.acquire()
-        self._lock.acquire()
-        try:
-            if max_items is None or int(max_items) <= 0:
-                items = self._items
-                self._items = []
-            else:
-                count = min(len(self._items), int(max_items))
-                items = self._items[:count]
-                self._items = self._items[count:]
-            self._wake_pending = False
-            items.sort(key=lambda item: (item["priority"],
-                                         item["sequence"]))
-            return items
-        finally:
-            self._lock.release()
+        events = self.take_events()
+        return events[6]
 
     def drain_nowait(self, max_items=0):
         self._lock.acquire()
         try:
-            self._merge_isr_event_locked()
             if max_items is None or int(max_items) <= 0:
                 items = self._items
                 self._items = []
@@ -161,19 +220,18 @@ class UICommandQueue:
     def pending_count(self):
         self._lock.acquire()
         try:
-            return len(self._items)
+            return (len(self._items) +
+                    (1 if self._double_click_signal_count !=
+                     self._double_click_taken_count else 0) +
+                    (1 if self._periodic_signal_count !=
+                     self._periodic_taken_count else 0) +
+                    (1 if self._stop_pending else 0))
         finally:
             self._lock.release()
 
     def wait(self):
-        """仅等待一次唤醒；命令内容由 ``drain_nowait`` 读取。"""
+        """仅阻塞等待一次统一唤醒。"""
         self._wake.acquire()
-        self._lock.acquire()
-        try:
-            self._merge_isr_event_locked()
-            self._wake_pending = False
-        finally:
-            self._lock.release()
 
     def wake(self):
         """唤醒等待 Worker；不添加命令，重复唤醒会合并。"""

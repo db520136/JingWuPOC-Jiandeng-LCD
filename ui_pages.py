@@ -21,6 +21,10 @@ RED = lv.color_hex(0xC93434)
 
 def _label(parent, text, x, y, w=296, h=34, color=WHITE):
     obj = lv.label(parent)
+    obj.set_style_border_width(0, lv.PART.MAIN)
+    obj.set_style_border_opa(0, lv.PART.MAIN)
+    obj.set_style_outline_width(0, lv.PART.MAIN)
+    obj.set_style_outline_opa(0, lv.PART.MAIN)
     obj.set_pos(x, y)
     obj.set_size(w, h)
     obj.set_text(text)
@@ -41,6 +45,10 @@ def _label(parent, text, x, y, w=296, h=34, color=WHITE):
 
 def _button(parent, text, x, y, w=260, h=48, callback=None, host=None):
     btn = lv.btn(parent)
+    btn.set_style_border_width(0, lv.PART.MAIN)
+    btn.set_style_border_opa(0, lv.PART.MAIN)
+    btn.set_style_outline_width(0, lv.PART.MAIN)
+    btn.set_style_outline_opa(0, lv.PART.MAIN)
     try:
         # 按钮只负责点击，不允许自身参与页面级滚动。
         btn.clear_flag(lv.obj.FLAG.SCROLLABLE)
@@ -67,6 +75,10 @@ class PageFactory:
 
     def root(self, name, title, parent=None):
         page = lv.obj(parent if parent is not None else self.app.root_content)
+        page.set_style_border_width(0, lv.PART.MAIN)
+        page.set_style_border_opa(0, lv.PART.MAIN)
+        page.set_style_outline_width(0, lv.PART.MAIN)
+        page.set_style_outline_opa(0, lv.PART.MAIN)
         page.set_size(self.app.width, self.app.height)
         try:
             # 一级页面的横向滚动只能由外层 tileview 处理。
@@ -110,6 +122,10 @@ class PageFactory:
 
     def child(self, name, params=None, parent=None):
         page = lv.obj(parent if parent is not None else self.app.child_screen)
+        page.set_style_border_width(0, lv.PART.MAIN)
+        page.set_style_border_opa(0, lv.PART.MAIN)
+        page.set_style_outline_width(0, lv.PART.MAIN)
+        page.set_style_outline_opa(0, lv.PART.MAIN)
         page.set_size(self.app.width, self.app.height)
         try:
             # 子页面本身不可横向拖动；返回动画由 Router/LVGL screen
@@ -128,6 +144,10 @@ class PageFactory:
                         ("brightness" if name == "shoulder_menu" else "device_info")),
                     host=self.app)
             viewport = lv.obj(page)
+            viewport.set_style_border_width(0, lv.PART.MAIN)
+            viewport.set_style_border_opa(0, lv.PART.MAIN)
+            viewport.set_style_outline_width(0, lv.PART.MAIN)
+            viewport.set_style_outline_opa(0, lv.PART.MAIN)
             viewport.set_pos(8, 164)
             viewport.set_size(280, 68)
             viewport.set_scroll_dir(lv.DIR.VER)
@@ -143,6 +163,10 @@ class PageFactory:
     def _add_list(page, y, count):
         for index in range(count):
             row = lv.obj(page)
+            row.set_style_border_width(0, lv.PART.MAIN)
+            row.set_style_border_opa(0, lv.PART.MAIN)
+            row.set_style_outline_width(0, lv.PART.MAIN)
+            row.set_style_outline_opa(0, lv.PART.MAIN)
             row.set_pos(18, y + index * 42)
             row.set_size(260, 34)
             row.set_style_bg_color(GRAY, lv.PART.MAIN)
