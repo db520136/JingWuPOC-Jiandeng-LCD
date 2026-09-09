@@ -28,7 +28,7 @@ except AttributeError:
 
 LCD_WIDTH = 296
 LCD_HEIGHT = 240
-DISPLAY_BUFFER_LINES = 40
+DISPLAY_BUFFER_LINES = 80
 
 I2C_BUS = I2C.I2C1
 I2C_MODE = I2C.FAST_MODE
@@ -96,11 +96,19 @@ class Display:
     def start(self):
         print("[PERFTEST] display start")
         self.lcd = LCD()
+        from machine import Pin
+
+        # 创建gpio对象
+        self.gpio1 = Pin(Pin.GPIO34, Pin.IN, Pin.PULL_DISABLE, 0)
+        
+        print("GPIO1 level:", self.gpio1.read())
+        
         self.lcd.lcd_init(
             bytearray(_INIT), LCD_WIDTH, LCD_HEIGHT, 52000, 1, 4, 0,
             _INVALID_P,
             bytearray((0, 0, 0x11, 2, 0, 120, 0, 0, 0x21, 0, 0, 0x29)),
-            bytearray((0, 0, 0x28, 2, 0, 120, 0, 0, 0x10)), None,TESel=True,TEpin=7)
+            bytearray((0, 0, 0x28, 2, 0, 120, 0, 0, 0x10)), None,TESel=True,TEPin=34)
+        print("TEpin=34")
         try:
             self.lcd.lcd_display_on()
         except Exception:
@@ -496,12 +504,15 @@ def main():
         task_max_us = max(task_max_us, task_elapsed_us)
         loop_count += 1
         sleep_begin_us = _ticks_us()
-        #utime.sleep_ms(1)
+        utime.sleep_ms(1)
         sleep_elapsed_us = utime.ticks_diff(_ticks_us(), sleep_begin_us)
         sleep_total_us += sleep_elapsed_us
         sleep_max_us = max(sleep_max_us, sleep_elapsed_us)
-        if utime.ticks_diff(_ticks_us(), run_start_us) >= 10000000:
-            break
+        #if utime.ticks_diff(_ticks_us(), run_start_us) >= 1000:#40000000:
+        #    print("GPIO1111 level:", display.gpio1.read())
+       # while 1:
+        #    utime.sleep(10)
+            #break
 
     run_end_us = _ticks_us()
     print("[性能测试] 采集结束，开始输出汇总")

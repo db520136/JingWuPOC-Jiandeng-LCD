@@ -100,7 +100,8 @@ class DisplayPort:
             _INIT_P, self.width, self.height, 52000, 1, 4, 0,
             _INVALID_P, bytearray((0, 0, 0x11, 2, 0, 120, 0, 0, 0x21,
                                    0, 0, 0x29)),
-            bytearray((0, 0, 0x28, 2, 0, 120, 0, 0, 0x10)), None)
+            bytearray((0, 0, 0x28, 2, 0, 120, 0, 0, 0x10)), None,TESel=True,TEPin=34)
+        print("goto TE")
         try:
             self.lcd.lcd_display_on()
         except Exception:

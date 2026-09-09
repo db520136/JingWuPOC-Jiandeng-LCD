@@ -44,6 +44,7 @@ AB_ENABLE_HARDWARE_KEYS = True
 # The watchdog callback runs periodically; keep its old marker available for
 # board bring-up without adding unsolicited UART output in normal runs.
 WATCHDOG_DEBUG_LOG_ENABLED = False
+'''公网'''
 '''
 POC_TCP_HOST = "125.124.233.231"
 POC_HTTP_URL = (
@@ -55,6 +56,7 @@ POC_LOCATION_ADDRESS_URL = (
     "http://125.124.233.231:18081/map/poi/selection?"
     "longitude={lon}&latitude={lat}")
 '''
+'''专网'''
 POC_TCP_HOST = "68.95.0.31"
 POC_HTTP_URL = (
     "http://68.95.0.31:38080/biz/deviceInfo/data?deviceId=" + DEVICE_ID)

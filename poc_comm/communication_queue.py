@@ -1,0 +1,175 @@
+# -*- coding: utf-8 -*-
+"""通信发送线程使用的有界优先级命令队列。
+
+队列只保存控制命令。RTP_AUDIO_FRAME 是高频实时流，不进入这里，发送线程
+应直接从音频缓冲获取并发送。该模块不访问 socket、UI 或任何硬件。
+"""
+
+import _thread
+
+try:
+    from usr.comm_commands import (BOUNDED_QUEUE_COMMANDS,
+                                   COALESCIBLE_COMMANDS,
+                                   NON_DROPPABLE_COMMANDS,
+                                   command_priority)
+except ImportError:
+    from comm_commands import (BOUNDED_QUEUE_COMMANDS,
+                               COALESCIBLE_COMMANDS,
+                               NON_DROPPABLE_COMMANDS,
+                               command_priority)
+
+
+class CommunicationCommandQueue:
+    """单消费者通信命令队列，使用一个 wake gate 避免重复 release。"""
+
+    def __init__(self, max_length=32):
+        self.max_length = max(1, int(max_length))
+        self._lock = _thread.allocate_lock()
+        self._wake = _thread.allocate_semphore(1)
+        # QuecPython semaphore 初始计数通常为 1；清掉初始令牌，使 wait
+        # 真正进入阻塞状态。若固件初始就是 0，第一次 acquire 会阻塞，
+        # 因此采用 getCnt() 读取初始计数后只清除已有令牌。
+        try:
+            count = self._wake.getCnt()
+            initial = count[1] if isinstance(count, (tuple, list)) else count
+            for _ in range(int(initial or 0)):
+                self._wake.acquire()
+        except Exception:
+            try:
+                # 兼容没有 getCnt() 的固件：项目中使用的 semaphore 初始
+                # 令牌为 1，此处清除一次；若本来就是 0，异常不会改变它。
+                self._wake.acquire()
+            except Exception:
+                pass
+        self._wake_pending = False
+        self._stop_pending = False
+        self._sequence = 0
+        self._items = []
+
+    def _release_wake(self):
+        if self._wake_pending:
+            return False
+        self._wake_pending = True
+        try:
+            self._wake.release()
+            return True
+        except Exception:
+            self._wake_pending = False
+            return False
+
+    def submit(self, command_type, payload=None, priority=None):
+        """投递一个命令。
+
+        P0/P1 或标记为不可丢弃的命令在队列满时返回 False；P2/P3 命令
+        允许淘汰一个最低优先级旧项。可合并命令已有同类项时只返回 True。
+        """
+        if command_type not in BOUNDED_QUEUE_COMMANDS:
+            return False
+        if priority is None:
+            priority = command_priority(command_type)
+        priority = int(priority)
+        should_wake = False
+        accepted = False
+        self._lock.acquire()
+        try:
+            if command_type in COALESCIBLE_COMMANDS:
+                for item in self._items:
+                    if item["type"] == command_type:
+                        return True
+            if len(self._items) >= self.max_length:
+                if command_type in NON_DROPPABLE_COMMANDS:
+                    return False
+                lowest_index = 0
+                lowest_key = (self._items[0]["priority"],
+                              self._items[0]["sequence"])
+                for index in range(1, len(self._items)):
+                    item = self._items[index]
+                    key = (item["priority"], item["sequence"])
+                    if key > lowest_key:
+                        lowest_index = index
+                        lowest_key = key
+                if lowest_key[0] < priority:
+                    return False
+                self._items.pop(lowest_index)
+            self._items.append({
+                "type": command_type,
+                "payload": payload,
+                "priority": priority,
+                "sequence": self._sequence,
+            })
+            self._sequence += 1
+            accepted = True
+            if not self._wake_pending:
+                self._wake_pending = True
+                should_wake = True
+        finally:
+            self._lock.release()
+        if should_wake:
+            try:
+                self._wake.release()
+            except Exception:
+                self._lock.acquire()
+                try:
+                    self._wake_pending = False
+                finally:
+                    self._lock.release()
+                return False
+        return accepted
+
+    def signal_stop(self):
+        """记录独立停止事件，保证空闲阻塞线程可以退出。"""
+        should_wake = False
+        self._lock.acquire()
+        try:
+            self._stop_pending = True
+            if not self._wake_pending:
+                self._wake_pending = True
+                should_wake = True
+        finally:
+            self._lock.release()
+        if should_wake:
+            self._wake.release()
+        return True
+
+    def wait(self):
+        """阻塞等待一次或多次命令/停止事件。"""
+        self._wake.acquire()
+
+    def take_batch(self):
+        """原子取得当前批次，返回 ``(stop_pending, items)``。"""
+        self._lock.acquire()
+        try:
+            stop_pending = self._stop_pending
+            self._stop_pending = False
+            items = self._items
+            self._items = []
+            self._wake_pending = False
+            items.sort(key=lambda item: (item["priority"],
+                                         item["sequence"]))
+            follow_up = bool(self._stop_pending or self._items)
+            if follow_up:
+                self._wake_pending = True
+        finally:
+            self._lock.release()
+        if follow_up:
+            self._wake.release()
+        return stop_pending, items
+
+    def take_batch_nowait(self):
+        """音频实时循环使用：有唤醒令牌时取走一批，否则返回空批次。"""
+        self._lock.acquire()
+        try:
+            pending = self._wake_pending
+        finally:
+            self._lock.release()
+        if not pending:
+            return False, []
+        self._wake.acquire()
+        return self.take_batch()
+
+    def pending_count(self):
+        self._lock.acquire()
+        try:
+            return len(self._items) + (1 if self._stop_pending else 0)
+        finally:
+            self._lock.release()

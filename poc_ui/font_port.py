@@ -20,8 +20,9 @@ def mount_external_flash():
     if _mounted:
         return True
     try:
-        device = uos.VfsLfs1(32, 32, 32, "ext_fs", 0, 2)
+        device = uos.VfsLfs1(32, 32, 32, "ext_fs", 0, 3)
         uos.mount(device, "/ext")
+        print("挂载外置 Flash 成功")
     except Exception:
         # 软重启时可能已经挂载；目录可读即可继续使用。
         uos.listdir("/ext")
