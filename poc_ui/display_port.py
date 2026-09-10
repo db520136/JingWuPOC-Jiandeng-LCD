@@ -11,6 +11,8 @@ from machine import LCD
 LCD_WIDTH = 296
 LCD_HEIGHT = 240
 DISPLAY_BUFFER_LINES = 40
+# 上电时先清除 LCD GRAM，避免上一次运行留下的页面残影。
+DISPLAY_BOOT_CLEAR_LINES = 20
 
 XSTART_H, XSTART_L, YSTART_H, YSTART_L = 0xF0, 0xF1, 0xF2, 0xF3
 XEND_H, XEND_L, YEND_H, YEND_L = 0xE0, 0xE1, 0xE2, 0xE3
@@ -100,12 +102,17 @@ class DisplayPort:
             _INIT_P, self.width, self.height, 52000, 1, 4, 0,
             _INVALID_P, bytearray((0, 0, 0x11, 2, 0, 120, 0, 0, 0x21,
                                    0, 0, 0x29)),
-            bytearray((0, 0, 0x28, 2, 0, 120, 0, 0, 0x10)), None,TESel=True,TEPin=34)
-        print("goto TE")
+            bytearray((0, 0, 0x28, 2, 0, 120, 0, 0, 0x10)), None)
         try:
             self.lcd.lcd_display_on()
         except Exception:
             pass
+        try:
+            self._clear_display_memory()
+        except Exception as error:
+            # 清屏是启动残影的防护措施；个别固件若不支持该写入，
+            # 不应阻止 LVGL 页面继续启动。
+            print("[LCD] 启动清屏失败：{}".format(error))
         lv.init()
         # LVGL 的 draw_buf.init 第三个参数是“像素数量”，不是字节数。
         # RGB565 每像素 2 字节，但这里必须传 width * lines；传入
@@ -122,10 +129,34 @@ class DisplayPort:
         self.display_driver.init()
         self.display_driver.draw_buf = self.draw_buffer
         self.display_driver.flush_cb = self.lcd.lcd_write   #self._flush
+        #self.display_driver.flush_cb = self._flush
         self.display_driver.hor_res = self.width
         self.display_driver.ver_res = self.height
         self.display = self.display_driver.register()
         return self
+
+    def _clear_display_memory(self):
+        """清除面板 GRAM 中的历史画面，防止启动时出现残留页面。"""
+        block_lines = min(DISPLAY_BOOT_CLEAR_LINES, self.height)
+        clear_block = bytearray(self.width * block_lines * 2)
+        y = 0
+        while y < self.height:
+            lines = min(block_lines, self.height - y)
+            data = (clear_block if lines == block_lines else
+                    bytearray(self.width * lines * 2))
+            self.lcd.lcd_write(data, 0, y, self.width - 1, y + lines - 1)
+            y += lines
+
+    def present_initial_frame(self):
+        """在首个主循环前立即刷新已加载的登录页面。"""
+        try:
+            lv.refr_now(self.display)
+        except Exception:
+            # 部分固件未导出 refr_now；task_handler 仍会处理整屏失效区域。
+            try:
+                lv.task_handler()
+            except Exception as error:
+                print("[LCD] 启动首帧刷新失败：{}".format(error))
 
     def tick(self, elapsed_ms):
         lv.tick_inc(max(0, int(elapsed_ms)))

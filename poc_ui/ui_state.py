@@ -34,6 +34,10 @@ class UIStateStore:
             "latitude": None,
             "longitude": None,
             "location_name": None,
+            "altitude": None,
+            "satellites": None,
+            "location_time": None,
+            "location_weekday": None,
             # POC/TCP 会话
             "tcp_connected": False,
             "login_state": "idle",
@@ -52,6 +56,9 @@ class UIStateStore:
             "lamp_brightness": 42,
             "lamp_alarm_active": False,
             "double_click_enabled": True,
+            # 当前纯 UI 基线使用的身份快照；后续由真实接口更新。
+            "police_name": "潘荣丰",
+            "police_no": "M100001",
             # 统一错误字段，供 UI 显示最近一次可见错误
             "last_error_domain": None,
             "last_error_text": None,
@@ -99,6 +106,24 @@ class UIStateStore:
             "latitude": latitude,
             "longitude": longitude,
             "location_name": location_name,
+        })
+
+    def update_location(self, location_name, latitude, longitude, altitude,
+                        satellites, location_time, location_weekday):
+        return self._update({
+            "location_name": location_name,
+            "latitude": latitude,
+            "longitude": longitude,
+            "altitude": altitude,
+            "satellites": satellites,
+            "location_time": location_time,
+            "location_weekday": location_weekday,
+        })
+
+    def update_identity(self, police_name, police_no):
+        return self._update({
+            "police_name": police_name,
+            "police_no": police_no,
         })
 
     def update_poc(self, tcp_connected, login_state, login_error,

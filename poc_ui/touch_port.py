@@ -46,41 +46,30 @@ class TouchPort:
         limit_value = max(0, min(255, int(limit_value)))
         throw_ok = False
         limit_ok = False
-        targets = [self.indev]
-        for target in targets:
-            if target is None:
-                continue
-            setter = getattr(target, "set_scroll_throw", None)
-            if setter is not None:
-                try:
-                    setter(throw_value)
-                    throw_ok = True
-                except Exception:
-                    pass
-            setter = getattr(target, "set_scroll_limit", None)
-            if setter is not None:
-                try:
-                    setter(limit_value)
-                    limit_ok = True
-                except Exception:
-                    pass
+        if self.indev is not None:
+            try:
+                self.indev.set_scroll_throw(throw_value)
+                throw_ok = True
+            except Exception:
+                pass
+            try:
+                self.indev.set_scroll_limit(limit_value)
+                limit_ok = True
+            except Exception:
+                pass
         # 部分 QuecPython 绑定导出为 lv.indev_set_* 全局函数。
         if not throw_ok:
-            setter = getattr(lv, "indev_set_scroll_throw", None)
-            if setter is not None and self.indev is not None:
-                try:
-                    setter(self.indev, throw_value)
-                    throw_ok = True
-                except Exception:
-                    pass
+            try:
+                lv.indev_set_scroll_throw(self.indev, throw_value)
+                throw_ok = True
+            except Exception:
+                pass
         if not limit_ok:
-            setter = getattr(lv, "indev_set_scroll_limit", None)
-            if setter is not None and self.indev is not None:
-                try:
-                    setter(self.indev, limit_value)
-                    limit_ok = True
-                except Exception:
-                    pass
+            try:
+                lv.indev_set_scroll_limit(self.indev, limit_value)
+                limit_ok = True
+            except Exception:
+                pass
         return throw_ok, limit_ok
 
     def _read_regs(self, register, length):

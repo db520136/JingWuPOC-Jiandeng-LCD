@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""最小 LVGL 导航验证应用。"""
+"""正式 UI 交互基线应用（不启动真实业务线程）。"""
 
 import utime
 
@@ -38,6 +38,9 @@ class NavigationTestApp:
                  state_store=None, message_bus=None):
         self.width = 296
         self.height = 240
+        self.status_height = 30
+        self.content_height = self.height - self.status_height
+        self.content_width = self.width
         self.display = DisplayPort(self.width, self.height)
         self.command_queue = (command_queue if command_queue is not None
                               else UICommandQueue())
@@ -75,6 +78,17 @@ class NavigationTestApp:
         self.root_view = None
         self.child_view = None
         self.root_pages = {}
+        self.status_bar = None
+        self.login_page = None
+        self.login_prefix = "M"
+        self.login_digits = ""
+        self.login_prefix_label = None
+        self.login_m_button = None
+        self.login_f_button = None
+        self.login_display = None
+        self.login_message = None
+        self._logged_in = False
+        self._login_transition_pending = False
         self.last_ms = utime.ticks_ms()
         self._last_pressed = False
         self.touch_start_point = None
@@ -95,6 +109,39 @@ class NavigationTestApp:
         obj.set_style_border_opa(0, lv.PART.MAIN)
         obj.set_style_outline_width(0, lv.PART.MAIN)
         obj.set_style_outline_opa(0, lv.PART.MAIN)
+        # 某些固件即使关闭 scrollbar mode，仍会保留 scrollbar 部件样式；
+        # 同时清除其宽度、透明度和边框，避免出现白色滑动条。
+        try:
+            obj.set_style_width(0, lv.PART.SCROLLBAR)
+            obj.set_style_bg_opa(0, lv.PART.SCROLLBAR)
+            obj.set_style_border_width(0, lv.PART.SCROLLBAR)
+            obj.set_style_border_opa(0, lv.PART.SCROLLBAR)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _make_fixed_container(obj):
+        """固定普通页面容器；不改变外层 tileview 的跟手处理。"""
+        try:
+            obj.clear_flag(lv.obj.FLAG.SCROLLABLE)
+        except Exception:
+            pass
+        try:
+            obj.set_scroll_dir(lv.DIR.NONE)
+        except Exception:
+            pass
+        try:
+            obj.set_scrollbar_mode(lv.SCROLLBAR_MODE.OFF)
+        except Exception:
+            pass
+        try:
+            obj.set_scroll_chain(lv.DIR.NONE)
+        except Exception:
+            pass
+        try:
+            obj.clear_flag(lv.obj.FLAG.SCROLL_ELASTIC)
+        except Exception:
+            pass
 
     def _set_ui_busy(self, busy, reason):
         busy = bool(busy)
@@ -104,13 +151,25 @@ class NavigationTestApp:
         released_periodic = self.command_queue.set_ui_busy(busy)
 
     def _make_root(self):
+        # 切页第一步：清理旧图片缓存，设置缓存数量
+        #lv.img.cache_invalidate_src(None)
+        #lv.img.cache_set_size(8) 
         self.root_screen = lv.obj()
         self.root_screen.set_size(self.width, self.height)
         self._remove_frame(self.root_screen)
+        try:
+            self.root_screen.clear_flag(lv.obj.FLAG.SCROLLABLE)
+            self.root_screen.set_scroll_dir(lv.DIR.NONE)
+            self.root_screen.set_scrollbar_mode(lv.SCROLLBAR_MODE.OFF)
+            self.root_screen.set_scroll_chain(lv.DIR.NONE)
+            self.root_screen.clear_flag(lv.obj.FLAG.SCROLL_ELASTIC)
+        except Exception:
+            pass
         self.root_screen.set_style_bg_color(lv.color_hex(0), lv.PART.MAIN)
         self.root_screen.set_style_bg_opa(255, lv.PART.MAIN)
         self.nav_host = lv.tileview(self.root_screen)
-        self.nav_host.set_size(self.width, self.height)
+        self.nav_host.set_pos(0, self.status_height)
+        self.nav_host.set_size(self.content_width, self.content_height)
         self._remove_frame(self.nav_host)
         self.nav_host.set_scroll_dir(lv.DIR.HOR)
         self.nav_host.set_scrollbar_mode(lv.SCROLLBAR_MODE.OFF)
@@ -122,11 +181,14 @@ class NavigationTestApp:
         self._disable_horizontal_elastic(self.nav_host)
         # 根槽位不接受用户横向拖动；一级页面由内部 root_content 独立处理。
         # 子槽位通过 DIR.LEFT 提供向右返回根页面的路径。
+        # 外层根槽位不接受用户横向拖动；一级页面由内部 root_content
+        # 独立处理，子页面槽位再通过 DIR.LEFT 提供右滑返回路径。
         root_tile = self.nav_host.add_tile(0, 0, lv.DIR.NONE)
         self._remove_frame(root_tile)
+        self._make_fixed_container(root_tile)
         self.nav_tiles[0] = root_tile
         self.root_content = lv.tileview(root_tile)
-        self.root_content.set_size(self.width, self.height)
+        self.root_content.set_size(self.content_width, self.content_height)
         self._remove_frame(self.root_content)
         self.root_content.set_scroll_dir(lv.DIR.HOR)
         self.root_content.set_scrollbar_mode(lv.SCROLLBAR_MODE.OFF)
@@ -136,9 +198,9 @@ class NavigationTestApp:
             pass
         self._disable_horizontal_elastic(self.root_content)
         for index, name in enumerate(ROOT_NAMES):
-            # 第一阶段仅放开 tileview 对当前触摸会话的双向处理；实际
-            # 是否能切换仍由相邻 tile 拓扑决定，首尾页面没有相邻页时
-            # 仍保持在边界。这样不引入自定义页面位移控制。
+            # 当前 tile 必须保留双向许可：页面被拖出半页后，LVGL 仍需
+            # 接受同一触摸会话的反向拖动以回到原页。边界禁止依靠相邻
+            # tile 不存在和关闭 SCROLL_ELASTIC 实现，不引入手工位移。
             tile_dir = lv.DIR.LEFT | lv.DIR.RIGHT
             tile = self.root_content.add_tile(index, 0, tile_dir)
             self._remove_frame(tile)
@@ -147,8 +209,62 @@ class NavigationTestApp:
         self.root_content.add_event_cb(self._root_changed, lv.EVENT.VALUE_CHANGED, None)
         self.nav_host.add_event_cb(self._nav_changed, lv.EVENT.VALUE_CHANGED, None)
         self.root_view = 0
+        self.status_bar = self.pages.create_status_bar(self.root_screen)
+        self.login_page = self.pages.create_login_page(self.root_screen)
+        self.nav_host.add_flag(lv.obj.FLAG.HIDDEN)
+        self.status_bar.add_flag(lv.obj.FLAG.HIDDEN)
         lv.scr_load(self.root_screen)
         self.root_screen.invalidate()
+        # 首帧在登录页创建完成后立即提交，避免等待触摸事件才触发重绘。
+        self.display.present_initial_frame()
+
+    def _finish_login_transition(self):
+        if not self._login_transition_pending:
+            return
+        self._login_transition_pending = False
+        self._logged_in = True
+        self.login_page.add_flag(lv.obj.FLAG.HIDDEN)
+        self.status_bar.clear_flag(lv.obj.FLAG.HIDDEN)
+        self.nav_host.clear_flag(lv.obj.FLAG.HIDDEN)
+        try:
+            self.nav_host.set_tile_id(0, 0, lv.ANIM.OFF)
+        except Exception:
+            self.nav_host.set_tile_id(0, 0)
+        self.root_screen.invalidate()
+
+    def set_login_prefix(self, prefix):
+        if prefix not in ("M", "F"):
+            return
+        self.login_prefix = prefix
+        # 登录页的颜色属于页面样式，由 PageFactory 统一管理。应用层只
+        # 传递状态，避免直接引用 ui_pages.py 内部的颜色常量。
+        self.pages.update_login_prefix(prefix)
+        self.login_digits = ""
+        if self.login_display is not None:
+            self.login_display.set_text("")
+
+    def login_digit(self, digit):
+        if len(self.login_digits) >= 6:
+            return
+        self.login_digits += str(digit)
+        self.login_display.set_text(self.login_digits)
+
+    def login_delete(self):
+        if self.login_digits:
+            self.login_digits = self.login_digits[:-1]
+        self.login_display.set_text(
+            self.login_digits if self.login_digits else "")
+
+    def login_confirm(self):
+        if len(self.login_digits) < 6:
+            return
+        self.state_store.update_identity(
+            "潘荣丰", self.login_prefix + self.login_digits)
+        self._login_transition_pending = True
+
+    def show_message(self, text):
+        # 纯 UI 基线不显示业务提示，登录页按固定键盘布局呈现。
+        return None
 
     @staticmethod
     def _disable_horizontal_elastic(obj):
@@ -254,11 +370,13 @@ class NavigationTestApp:
 
     def _make_child_tile(self, depth, page_info):
         self._remove_route_tiles_from(depth)
-        # 子页面同样允许 tileview 在当前触摸会话中双向处理；当前路径
-        # 没有下一级 tile 时，向左仍没有可切换目标，页面保持不动。
+        # 子页面保留双向许可，以便右滑返回过程中可以反向拖回当前页；
+        # 左侧没有用户可到达的下一级 tile，因此左滑最终保持原页。下
+        # 一级页面仍由点击事件通过 Router 以程序方式进入。
         tile = self.nav_host.add_tile(
             depth, 0, lv.DIR.LEFT | lv.DIR.RIGHT)
         self._remove_frame(tile)
+        self._make_fixed_container(tile)
         self.nav_tiles[depth] = tile
         self.child_screen = tile
         self.pages.child(page_info[0], page_info[2], parent=tile)
@@ -327,6 +445,8 @@ class NavigationTestApp:
             if self._release_ui_after_task:
                 self._release_ui_after_task = False
                 self._set_ui_busy(False, "触摸/点击本轮LVGL处理完成")
+            if self._login_transition_pending and not self.touch.pressed:
+                self._finish_login_transition()
             utime.sleep_ms(1)
 
     def _refresh_page_state(self):
