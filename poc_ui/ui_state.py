@@ -51,11 +51,23 @@ class UIStateStore:
             "audio_tx_active": False,
             "audio_rx_active": False,
             "audio_volume": 11,
+            # 本机显示与交互设置
+            "screen_brightness": 100,
+            "sleep_timeout_seconds": 30,
+            "fall_detection_enabled": False,
             # 肩灯和运动
             "lamp_mode": "off",
             "lamp_brightness": 42,
             "lamp_alarm_active": False,
             "double_click_enabled": True,
+            # 对讲名单由业务层归一化后整体替换，页面不解析原始接口数据。
+            "group_items": (),
+            "person_items": (),
+            # 设备与升级信息
+            "software_version": "--",
+            "hardware_version": "--",
+            "firmware_version": "--",
+            "upgrade_status": "等待检查",
             # 当前纯 UI 基线使用的身份快照；后续由真实接口更新。
             "police_name": "潘荣丰",
             "police_no": "M100001",
@@ -157,6 +169,49 @@ class UIStateStore:
     def update_motion(self, double_click_enabled):
         return self._update({
             "double_click_enabled": bool(double_click_enabled),
+        })
+
+    def update_screen_brightness(self, percent):
+        return self._update({
+            "screen_brightness": int(percent),
+        })
+
+    def update_sleep_timeout(self, seconds):
+        return self._update({
+            "sleep_timeout_seconds": seconds,
+        })
+
+    def update_fall_detection(self, enabled):
+        return self._update({
+            "fall_detection_enabled": bool(enabled),
+        })
+
+    def update_intercom_directory(self, groups, people):
+        return self._update({
+            "group_items": tuple(groups),
+            "person_items": tuple(people),
+        })
+
+    def update_group_selection(self, group_id):
+        return self._update({
+            "confirmed_group_id": group_id,
+        })
+
+    def update_single_selection(self, person_key):
+        return self._update({
+            "single_peer": person_key,
+        })
+
+    def update_device_versions(self, software, hardware, firmware):
+        return self._update({
+            "software_version": str(software),
+            "hardware_version": str(hardware),
+            "firmware_version": str(firmware),
+        })
+
+    def update_upgrade_status(self, status):
+        return self._update({
+            "upgrade_status": str(status),
         })
 
     def set_error(self, domain, text):

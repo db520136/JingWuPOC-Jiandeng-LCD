@@ -10,9 +10,12 @@ from machine import LCD
 
 LCD_WIDTH = 296
 LCD_HEIGHT = 240
-DISPLAY_BUFFER_LINES = 40
+DISPLAY_BUFFER_LINES = 100
 # 上电时先清除 LCD GRAM，避免上一次运行留下的页面残影。
 DISPLAY_BOOT_CLEAR_LINES = 20
+# EC800M 图片缓存容量（缓存项数量，不是字节数）。页面图片统一使用
+# 标准 JPG，缓存初始化放在显示层，避免页面或业务线程重复清空缓存。
+IMAGE_CACHE_SIZE = 16
 
 XSTART_H, XSTART_L, YSTART_H, YSTART_L = 0xF0, 0xF1, 0xF2, 0xF3
 XEND_H, XEND_L, YEND_H, YEND_L = 0xE0, 0xE1, 0xE2, 0xE3
@@ -114,6 +117,15 @@ class DisplayPort:
             # 不应阻止 LVGL 页面继续启动。
             print("[LCD] 启动清屏失败：{}".format(error))
         lv.init()
+        # 图片缓存必须在 LVGL 初始化后设置，并且只在显示启动时清空一次。
+        # 普通切页不再清空缓存，避免反复解码造成卡顿和闪烁。
+        
+        try:
+            lv.img.cache_invalidate_src(None)
+            lv.img.cache_set_size(IMAGE_CACHE_SIZE)
+        except (AttributeError, TypeError):
+            # 兼容未导出图片缓存 API 的固件；图片仍可按普通方式加载。
+            pass
         # LVGL 的 draw_buf.init 第三个参数是“像素数量”，不是字节数。
         # RGB565 每像素 2 字节，但这里必须传 width * lines；传入
         # bytearray 的 len 会让 LVGL 误判容量为实际的两倍，连续局部

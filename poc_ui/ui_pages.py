@@ -2,6 +2,7 @@
 """正式 UI 页面（纯 UI 基线，不访问任何真实业务硬件）。"""
 
 import lvgl as lv
+import utime
 
 try:
     from usr.font_port import (text_style_blue, text_style_green,
@@ -22,6 +23,14 @@ BLUE = lv.color_hex(0x12618A)
 # 登录输入框使用设计稿取样得到的深灰色（RGB 42,42,42）。
 LOGIN_INPUT_BG = lv.color_hex(0x2A2A2A)
 ASSET_ROOT = "U:/"
+LIST_ROW_STEP = 52
+LIST_ROW_HEIGHT = 48
+LIST_VISIBLE_ROWS = 4
+LIST_SETTLE_POLL_MS = 30
+LIST_SETTLE_STABLE_MS = 120
+OPTION_SELECTED_BG = lv.color_hex(0x0A3D47)
+OPTION_DOT_OFF = lv.color_hex(0x8FA7B3)
+DISABLED_TEXT = lv.color_hex(0x68747A)
 
 
 def _remove_frame(obj):
@@ -30,10 +39,21 @@ def _remove_frame(obj):
     obj.set_style_outline_width(0, lv.PART.MAIN)
     obj.set_style_outline_opa(0, lv.PART.MAIN)
     try:
+        obj.set_style_radius(0, lv.PART.MAIN)
+        obj.set_style_shadow_width(0, lv.PART.MAIN)
+        obj.set_style_pad_all(0, lv.PART.MAIN)
+    except Exception:
+        pass
+    try:
         obj.set_style_width(0, lv.PART.SCROLLBAR)
+        obj.set_style_height(0, lv.PART.SCROLLBAR)
         obj.set_style_bg_opa(0, lv.PART.SCROLLBAR)
         obj.set_style_border_width(0, lv.PART.SCROLLBAR)
         obj.set_style_border_opa(0, lv.PART.SCROLLBAR)
+        obj.set_style_outline_width(0, lv.PART.SCROLLBAR)
+        obj.set_style_outline_opa(0, lv.PART.SCROLLBAR)
+        obj.set_style_shadow_width(0, lv.PART.SCROLLBAR)
+        obj.set_style_pad_all(0, lv.PART.SCROLLBAR)
     except Exception:
         pass
 
@@ -123,8 +143,10 @@ def _image(parent, path, x, y, w, h, callback=None, host=None):
     image.set_size(int(w), int(h))
     try:
         image.set_src(ASSET_ROOT + path)
-    except Exception:
-        pass
+    except Exception as error:
+        # 图片资源缺失或格式不被固件支持时保留页面结构，并输出明确路径。
+        # 不让单张图片阻断整个 UI 启动；实机日志可据此检查资源部署。
+        print("[图片] JPG加载失败：{}，{}".format(ASSET_ROOT + path, error))
     if callback is not None:
         try:
             image.add_flag(lv.obj.FLAG.CLICKABLE)
@@ -142,6 +164,85 @@ class PageFactory:
         self.app = app
         self._status_labels = {}
         self._location_labels = {}
+        self._root_indicator_dots = []
+        self._status_context = "police"
+        self._status_police_no = "M100001"
+        self._list_scroll_states = []
+        self._list_scroll_timer = None
+        self._confirm_overlay = None
+        self._confirm_dialog = None
+        self._confirm_label = None
+        self._pending_confirm = None
+
+    def create_confirm_dialog(self, parent):
+        """创建唯一一套确认弹窗及全屏输入遮罩。"""
+        overlay = lv.obj(parent)
+        _remove_frame(overlay)
+        _make_fixed(overlay)
+        overlay.set_pos(0, 0)
+        overlay.set_size(self.app.width, self.app.height)
+        overlay.set_style_bg_opa(0, lv.PART.MAIN)
+        try:
+            overlay.add_flag(lv.obj.FLAG.CLICKABLE)
+        except Exception:
+            pass
+
+        dialog = lv.obj(overlay)
+        _remove_frame(dialog)
+        _make_fixed(dialog)
+        dialog.set_pos(16, 35)
+        dialog.set_size(264, 164)
+        dialog.set_style_bg_color(BLUE, lv.PART.MAIN)
+        dialog.set_style_bg_opa(255, lv.PART.MAIN)
+        try:
+            dialog.set_style_radius(6, lv.PART.MAIN)
+        except Exception:
+            pass
+
+        self._confirm_label = _label(
+            dialog, "确认修改？", 0, 40, 264, 40,
+            WHITE, lv.TEXT_ALIGN.CENTER)
+        _button(dialog, "取消", 25, 104, 95, 45,
+                lambda event: self.cancel_confirm_dialog(), self.app, RED)
+        _button(dialog, "确认", 144, 104, 95, 45,
+                lambda event: self.accept_confirm_dialog(), self.app, GREEN)
+
+        self._confirm_overlay = overlay
+        self._confirm_dialog = dialog
+        overlay.add_flag(lv.obj.FLAG.HIDDEN)
+        return overlay
+
+    def show_confirm_dialog(self, text, on_confirm):
+        """显示公共弹窗；同一时刻只保存一个待确认动作。"""
+        if self._confirm_overlay is None or on_confirm is None:
+            return False
+        if self._pending_confirm is not None:
+            return False
+        self._pending_confirm = on_confirm
+        self._confirm_label.set_text(str(text))
+        self._confirm_label.invalidate()
+        self._confirm_overlay.clear_flag(lv.obj.FLAG.HIDDEN)
+        try:
+            self._confirm_overlay.move_foreground()
+        except Exception:
+            pass
+        self._confirm_overlay.invalidate()
+        return True
+
+    def cancel_confirm_dialog(self):
+        """取消待确认动作，不修改页面状态。"""
+        self._pending_confirm = None
+        if self._confirm_overlay is not None:
+            self._confirm_overlay.add_flag(lv.obj.FLAG.HIDDEN)
+
+    def accept_confirm_dialog(self):
+        """先关闭弹窗，再执行一次待确认动作。"""
+        callback = self._pending_confirm
+        self._pending_confirm = None
+        if self._confirm_overlay is not None:
+            self._confirm_overlay.add_flag(lv.obj.FLAG.HIDDEN)
+        if callback is not None:
+            callback()
 
     def create_status_bar(self, parent):
         bar = lv.obj(parent)
@@ -152,23 +253,87 @@ class PageFactory:
         bar.set_style_bg_color(BLACK, lv.PART.MAIN)
         bar.set_style_bg_opa(255, lv.PART.MAIN)
         self._status_labels["police"] = _label(
-            bar, "M100001", 8, 3, 105, 24, WHITE, lv.TEXT_ALIGN.LEFT, True)
-        self._status_network_icon = _image(bar, "wifi_5.png", 173, 3, 24, 24)
+            bar, "M100001", 23, 3, 105, 24, WHITE, lv.TEXT_ALIGN.LEFT, True)
+        self._status_network_icon = _image(bar, "wifi_5.jpg", 143, 3, 24, 24)
         self._status_labels["battery"] = _label(
-            bar, "电量：99%", 220, 3, 74, 24, WHITE, lv.TEXT_ALIGN.RIGHT, True)
+            bar, "电量：99%", 170, 3, 74, 24, WHITE, lv.TEXT_ALIGN.RIGHT, True)
         return bar
+
+    def create_root_indicator(self, parent):
+        """创建覆盖在一级页面之上的唯一一组四页指示圆点。"""
+        holder = lv.obj(parent)
+        _remove_frame(holder)
+        _make_fixed(holder)
+        holder.set_pos(116, self.app.content_height - 16)
+        holder.set_size(64, 12)
+        holder.set_style_bg_opa(0, lv.PART.MAIN)
+        try:
+            holder.clear_flag(lv.obj.FLAG.CLICKABLE)
+        except Exception:
+            pass
+        centers = (11, 25, 39, 53)
+        for center_x in centers:
+            dot = lv.obj(holder)
+            _remove_frame(dot)
+            _make_fixed(dot)
+            try:
+                dot.clear_flag(lv.obj.FLAG.CLICKABLE)
+            except Exception:
+                pass
+            self._root_indicator_dots.append((dot, center_x))
+        self.update_root_indicator(0)
+        return holder
+
+    def update_root_indicator(self, active_index):
+        """按已吸附的一级页面索引更新圆点，不参与手势判定。"""
+        try:
+            selected = int(active_index)
+        except Exception:
+            selected = 0
+        for index, item in enumerate(self._root_indicator_dots):
+            dot, center_x = item
+            size = 8 if index == selected else 6
+            dot.set_size(size, size)
+            dot.set_pos(center_x - size // 2, 6 - size // 2)
+            dot.set_style_radius(size // 2, lv.PART.MAIN)
+            dot.set_style_bg_color(CYAN if index == selected else GRAY,
+                                   lv.PART.MAIN)
+            dot.set_style_bg_opa(255, lv.PART.MAIN)
+            dot.invalidate()
+
+    def set_status_context(self, context):
+        """同步固定状态栏左侧上下文，不改变状态栏位置。"""
+        self._status_context = ("settings" if context == "settings"
+                                else "police")
+        labels = self._status_labels
+        label = labels.get("police")
+        if label is None:
+            return
+        if self._status_context == "settings":
+            label.set_text("设置")
+            label.set_style_text_color(CYAN, lv.PART.MAIN)
+        else:
+            label.set_text(self._status_police_no)
+            label.set_style_text_color(WHITE, lv.PART.MAIN)
+        label.invalidate()
 
     def refresh_status(self, snapshot):
         labels = self._status_labels
         if not labels:
             return
         police_no = snapshot.get("police_no") or "M100001"
+        self._status_police_no = str(police_no)
         connected = bool(snapshot.get("network_connected"))
         battery = snapshot.get("battery_percent")
-        labels["police"].set_text(str(police_no))
+        if self._status_context == "settings":
+            labels["police"].set_text("设置")
+            labels["police"].set_style_text_color(CYAN, lv.PART.MAIN)
+        else:
+            labels["police"].set_text(str(police_no))
+            labels["police"].set_style_text_color(WHITE, lv.PART.MAIN)
         try:
             self._status_network_icon.set_src(
-                ASSET_ROOT + ("wifi_5.png" if connected else "wifi_0.png"))
+                ASSET_ROOT + ("wifi_5.jpg" if connected else "wifi_0.jpg"))
         except Exception:
             pass
         labels["battery"].set_text("电量：{}".format(
@@ -249,7 +414,6 @@ class PageFactory:
         if name == "location":
             self._make_location(page)
         else:
-            # 92x92 SJPG 是设备端已验证的图片格式；PNG 资源仍可用于列表图标。
             icons = {"shoulder": "shoulder_lamp.jpg", "intercom": "intercom.jpg",
                      "settings": "settings.jpg"}
             targets = {"shoulder": "shoulder_menu", "intercom": "intercom_menu",
@@ -258,8 +422,6 @@ class PageFactory:
                    lambda e, n=name: self.app.open_child(targets[n]), self.app)
             _label(page, title, 0, 126, self.app.content_width, 40,
                    WHITE, lv.TEXT_ALIGN.CENTER)
-            _label(page, "点击图标进入", 0, 174, self.app.content_width, 30,
-                   CYAN, lv.TEXT_ALIGN.CENTER)
         return page
 
     def _make_location(self, page):
@@ -277,7 +439,7 @@ class PageFactory:
         self._location_labels["weekday"] = _label(
             page, "星期三", 190, 84, 100, 33, WHITE,
             lv.TEXT_ALIGN.CENTER)
-        _image(page, "location_icon_92.sjpg", 196, 112, 92, 92,
+        _image(page, "location_icon_92.jpg", 196, 112, 92, 92,
                lambda e: self.app.open_child("location_detail"), self.app)
 
     def refresh_state(self, snapshot):
@@ -312,6 +474,30 @@ class PageFactory:
                                                    ("单呼模式", "single_mode")))
         elif name == "settings_menu":
             self._make_settings(page)
+        elif name == "shoulder_mode":
+            self._make_shoulder_mode(page)
+        elif name == "double_click_mode":
+            self._make_double_click_mode(page)
+        elif name == "group_mode":
+            self._make_group_mode(page)
+        elif name == "single_mode":
+            self._make_single_mode(page)
+        elif name == "device_info":
+            self._make_device_info(page)
+        elif name == "brightness":
+            self._make_brightness(page)
+        elif name == "lamp_brightness":
+            self._make_lamp_brightness(page)
+        elif name == "volume":
+            self._make_volume(page)
+        elif name == "sleep":
+            self._make_sleep(page)
+        elif name == "network":
+            self._make_network(page)
+        elif name == "fall_detection":
+            self._make_fall_detection(page)
+        elif name == "upgrade":
+            self._make_upgrade(page)
         else:
             self._make_placeholder(page, name)
         return page
@@ -325,7 +511,9 @@ class PageFactory:
         _label(page, "警号：{}".format(police_no), 0, 122, 296, 33, WHITE,
                lv.TEXT_ALIGN.CENTER)
         _button(page, "切换用户", 4, 170, 288, 40,
-                lambda e: self.app.show_message("当前为模拟页面"), self.app, RED)
+                lambda e: self.show_confirm_dialog(
+                    "确认退出登录？", self.app.logout_to_login),
+                self.app, RED)
 
     def _make_choice_page(self, page, title, choices):
         _label(page, title, 0, 8, 296, 33, CYAN, lv.TEXT_ALIGN.CENTER)
@@ -334,46 +522,461 @@ class PageFactory:
                     lambda e, target=choice[1]: self.app.open_child(target),
                     self.app, GRAY)
 
+    def _snapshot(self):
+        _revision, snapshot = self.app.state_store.get_snapshot()
+        return snapshot
+
+    @staticmethod
+    def _set_radio_visual(row_info, selected):
+        row, dot, label, enabled = row_info
+        row.set_style_bg_color(
+            OPTION_SELECTED_BG if selected else GRAY, lv.PART.MAIN)
+        dot.set_style_bg_color(
+            CYAN if selected else OPTION_DOT_OFF, lv.PART.MAIN)
+        label.set_style_text_color(
+            CYAN if selected else (WHITE if enabled else DISABLED_TEXT),
+            lv.PART.MAIN)
+        row.invalidate()
+
+    def _radio_row(self, parent, y, text, value, selected, enabled,
+                   on_select, rows, selection, require_confirm):
+        row = lv.btn(parent)
+        _remove_frame(row)
+        row.set_pos(4, int(y))
+        row.set_size(self.app.content_width - 8, LIST_ROW_HEIGHT)
+        try:
+            row.clear_flag(lv.obj.FLAG.SCROLLABLE)
+            row.clear_flag(lv.obj.FLAG.SCROLL_ELASTIC)
+        except Exception:
+            pass
+        dot = lv.obj(row)
+        _remove_frame(dot)
+        _make_fixed(dot)
+        dot.set_pos(12, 16)
+        dot.set_size(16, 16)
+        dot.set_style_radius(8, lv.PART.MAIN)
+        label = _label(
+            row, text, 42, 7, self.app.content_width - 58, 33,
+            WHITE if enabled else DISABLED_TEXT, lv.TEXT_ALIGN.LEFT)
+        info = (row, dot, label, bool(enabled))
+        rows[value] = info
+        self._set_radio_visual(info, selected)
+
+        def choose(event, key=value, allowed=bool(enabled)):
+            if not allowed or not self.app.can_click_current_touch():
+                return
+            if key == selection["value"]:
+                return
+
+            def commit_selection():
+                if not on_select(key):
+                    return
+                selection["value"] = key
+                for item_key in rows:
+                    self._set_radio_visual(rows[item_key], item_key == key)
+
+            if require_confirm:
+                self.show_confirm_dialog("确认修改？", commit_selection)
+            else:
+                commit_selection()
+        row.add_event_cb(choose, lv.EVENT.CLICKED, None)
+        return row
+
+    def _make_radio_page(self, page, title, options, selected, on_select,
+                         list_mode=False, require_confirm=False):
+        rows = {}
+        selection = {"value": selected}
+        if list_mode:
+            parent = self._new_list_viewport(page)
+            start_y = 0
+            step = LIST_ROW_STEP
+        else:
+            parent = page
+            _label(page, title, 0, 4, self.app.content_width, 33,
+                   CYAN, lv.TEXT_ALIGN.CENTER)
+            start_y = 44
+            step = LIST_ROW_STEP
+        for index, option in enumerate(options):
+            self._radio_row(
+                parent, start_y + index * step, option[1], option[0],
+                option[0] == selected, option[2], on_select, rows,
+                selection, require_confirm)
+        if list_mode:
+            self._finish_list_viewport(parent, len(options))
+
+    def _make_shoulder_mode(self, page):
+        snapshot = self._snapshot()
+        options = (("off", "关闭", True),
+                   ("alternate", "红蓝交替闪", True),
+                   ("diagonal", "红蓝对角闪", True))
+        self._make_radio_page(
+            page, "肩灯模式", options, snapshot["lamp_mode"],
+            self.app.select_lamp_mode, require_confirm=True)
+
+    def _make_double_click_mode(self, page):
+        snapshot = self._snapshot()
+        options = ((True, "开启", True), (False, "关闭", True))
+        self._make_radio_page(
+            page, "双击模式", options, snapshot["double_click_enabled"],
+            self.app.select_double_click, require_confirm=True)
+
+    def _make_group_mode(self, page):
+        snapshot = self._snapshot()
+        selected = snapshot["confirmed_group_id"]
+        selected = "__none_group__" if selected is None else selected
+        options = [("__none_group__", "无/退出", True)]
+        for group in snapshot["group_items"]:
+            options.append((group["id"], group["name"], True))
+        self._make_radio_page(
+            page, "", tuple(options), selected, self.app.select_group,
+            list_mode=True, require_confirm=True)
+
+    def _make_single_mode(self, page):
+        snapshot = self._snapshot()
+        selected = snapshot["single_peer"]
+        selected = "__none_person__" if selected is None else selected
+        options = [("__none_person__", "无/解散", True)]
+        for person in snapshot["person_items"]:
+            if person["is_self"]:
+                continue
+            online = bool(person["online"])
+            text = person["name"] if online else person["name"] + "（离线）"
+            options.append((person["key"], text, online))
+        self._make_radio_page(
+            page, "", tuple(options), selected, self.app.select_person,
+            list_mode=True, require_confirm=True)
+
+    def _make_device_info(self, page):
+        snapshot = self._snapshot()
+        _label(page, "设备信息", 0, 4, self.app.content_width, 33,
+               CYAN, lv.TEXT_ALIGN.CENTER)
+        values = (("软件版本：", snapshot["software_version"]),
+                  ("硬件版本：", snapshot["hardware_version"]),
+                  ("固件版本：", snapshot["firmware_version"]))
+        for index, item in enumerate(values):
+            y = 48 + index * 44
+            _label(page, item[0], 16, y, 120, 33, WHITE, lv.TEXT_ALIGN.LEFT)
+            _label(page, item[1], 136, y, 144, 33, CYAN, lv.TEXT_ALIGN.LEFT)
+
+    def _make_vertical_slider(self, page, title, minimum, maximum, value,
+                              on_change, suffix="", bottom_image=None):
+        _label(page, title, 0, 2, self.app.content_width, 33,
+               CYAN, lv.TEXT_ALIGN.CENTER)
+        slider = lv.slider(page)
+        _remove_frame(slider)
+        slider.set_pos(108, 40)
+        slider.set_size(64, 126)
+        slider.set_range(int(minimum), int(maximum))
+        slider.set_value(int(value), lv.ANIM.OFF)
+        slider.set_style_bg_color(lv.color_hex(0x26343C), lv.PART.MAIN)
+        slider.set_style_bg_opa(255, lv.PART.MAIN)
+        slider.set_style_radius(28, lv.PART.MAIN)
+        slider.set_style_bg_color(CYAN, lv.PART.INDICATOR)
+        slider.set_style_bg_opa(255, lv.PART.INDICATOR)
+        slider.set_style_radius(28, lv.PART.INDICATOR)
+        slider.set_style_bg_opa(0, lv.PART.KNOB)
+        value_label = _label(
+            page, "{}{}".format(value, suffix), 184, 87, 104, 33,
+            CYAN, lv.TEXT_ALIGN.LEFT)
+        _label(page, "高", 60, 42, 40, 33, WHITE, lv.TEXT_ALIGN.CENTER)
+        low_label = _label(
+            page, "低", 60, 133, 40, 33, WHITE, lv.TEXT_ALIGN.CENTER)
+        low_label.set_style_text_color(DISABLED_TEXT, lv.PART.MAIN)
+        if bottom_image is not None:
+            _image(page, bottom_image, 120, 170, 40, 40)
+
+        def value_changed(event):
+            target = event.get_target()
+            new_value = on_change(int(target.get_value()))
+            value_label.set_text("{}{}".format(new_value, suffix))
+            value_label.invalidate()
+        slider.add_event_cb(value_changed, lv.EVENT.VALUE_CHANGED, None)
+
+    def _make_brightness(self, page):
+        snapshot = self._snapshot()
+        self._make_vertical_slider(
+            page, "屏幕亮度", 5, 100, snapshot["screen_brightness"],
+            self.app.set_screen_brightness, "%")
+
+    def _make_lamp_brightness(self, page):
+        snapshot = self._snapshot()
+        self._make_vertical_slider(
+            page, "肩灯亮度", 5, 100, snapshot["lamp_brightness"],
+            self.app.set_lamp_brightness, "%")
+
+    def _make_volume(self, page):
+        snapshot = self._snapshot()
+        self._make_vertical_slider(
+            page, "音量", 0, 11, snapshot["audio_volume"],
+            self.app.set_audio_volume, "", "settings_volume.jpg")
+
+    def _make_sleep(self, page):
+        snapshot = self._snapshot()
+        options = ((10, "10秒", True), (15, "15秒", True),
+                   (20, "20秒", True), (30, "30秒", True),
+                   (60, "1分钟", True), (None, "永不息屏", True))
+        self._make_radio_page(
+            page, "", options, snapshot["sleep_timeout_seconds"],
+            self.app.select_sleep_timeout,
+            list_mode=True, require_confirm=True)
+
+    def _make_network(self, page):
+        snapshot = self._snapshot()
+        _label(page, "网络状态", 0, 4, self.app.content_width, 33,
+               CYAN, lv.TEXT_ALIGN.CENTER)
+        connected = bool(snapshot["network_connected"])
+        items = (("SIM卡号：", snapshot["iccid"] or "未识别到",
+                  WHITE if snapshot["iccid"] else RED),
+                 ("信号值：", snapshot["signal_level"] or "无",
+                  GREEN if snapshot["signal_level"] in ("极好", "强") else WHITE),
+                 ("网络状态：", "成功连接" if connected else "连接失败",
+                  GREEN if connected else RED))
+        for index, item in enumerate(items):
+            y = 50 + index * 50
+            _label(page, item[0], 16, y, 114, 33, WHITE, lv.TEXT_ALIGN.LEFT)
+            _label(page, item[1], 130, y, 154, 33, item[2],
+                   lv.TEXT_ALIGN.LEFT)
+
+    def _make_fall_detection(self, page):
+        snapshot = self._snapshot()
+        options = ((True, "开启", True), (False, "关闭", True))
+        self._make_radio_page(
+            page, "跌倒检测", options, snapshot["fall_detection_enabled"],
+            self.app.select_fall_detection)
+
+    def _make_upgrade(self, page):
+        snapshot = self._snapshot()
+        _label(page, "升级", 0, 4, self.app.content_width, 33,
+               CYAN, lv.TEXT_ALIGN.CENTER)
+        _label(page, "当前版本：", 20, 54, 130, 33, WHITE, lv.TEXT_ALIGN.LEFT)
+        _label(page, snapshot["firmware_version"], 150, 54, 126, 33,
+               CYAN, lv.TEXT_ALIGN.LEFT)
+        status = _label(page, snapshot["upgrade_status"], 8, 100,
+                        self.app.content_width - 16, 33, WHITE,
+                        lv.TEXT_ALIGN.CENTER)
+
+        def check_upgrade(event):
+            status.set_text(self.app.preview_check_upgrade())
+            status.set_style_text_color(GREEN, lv.PART.MAIN)
+            status.invalidate()
+        _button(page, "检查更新", 48, 152, 200, 48,
+                check_upgrade, self.app, BLUE)
+
     def _make_settings(self, page):
-        _label(page, "设置", 0, 4, 296, 33, CYAN, lv.TEXT_ALIGN.CENTER)
+        viewport = self._new_list_viewport(page)
+        rows = (("settings_device.jpg", "设备信息", "device_info"),
+                ("settings_brightness.jpg", "屏幕亮度", "brightness"),
+                ("settings_shoulder_brightness.jpg", "肩灯亮度", "lamp_brightness"),
+                ("settings_volume.jpg", "音量", "volume"),
+                ("settings_sleep.jpg", "息屏时间", "sleep"),
+                ("settings_network.jpg", "网络状态", "network"),
+                ("settings_fall_detection.jpg", "跌倒检测", "fall_detection"),
+                (None, "升级", "upgrade"))
+        for index, row_data in enumerate(rows):
+            row = lv.btn(viewport)
+            _remove_frame(row)
+            row.set_pos(4, index * LIST_ROW_STEP)
+            row.set_size(self.app.content_width - 8, LIST_ROW_HEIGHT)
+            try:
+                row.clear_flag(lv.obj.FLAG.SCROLLABLE)
+                row.clear_flag(lv.obj.FLAG.SCROLL_ELASTIC)
+            except Exception:
+                pass
+            row.set_style_bg_color(GRAY, lv.PART.MAIN)
+            row.set_style_bg_opa(255, lv.PART.MAIN)
+            if row_data[0] is not None:
+                _image(row, row_data[0], 8, 8, 32, 32)
+            _label(row, row_data[1], 48, 7, 228, 33, WHITE,
+                   lv.TEXT_ALIGN.LEFT)
+            def guarded_row(event, target=row_data[2]):
+                if self.app.can_click_current_touch():
+                    self.app.open_child(target)
+            row.add_event_cb(guarded_row, lv.EVENT.CLICKED, None)
+        self._finish_list_viewport(viewport, len(rows))
+
+    def _new_list_viewport(self, page):
         viewport = lv.obj(page)
         _remove_frame(viewport)
-        viewport.set_pos(8, 40)
-        viewport.set_size(280, 166)
+        viewport.set_pos(0, 0)
+        viewport.set_size(self.app.content_width, self.app.content_height)
+        viewport.set_style_bg_color(BLACK, lv.PART.MAIN)
+        viewport.set_style_bg_opa(255, lv.PART.MAIN)
+        # 210px内容区配合48px行高和4px行距，一屏完整显示四项。
+        viewport.set_style_pad_bottom(6, lv.PART.MAIN)
         viewport.set_scroll_dir(lv.DIR.VER)
         viewport.set_scrollbar_mode(lv.SCROLLBAR_MODE.OFF)
         try:
             viewport.set_scroll_chain(lv.DIR.NONE)
         except Exception:
             pass
+        viewport.add_flag(lv.obj.FLAG.SCROLLABLE)
         try:
             viewport.clear_flag(lv.obj.FLAG.SCROLL_ELASTIC)
         except Exception:
             pass
-        viewport.add_flag(lv.obj.FLAG.SCROLLABLE)
-        rows = (("settings_device.png", "设备信息", "device_info"),
-                ("settings_brightness.png", "屏幕亮度", "brightness"),
-                ("settings_shoulder_brightness.png", "肩灯亮度", "lamp_brightness"),
-                ("settings_volume.png", "音量", "volume"),
-                ("settings_sleep.png", "息屏时间", "sleep"),
-                ("settings_network.png", "网络状态", "network"),
-                ("settings_fall_detection.png", "跌倒检测", "fall_detection"),
-                (None, "升级", "upgrade"))
-        for index, row_data in enumerate(rows):
-            row = lv.btn(viewport)
-            _remove_frame(row)
-            row.set_pos(0, index * 46)
-            row.set_size(280, 42)
-            row.set_style_bg_color(GRAY, lv.PART.MAIN)
-            row.set_style_bg_opa(255, lv.PART.MAIN)
-            if row_data[0] is not None:
-                _image(row, row_data[0], 6, 5, 32, 32)
-            _label(row, row_data[1], 46, 4, 220, 33, WHITE,
-                   lv.TEXT_ALIGN.LEFT)
-            def guarded_row(event, target=row_data[2]):
-                if self.app.can_click_current_touch():
-                    self.app.open_child(target)
-            row.add_event_cb(guarded_row, lv.EVENT.CLICKED, None)
+        return viewport
+
+    def _finish_list_viewport(self, viewport, item_count):
+        """完成内容尺寸计算，并绑定不截断惯性的整行收尾。"""
+        try:
+            viewport.update_layout()
+        except Exception:
+            try:
+                lv.obj_update_layout(viewport)
+            except Exception:
+                pass
+        try:
+            viewport.scroll_to_y(0, lv.ANIM.OFF)
+        except Exception:
+            try:
+                lv.obj_scroll_to_y(viewport, 0, lv.ANIM.OFF)
+            except Exception:
+                pass
+        try:
+            viewport.clear_flag(lv.obj.FLAG.SCROLL_ELASTIC)
+        except Exception:
+            pass
+        last_row_start = max(
+            0, (int(item_count) - LIST_VISIBLE_ROWS) * LIST_ROW_STEP)
+        self._bind_list_scroll_settle(viewport, last_row_start)
+
+    def _bind_list_scroll_settle(self, viewport, last_row_start):
+        state = {
+            "viewport": viewport,
+            "last_row_start": int(last_row_start),
+            "tracking": False,
+            "last_y": None,
+            "stable_since": None,
+            "target": None,
+            "settling": False,
+        }
+        self._list_scroll_states.append(state)
+        def scroll_activity(event, target=viewport):
+            self._list_scroll_activity(state)
+        def scroll_deleted(event, target=viewport):
+            self._list_scroll_deleted(state)
+        viewport.add_event_cb(
+            scroll_activity, lv.EVENT.SCROLL_BEGIN, None)
+        viewport.add_event_cb(
+            scroll_activity, lv.EVENT.SCROLL, None)
+        viewport.add_event_cb(
+            scroll_deleted, lv.EVENT.DELETE, None)
+        if self._list_scroll_timer is None:
+            try:
+                self._list_scroll_timer = lv.timer_create(
+                    self._list_scroll_poll, LIST_SETTLE_POLL_MS, None)
+                self._pause_list_scroll_timer()
+            except Exception:
+                self._list_scroll_timer = None
+
+    @staticmethod
+    def _read_list_scroll_y(viewport):
+        try:
+            return int(viewport.get_scroll_y())
+        except Exception:
+            try:
+                return int(lv.obj_get_scroll_y(viewport))
+            except Exception:
+                return None
+
+    def _pause_list_scroll_timer(self):
+        timer = self._list_scroll_timer
+        if timer is None:
+            return
+        try:
+            timer.pause()
+        except Exception:
+            pass
+
+    def _resume_list_scroll_timer(self):
+        timer = self._list_scroll_timer
+        if timer is None:
+            return
+        try:
+            timer.reset()
+            timer.resume()
+        except Exception:
+            pass
+
+    def _list_scroll_activity(self, state):
+        """只记录原生滚动活动，不修改跟手或惯性过程。"""
+        if state["settling"] or state not in self._list_scroll_states:
+            return
+        now = utime.ticks_ms()
+        was_tracking = state["tracking"]
+        if self.app.touch.pressed:
+            state["target"] = None
+        state["tracking"] = True
+        state["last_y"] = self._read_list_scroll_y(state["viewport"])
+        state["stable_since"] = now
+        if not was_tracking:
+            self._resume_list_scroll_timer()
+
+    def _list_scroll_deleted(self, state):
+        """列表销毁后解除引用，避免定时器持有失效的LVGL对象。"""
+        self._list_scroll_states = [
+            item for item in self._list_scroll_states if item is not state]
+        if not any(item["tracking"] for item in self._list_scroll_states):
+            self._pause_list_scroll_timer()
+
+    def _list_scroll_poll(self, timer):
+        """原生惯性真正静止后，再将活动列表补齐到最近的完整行。"""
+        now = utime.ticks_ms()
+        for state in tuple(self._list_scroll_states):
+            if state["tracking"]:
+                self._poll_one_list_scroll(state, now)
+        if not any(item["tracking"] for item in self._list_scroll_states):
+            self._pause_list_scroll_timer()
+
+    def _poll_one_list_scroll(self, state, now):
+        viewport = state["viewport"]
+        scroll_y = self._read_list_scroll_y(viewport)
+        if scroll_y is None:
+            state["tracking"] = False
+            state["target"] = None
+            return
+        if self.app.touch.pressed:
+            state["target"] = None
+            state["last_y"] = scroll_y
+            state["stable_since"] = now
+            return
+        if scroll_y != state["last_y"]:
+            state["last_y"] = scroll_y
+            state["stable_since"] = now
+            return
+        stable_since = state["stable_since"]
+        if (stable_since is None or
+                utime.ticks_diff(now, stable_since) < LIST_SETTLE_STABLE_MS):
+            return
+        if state["target"] is not None:
+            state["target"] = None
+            state["tracking"] = False
+            return
+        target = ((scroll_y + LIST_ROW_STEP // 2) //
+                  LIST_ROW_STEP) * LIST_ROW_STEP
+        target = max(0, min(state["last_row_start"], target))
+        if target == scroll_y:
+            state["tracking"] = False
+            return
+        state["target"] = target
+        state["settling"] = True
+        aligned = True
+        try:
+            try:
+                viewport.scroll_to_y(target, lv.ANIM.ON)
+            except Exception:
+                try:
+                    lv.obj_scroll_to_y(viewport, target, lv.ANIM.ON)
+                except Exception:
+                    aligned = False
+        finally:
+            state["settling"] = False
+        if not aligned:
+            state["target"] = None
+            state["tracking"] = False
+            return
+        state["last_y"] = None
+        state["stable_since"] = now
 
     def _make_placeholder(self, page, name):
         titles = {"shoulder_mode": "肩灯模式", "double_click_mode": "双击模式",

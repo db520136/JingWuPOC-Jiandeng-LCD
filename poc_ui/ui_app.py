@@ -78,6 +78,7 @@ class NavigationTestApp:
         self.root_view = None
         self.child_view = None
         self.root_pages = {}
+        self.root_indicator = None
         self.status_bar = None
         self.login_page = None
         self.login_prefix = "M"
@@ -109,13 +110,36 @@ class NavigationTestApp:
         obj.set_style_border_opa(0, lv.PART.MAIN)
         obj.set_style_outline_width(0, lv.PART.MAIN)
         obj.set_style_outline_opa(0, lv.PART.MAIN)
+        try:
+            obj.set_style_radius(0, lv.PART.MAIN)
+            obj.set_style_shadow_width(0, lv.PART.MAIN)
+            obj.set_style_pad_all(0, lv.PART.MAIN)
+        except Exception:
+            pass
         # 某些固件即使关闭 scrollbar mode，仍会保留 scrollbar 部件样式；
-        # 同时清除其宽度、透明度和边框，避免出现白色滑动条。
+        # 横向滚动条由高度控制，因此宽度和高度都清零。
         try:
             obj.set_style_width(0, lv.PART.SCROLLBAR)
+            obj.set_style_height(0, lv.PART.SCROLLBAR)
             obj.set_style_bg_opa(0, lv.PART.SCROLLBAR)
             obj.set_style_border_width(0, lv.PART.SCROLLBAR)
             obj.set_style_border_opa(0, lv.PART.SCROLLBAR)
+            obj.set_style_outline_width(0, lv.PART.SCROLLBAR)
+            obj.set_style_outline_opa(0, lv.PART.SCROLLBAR)
+            obj.set_style_shadow_width(0, lv.PART.SCROLLBAR)
+            obj.set_style_pad_all(0, lv.PART.SCROLLBAR)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _make_black_surface(obj):
+        """清除导航容器主题底色；只调整视觉样式，不改变滚动行为。"""
+        obj.set_style_bg_color(lv.color_hex(0), lv.PART.MAIN)
+        obj.set_style_bg_opa(255, lv.PART.MAIN)
+        try:
+            obj.set_style_radius(0, lv.PART.MAIN)
+            obj.set_style_shadow_width(0, lv.PART.MAIN)
+            obj.set_style_pad_all(0, lv.PART.MAIN)
         except Exception:
             pass
 
@@ -151,9 +175,6 @@ class NavigationTestApp:
         released_periodic = self.command_queue.set_ui_busy(busy)
 
     def _make_root(self):
-        # 切页第一步：清理旧图片缓存，设置缓存数量
-        #lv.img.cache_invalidate_src(None)
-        #lv.img.cache_set_size(8) 
         self.root_screen = lv.obj()
         self.root_screen.set_size(self.width, self.height)
         self._remove_frame(self.root_screen)
@@ -171,6 +192,7 @@ class NavigationTestApp:
         self.nav_host.set_pos(0, self.status_height)
         self.nav_host.set_size(self.content_width, self.content_height)
         self._remove_frame(self.nav_host)
+        self._make_black_surface(self.nav_host)
         self.nav_host.set_scroll_dir(lv.DIR.HOR)
         self.nav_host.set_scrollbar_mode(lv.SCROLLBAR_MODE.OFF)
         try:
@@ -185,11 +207,13 @@ class NavigationTestApp:
         # 独立处理，子页面槽位再通过 DIR.LEFT 提供右滑返回路径。
         root_tile = self.nav_host.add_tile(0, 0, lv.DIR.NONE)
         self._remove_frame(root_tile)
+        self._make_black_surface(root_tile)
         self._make_fixed_container(root_tile)
         self.nav_tiles[0] = root_tile
         self.root_content = lv.tileview(root_tile)
         self.root_content.set_size(self.content_width, self.content_height)
         self._remove_frame(self.root_content)
+        self._make_black_surface(self.root_content)
         self.root_content.set_scroll_dir(lv.DIR.HOR)
         self.root_content.set_scrollbar_mode(lv.SCROLLBAR_MODE.OFF)
         try:
@@ -204,13 +228,16 @@ class NavigationTestApp:
             tile_dir = lv.DIR.LEFT | lv.DIR.RIGHT
             tile = self.root_content.add_tile(index, 0, tile_dir)
             self._remove_frame(tile)
+            self._make_black_surface(tile)
             self.root_pages[name] = self.pages.root(
                 name, ROOT_TITLES[index], parent=tile)
+        self.root_indicator = self.pages.create_root_indicator(root_tile)
         self.root_content.add_event_cb(self._root_changed, lv.EVENT.VALUE_CHANGED, None)
         self.nav_host.add_event_cb(self._nav_changed, lv.EVENT.VALUE_CHANGED, None)
         self.root_view = 0
         self.status_bar = self.pages.create_status_bar(self.root_screen)
         self.login_page = self.pages.create_login_page(self.root_screen)
+        self.pages.create_confirm_dialog(self.root_screen)
         self.nav_host.add_flag(lv.obj.FLAG.HIDDEN)
         self.status_bar.add_flag(lv.obj.FLAG.HIDDEN)
         lv.scr_load(self.root_screen)
@@ -239,9 +266,6 @@ class NavigationTestApp:
         # 登录页的颜色属于页面样式，由 PageFactory 统一管理。应用层只
         # 传递状态，避免直接引用 ui_pages.py 内部的颜色常量。
         self.pages.update_login_prefix(prefix)
-        self.login_digits = ""
-        if self.login_display is not None:
-            self.login_display.set_text("")
 
     def login_digit(self, digit):
         if len(self.login_digits) >= 6:
@@ -262,9 +286,102 @@ class NavigationTestApp:
             "潘荣丰", self.login_prefix + self.login_digits)
         self._login_transition_pending = True
 
+    def logout_to_login(self):
+        """结束模拟登录并复位现有导航对象，不触发真实通信业务。"""
+        self._logged_in = False
+        self._login_transition_pending = False
+        self.router.reset()
+        try:
+            self.nav_host.set_tile_id(0, 0, lv.ANIM.OFF)
+        except Exception:
+            self.nav_host.set_tile_id(0, 0)
+        try:
+            self.root_content.set_tile_id(0, 0, lv.ANIM.OFF)
+        except Exception:
+            self.root_content.set_tile_id(0, 0)
+        self._remove_route_tiles_from(1)
+        self.root_view = 0
+        self._root_session_index = 0
+        self.child_screen = self.nav_tiles.get(0)
+        self.pages.update_root_indicator(0)
+        self.pages.set_status_context("police")
+
+        self.login_digits = ""
+        if self.login_display is not None:
+            self.login_display.set_text("")
+            self.login_display.invalidate()
+        self.set_login_prefix("M")
+
+        self.nav_host.add_flag(lv.obj.FLAG.HIDDEN)
+        self.status_bar.add_flag(lv.obj.FLAG.HIDDEN)
+        self.login_page.clear_flag(lv.obj.FLAG.HIDDEN)
+        try:
+            self.login_page.move_foreground()
+        except Exception:
+            pass
+        self.root_screen.invalidate()
+
     def show_message(self, text):
         # 纯 UI 基线不显示业务提示，登录页按固定键盘布局呈现。
         return None
+
+    def select_lamp_mode(self, mode):
+        if mode not in ("off", "alternate", "diagonal"):
+            return False
+        _revision, snapshot = self.state_store.get_snapshot()
+        self.state_store.update_lamp(
+            mode, snapshot["lamp_brightness"],
+            snapshot["lamp_alarm_active"])
+        return True
+
+    def select_double_click(self, enabled):
+        self.state_store.update_motion(bool(enabled))
+        return True
+
+    def select_group(self, group_id):
+        self.state_store.update_group_selection(
+            None if group_id == "__none_group__" else group_id)
+        return True
+
+    def select_person(self, person_key):
+        self.state_store.update_single_selection(
+            None if person_key == "__none_person__" else person_key)
+        return True
+
+    def set_screen_brightness(self, percent):
+        value = max(5, min(100, int(percent)))
+        self.state_store.update_screen_brightness(value)
+        return value
+
+    def set_lamp_brightness(self, percent):
+        value = max(5, min(100, int(percent)))
+        _revision, snapshot = self.state_store.get_snapshot()
+        self.state_store.update_lamp(
+            snapshot["lamp_mode"], value,
+            snapshot["lamp_alarm_active"])
+        return value
+
+    def set_audio_volume(self, level):
+        value = max(0, min(11, int(level)))
+        _revision, snapshot = self.state_store.get_snapshot()
+        self.state_store.update_audio(
+            snapshot["audio_tx_active"], snapshot["audio_rx_active"], value)
+        return value
+
+    def select_sleep_timeout(self, seconds):
+        if seconds not in (10, 15, 20, 30, 60, None):
+            return False
+        self.state_store.update_sleep_timeout(seconds)
+        return True
+
+    def select_fall_detection(self, enabled):
+        self.state_store.update_fall_detection(bool(enabled))
+        return True
+
+    def preview_check_upgrade(self):
+        status = "当前已是最新版本"
+        self.state_store.update_upgrade_status(status)
+        return status
 
     @staticmethod
     def _disable_horizontal_elastic(obj):
@@ -322,6 +439,7 @@ class NavigationTestApp:
                     except Exception:
                         pass
                 self.root_view = self._root_session_index
+            self.pages.update_root_indicator(self.root_view)
         except Exception as error:
             # LVGL event callbacks must not bring down the UI loop.
             self.root_view = None
@@ -376,6 +494,7 @@ class NavigationTestApp:
         tile = self.nav_host.add_tile(
             depth, 0, lv.DIR.LEFT | lv.DIR.RIGHT)
         self._remove_frame(tile)
+        self._make_black_surface(tile)
         self._make_fixed_container(tile)
         self.nav_tiles[depth] = tile
         self.child_screen = tile
@@ -394,9 +513,14 @@ class NavigationTestApp:
                 depth, 0, lv.ANIM.ON if direction == "forward" else lv.ANIM.OFF)
         except Exception:
             self.nav_host.set_tile_id(depth, 0)
+        if direction == "back":
+            # 返回手势确认完成后才清理更深层页面。这样拖动过程中仍能
+            # 反向回到原页，返回完成后上一级右侧也不会残留旧页面。
+            self._remove_route_tiles_from(depth + 1)
         self.nav_tiles[depth].invalidate()
 
     def show_root_page(self):
+        self.pages.set_status_context("police")
         self.child_screen = self.nav_tiles.get(0)
         try:
             self.nav_host.set_tile_id(0, 0, lv.ANIM.OFF)
@@ -408,6 +532,8 @@ class NavigationTestApp:
         self.root_screen.invalidate()
 
     def show_child_page(self, page_info, direction="forward"):
+        self.pages.set_status_context(
+            "settings" if page_info[0] == "settings_menu" else "police")
         self._show_child(page_info, direction)
 
     def open_child(self, name):

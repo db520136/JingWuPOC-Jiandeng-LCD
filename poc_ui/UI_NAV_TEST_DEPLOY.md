@@ -32,23 +32,25 @@ font_port.py
 
 本验证版本不依赖 `lcd_touch.py` 或现有通信业务脚本，但页面图标需要一并上传。
 需要外置 Flash 中已有的 `watch_Semibold_24.bin` 和 `watch_Regular_16.bin` 字库。
+页面图片统一使用标准 baseline RGB JPG（不再依赖 PNG/SJPG）；请上传下方列出的
+`.jpg` 资源，并保持文件名和 `U:/` 路径一致。
 
 若图片资源挂载在 `U:/`，请同时上传以下资源（文件名保持不变）：
 
 ```text
-location_icon_92.sjpg
-shoulder_lamp.sjpg
-intercom.sjpg
-settings.sjpg
-settings_device.png
-settings_brightness.png
-settings_shoulder_brightness.png
-settings_volume.png
-settings_sleep.png
-settings_network.png
-settings_fall_detection.png
-wifi_0.png
-wifi_5.png
+location_icon_92.jpg
+shoulder_lamp.jpg
+intercom.jpg
+settings.jpg
+settings_device.jpg
+settings_brightness.jpg
+settings_shoulder_brightness.jpg
+settings_volume.jpg
+settings_sleep.jpg
+settings_network.jpg
+settings_fall_detection.jpg
+wifi_0.jpg
+wifi_5.jpg
 ```
 
 `ui_perf_diag.py` 是保留的独立性能诊断文件，本次正常启动入口不导入它，
