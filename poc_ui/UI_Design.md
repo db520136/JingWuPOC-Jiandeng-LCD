@@ -42,7 +42,6 @@ display_port.py        LCD 初始化、LVGL 显示驱动和 flush
 touch_port.py          触摸读取、坐标变换和 LVGL 输入驱动
 ui_router.py           二级/三级页面栈和生命周期
 root_carousel.py       四个一级页面的固定横向容器
-ui_gesture.py          历史手势模块（当前统一导航容器不再使用）
 ui_messages.py         业务消息格式和 UI 消息队列
 ui_commands.py         UI 到业务服务的命令适配
 ui_pages.py            最小验证页面
@@ -365,7 +364,6 @@ Brightness
 display_port.py       LCD/LVGL 显示适配
 touch_port.py         CST816D 简化坐标输入
 ui_router.py          二级/三级页面栈
-ui_gesture.py         历史手势模块（当前入口不依赖）
 ui_pages.py           静态验证页面
 ui_app.py             LVGL 主循环和应用编排
 main_ui_nav_test.py   独立启动入口

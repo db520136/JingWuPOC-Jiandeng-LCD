@@ -23,7 +23,6 @@ touch_port.py
 ui_app.py
 ui_pages.py
 ui_router.py
-ui_gesture.py
 ui_commands.py
 ui_messages.py
 ui_state.py
@@ -52,9 +51,6 @@ settings_fall_detection.jpg
 wifi_0.jpg
 wifi_5.jpg
 ```
-
-`ui_perf_diag.py` 是保留的独立性能诊断文件，本次正常启动入口不导入它，
-因此不会输出 `[诊断A]`/`[诊断B]` 日志；需要再次做性能测试时再单独接入。
 
 正文固定使用外置 Flash 中的 `watch_Semibold_24.bin`，状态栏使用
 `watch_Regular_16.bin`，不提供 A/B 运行时切换开关。
