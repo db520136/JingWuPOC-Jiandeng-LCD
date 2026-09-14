@@ -69,8 +69,13 @@ class CommunicationRuntime:
         if self.event_callback is not None:
             self.event_callback(wrapped)
 
-    def start(self):
-        """启动三个 Worker；失败时回收已启动对象和 Socket。"""
+    def start(self, session_threaded=True, session_wake_callback=None):
+        """启动三个 Worker；失败时回收已启动对象和 Socket。
+
+        ``session_threaded=False`` 用于正式 UI 入口：PTT 状态机由上层
+        唯一通信业务线程调用 ``poll_once``，避免额外创建 PTT 线程。
+        独立通信测试默认保持原有内部线程模式。
+        """
         if self.running:
             return False
         self.tcp_receive = TCPReceiveWorker(
@@ -96,7 +101,7 @@ class CommunicationRuntime:
                 raise RuntimeError("统一发送线程未启动")
             self.running = True
             if self.session is not None:
-                self.session.start()
+                self.session.start(session_threaded, session_wake_callback)
             return True
         except Exception:
             if started_tcp:

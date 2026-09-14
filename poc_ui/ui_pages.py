@@ -253,7 +253,7 @@ class PageFactory:
 			bar, "M100001", 23, 3, 105, 24, WHITE, lv.TEXT_ALIGN.LEFT, True)
 		self._status_network_icon = _image(bar, "wifi_5.jpg", 143, 3, 24, 24)
 		self._status_labels["battery"] = _label(
-			bar, "电量：99%", 170, 3, 74, 24, WHITE, lv.TEXT_ALIGN.RIGHT, True)
+			bar, "电量：99%", 170, 3, 110, 24, WHITE, lv.TEXT_ALIGN.RIGHT, True)
 		return bar
 
 	def create_root_indicator(self, parent):

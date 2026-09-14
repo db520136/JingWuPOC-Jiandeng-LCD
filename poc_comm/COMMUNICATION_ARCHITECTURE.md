@@ -61,9 +61,9 @@ communication_session.py
 统一发送。它负责 Worker 启停、Socket 关闭和 Socket 替换重连，但不自动执行
 登录、入组等协议状态机。第四阶段测试入口只使用可控假 Socket 验证三个线程
 同时运行，不修改正式 `main.py`。`audio_port.py` 统一管理 G.711/PCM 和
-GPIO27；`communication_session.py` 独立管理 GPIO28 PTT 消抖、抢麦和释放麦权
-状态机，作为可选会话挂载到 Runtime。它会额外创建一个永久阻塞等待事件的
-轻量 PTT/会话线程，但不会增加 RTP 或 TCP 发送线程；`audio_port.py` 本身不
+GPIO27；`communication_session.py` 管理 GPIO29 PTT 消抖、抢麦和释放麦权
+状态机。正式 UI 入口由统一通信业务线程调用 `poll_once()`，不再额外创建
+PTT 线程；独立测试入口仍可使用默认的内部线程模式。`audio_port.py` 本身不
 创建线程。
 
 第四阶段真实公网测试入口为：
@@ -73,7 +73,7 @@ communication_stage4_live_test.py
 ```
 
 该入口将 HTTP 组查询、登录、入组、抢麦、RTP 激活与持续音频、释放麦权、TCP
-心跳和重连流程迁移到 `CommunicationRuntime` 上。当前入口在入组后等待 GPIO28
+心跳和重连流程迁移到 `CommunicationRuntime` 上。当前入口在入组后等待 GPIO29
 PTT，使用 `audio_port.py` 的真实 G.711 麦克风采集；主线程不直接调用 TCP
 `recv()`，TCP 应答全部来自 `TCPReceiveWorker` 回调，所有发送均通过统一发送
 线程完成。该入口仍不修改正式 `main.py`。

@@ -38,7 +38,8 @@ class NavigationTestApp:
 	def __init__(self, battery=None, network=None, lamp=None,
 				 low_priority_worker=None, low_priority_worker_factory=None,
 				 sensor_service=None, command_queue=None,
-				 state_store=None, message_bus=None):
+				 state_store=None, message_bus=None,
+				 communication_controller=None):
 		self.width = 296
 		self.height = 240
 		self.status_height = 30
@@ -58,6 +59,7 @@ class NavigationTestApp:
 		self.lamp = lamp
 		self.low_priority_worker = low_priority_worker
 		self.sensor_service = sensor_service
+		self.communication_controller = communication_controller
 		if (self.low_priority_worker is None and
 				low_priority_worker_factory is not None):
 			self.low_priority_worker = low_priority_worker_factory(
@@ -279,12 +281,18 @@ class NavigationTestApp:
 	def login_confirm(self):
 		if len(self.login_digits) < 6:
 			return
+		police_no = self.login_prefix + self.login_digits
+		if self.communication_controller is not None:
+			if not self.communication_controller.request_login(police_no):
+				return
 		self.state_store.update_identity(
-			"潘荣丰", self.login_prefix + self.login_digits)
+			"潘荣丰", police_no)
 		self._login_transition_pending = True
 
 	def logout_to_login(self):
-		"""结束模拟登录并复位现有导航对象，不触发真实通信业务。"""
+		"""复位导航并异步通知通信侧释放当前会话。"""
+		if self.communication_controller is not None:
+			self.communication_controller.request_logout()
 		self._logged_in = False
 		self._login_transition_pending = False
 		self.router.reset()
@@ -332,6 +340,10 @@ class NavigationTestApp:
 		return True
 
 	def select_group(self, group_id):
+		if (self.communication_controller is not None and
+				group_id != "__none_group__"):
+			if not self.communication_controller.request_join_group(group_id):
+				return False
 		self.state_store.update_group_selection(
 			None if group_id == "__none_group__" else group_id)
 		return True
@@ -581,7 +593,12 @@ class NavigationTestApp:
 				self._release_ui_after_task = False
 				self._set_ui_busy(False)
 			if self._login_transition_pending and not self.touch.pressed:
-				self._finish_login_transition()
+				_login_ready = self.communication_controller is None
+				if self.communication_controller is not None:
+					_login_ready = (self.state_store.get_snapshot()[1]["login_state"]
+									in ("logged_in", "joined"))
+				if _login_ready:
+					self._finish_login_transition()
 			if (self._child_transition_busy and
 					utime.ticks_diff(utime.ticks_ms(),
 						self._child_transition_until) >= 0):
@@ -599,7 +616,7 @@ class NavigationTestApp:
 def main(battery=None, network=None, lamp=None,
 		 low_priority_worker=None, low_priority_worker_factory=None,
 		 sensor_service=None, command_queue=None, state_store=None,
-		 message_bus=None):
+		 message_bus=None, communication_controller=None):
 	NavigationTestApp(
 		battery=battery,
 		network=network,
@@ -610,4 +627,5 @@ def main(battery=None, network=None, lamp=None,
 		command_queue=command_queue,
 		state_store=state_store,
 		message_bus=message_bus,
+		communication_controller=communication_controller,
 	).start()

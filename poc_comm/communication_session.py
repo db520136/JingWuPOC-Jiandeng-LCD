@@ -2,8 +2,11 @@
 """PTT GPIO29 和 POC 麦权会话状态机。
 
 本模块不直接访问 Socket；所有 TCP/RTP 发送都通过注入的 ``submit_command``
-进入 CommunicationRuntime 的有界队列。GPIO29 中断只负责唤醒本模块的事件
-线程，消抖、协议组包、状态改变和命令投递全部在线程上下文完成。
+进入 CommunicationRuntime 的有界队列。GPIO29 中断只负责记录边沿并唤醒
+业务循环，消抖、协议组包、状态改变和命令投递全部在线程上下文完成。
+
+正式 UI 入口由 CommunicationController 的唯一业务线程调用 ``poll_once``，
+因此不会再额外创建 PTT 线程；独立阶段测试仍可使用默认的内部线程模式。
 """
 
 import _thread
@@ -83,6 +86,8 @@ class CommunicationSession:
         self._wake_pending = False
         self._ptt_irq_pending = False
         self._events = []
+        self._threaded = True
+        self._wake_callback = None
 
     @staticmethod
     def _new_event_sem():
@@ -112,7 +117,10 @@ class CommunicationSession:
         finally:
             self._lock.release()
         try:
-            self._event_sem.release()
+            if self._threaded:
+                self._event_sem.release()
+            elif self._wake_callback is not None:
+                self._wake_callback()
         except Exception:
             self._lock.acquire()
             try:
@@ -172,7 +180,7 @@ class CommunicationSession:
             utime.sleep_ms(1)
         return self.thread_id is None
 
-    def start(self):
+    def start(self, threaded=True, wake_callback=None):
         if self.running:
             return False
         # 重启/重连前，确保上一次 worker 已经离开 _run；否则同一对象
@@ -190,16 +198,19 @@ class CommunicationSession:
         self.ptt_pin = self._make_ptt_input()
         self.ptt_pressed = (int(self.ptt_pin.read()) == PTT_ACTIVE_LEVEL)
         self.ptt_irq = self._make_ptt_irq()
-        self.ptt_irq.enable()
+        self._threaded = bool(threaded)
+        self._wake_callback = wake_callback
         self.running = True
+        self.ptt_irq.enable()
         self.state = STATE_IDLE if self.group_id is not None else STATE_DISCONNECTED
-        try:
-            self.thread_id = _thread.start_new_thread(self._run, ())
-        except Exception:
-            self.running = False
-            self.ptt_irq.disable()
-            self.ptt_irq = None
-            raise
+        if self._threaded:
+            try:
+                self.thread_id = _thread.start_new_thread(self._run, ())
+            except Exception:
+                self.running = False
+                self.ptt_irq.disable()
+                self.ptt_irq = None
+                raise
         self._emit("ptt_service_started", self.ptt_gpio)
         return True
 
@@ -222,6 +233,42 @@ class CommunicationSession:
             self._ptt_irq_pending = False
         finally:
             self._lock.release()
+
+    def _process_pending(self):
+        """在调用线程中处理一次 GPIO 和运行时事件。"""
+        events = self._take_events()
+        self._lock.acquire()
+        try:
+            ptt_irq_pending = self._ptt_irq_pending
+            self._ptt_irq_pending = False
+        finally:
+            self._lock.release()
+        if ptt_irq_pending and self.ptt_pin is not None:
+            # GPIO 中断只负责唤醒；在线程上下文中消抖并读取最终电平。
+            utime.sleep_ms(PTT_DEBOUNCE_MS)
+            current = (int(self.ptt_pin.read()) == PTT_ACTIVE_LEVEL)
+            self._emit("ptt_sample", {
+                "gpio": self.ptt_gpio,
+                "pressed": current,
+                "previous": self.ptt_pressed,
+            })
+            if current != self.ptt_pressed:
+                self._on_ptt_changed(current)
+        for item in events:
+            if item["kind"] == "runtime":
+                self._handle_runtime_event(item["event"])
+
+    def poll_once(self):
+        """非线程模式下由唯一通信业务线程调用一次。"""
+        if not self.running or self._threaded:
+            return False
+        try:
+            self._process_pending()
+        except Exception as error:
+            # 一次协议异常不能杀死正式通信业务线程，否则 PTT 后续边沿
+            # 将无人处理。
+            self._emit("ptt_worker_error", error)
+        return True
 
     def _take_events(self):
         self._lock.acquire()
@@ -369,31 +416,7 @@ class CommunicationSession:
                 if not self.running:
                     break
                 try:
-                    events = self._take_events()
-                    self._lock.acquire()
-                    try:
-                        ptt_irq_pending = self._ptt_irq_pending
-                        self._ptt_irq_pending = False
-                    finally:
-                        self._lock.release()
-                    if ptt_irq_pending and self.ptt_pin is not None:
-                        # GPIO 中断只负责唤醒；在线程中消抖并读取最终电平。
-                        utime.sleep_ms(PTT_DEBOUNCE_MS)
-                        current = (int(self.ptt_pin.read()) ==
-                                   PTT_ACTIVE_LEVEL)
-                        # ExtInt 在 start() 中启用一次即可；与旧版按键服务
-                        # 保持一致，不在 worker 中重复 enable，避免部分固件
-                        # 在回调期间重配边沿触发器。
-                        self._emit("ptt_sample", {
-                            "gpio": self.ptt_gpio,
-                            "pressed": current,
-                            "previous": self.ptt_pressed,
-                        })
-                        if current != self.ptt_pressed:
-                            self._on_ptt_changed(current)
-                    for item in events:
-                        if item["kind"] == "runtime":
-                            self._handle_runtime_event(item["event"])
+                    self._process_pending()
                 except Exception as error:
                     # 不能让一次协议/驱动异常静默杀死 PTT worker，否则后续
                     # 松开边沿将永远无人处理。
