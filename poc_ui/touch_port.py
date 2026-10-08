@@ -1,32 +1,23 @@
 # -*- coding: utf-8 -*-
-"""独立的 CST816D 触摸输入适配层。
-
-这里只输出统一的横屏逻辑坐标和 pressed/released 状态，不做页面导航、
-点击补发或业务线程调度。该实现不使用旧 ``CST816D.py`` 的手势状态机。
-"""
 
 import utime
 
 import lvgl as lv
-from machine import I2C, Pin
+from machine import I2C
 
 
 I2C_BUS = I2C.I2C1
 I2C_MODE = I2C.FAST_MODE
 CST816D_ADDRESS = 0x15
-RAW_WIDTH = 240
 RAW_HEIGHT = 296
 LOGICAL_WIDTH = 296
 LOGICAL_HEIGHT = 240
 REG_FINGER_NUM = 0x02
-IRQ_GPIO = Pin.GPIO11
-RESET_GPIO = Pin.GPIO15
 TOUCH_SCROLL_THROW = 25
 TOUCH_SCROLL_LIMIT = 10
 
 
 class TouchPort:
-	"""主循环轮询的最小 CST816D -> LVGL pointer 适配。"""
 
 	def __init__(self, address=CST816D_ADDRESS, sample_ms=5):
 		self.address = int(address)
@@ -34,6 +25,7 @@ class TouchPort:
 		self.i2c = I2C(I2C_BUS, I2C_MODE)
 		self.point = (0, 0)
 		self.pressed = False
+		self.enabled = True
 		self.last_poll_ms = None
 		self.started = False
 		self._indev_driver = None
@@ -41,7 +33,6 @@ class TouchPort:
 
 	def configure_scroll(self, throw_value=TOUCH_SCROLL_THROW,
 						 limit_value=TOUCH_SCROLL_LIMIT):
-		"""配置 LVGL 原生滚动惯性和启动门槛；不支持时保留固件默认值。"""
 		throw_value = max(0, min(255, int(throw_value)))
 		limit_value = max(0, min(255, int(limit_value)))
 		throw_ok = False
@@ -87,7 +78,8 @@ class TouchPort:
 			max(0, min(LOGICAL_HEIGHT - 1, int(x)))
 
 	def poll(self, force=False):
-		if not self.started:
+		if not self.started or not self.enabled:
+			self.pressed = False
 			return False
 		now = utime.ticks_ms()
 		if not force and self.last_poll_ms is not None:
@@ -113,10 +105,16 @@ class TouchPort:
 	def _read_cb(self, indev_drv, data):
 		data.point.x = int(self.point[0])
 		data.point.y = int(self.point[1])
-		data.state = 1 if self.pressed else 0
+		data.state = 1 if (self.enabled and self.pressed) else 0
+
+	def set_enabled(self, enabled):
+		self.enabled = bool(enabled)
+		if not self.enabled:
+			self.pressed = False
 
 	def start(self):
 		self.started = True
+		self.enabled = True
 		self._indev_driver = lv.indev_drv_t()
 		self._indev_driver.init()
 		self._indev_driver.type = lv.INDEV_TYPE.POINTER
@@ -126,4 +124,5 @@ class TouchPort:
 
 	def stop(self):
 		self.started = False
+		self.enabled = False
 		self.pressed = False

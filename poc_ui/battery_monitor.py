@@ -1,12 +1,4 @@
 # -*- coding: utf-8 -*-
-"""EC800M ADC0 电池电压采集、滤波和电量换算。
-
-硬件分压：R52=220kΩ，R53=82kΩ，ADC 节点并联 100nF 电容。
-QuecPython 的 ADC.read() 返回值单位为 mV，本模块将其还原为电池端电压。
-
-本模块不创建线程，也不在采样时阻塞主循环。调用方应在主循环中周期调用
-BatteryMonitor.tick()；开机阶段自动快速采样，稳定运行后每秒采样一次。
-"""
 
 import utime
 
@@ -16,17 +8,37 @@ except Exception:
 	# 非 EC800M 环境允许通过构造参数注入 ADC 对象进行静态测试。
 	ADC = None
 
+try:
+	from machine import Pin
+except Exception:
+	Pin = None
+
 
 # 分压电阻参数，单位为 kΩ；电池端到 ADC 节点为 R52，节点到地为 R53。
 DIVIDER_TOP_KOHM = 220
 DIVIDER_BOTTOM_KOHM = 82
-DIVIDER_TOTAL_KOHM = DIVIDER_TOP_KOHM + DIVIDER_BOTTOM_KOHM
 
 # 开机快速采样和运行期采样参数。
 BOOT_SAMPLE_COUNT = 9
 BOOT_SAMPLE_INTERVAL_MS = 20
 RUN_SAMPLE_INTERVAL_MS = 1000
 RUN_MEDIAN_WINDOW = 5
+FULL_CONFIRM_SAMPLES = 3
+CV_CONFIRM_SAMPLES = 3
+CV_ENTER_MV = 4340
+CV_STABLE_SPREAD_MV = 10
+CV_STEP_SECONDS = 60
+UNPLUG_HOLD_MS = 120000
+UNPLUG_RECONCILE_TOTAL_MS = 1800000
+UNPLUG_RECONCILE_MIN_STEP_MS = 60000
+UNPLUG_RECONCILE_MAX_STEP_MS = 360000
+DISCHARGE_STEP_MS = 120000
+DISCHARGE_STABLE_SAMPLES = 3
+DISCHARGE_STABLE_SPREAD_MV = 15
+HIGH_BATTERY_RESTORE_CUTOFF_MV = 4074
+LOW_VOLTAGE_CONFIRM_SAMPLES = 3
+CV_EXIT_MV = 4325
+CV_EXIT_CONFIRM_SAMPLES = 5
 
 # EMA：新值占 1/4，旧值占 3/4，抑制 LED、PTT 等负载瞬态造成的电压跳变。
 EMA_NEW_WEIGHT = 1
@@ -35,43 +47,24 @@ EMA_TOTAL_WEIGHT = 4
 # 分段放电曲线，电压单位 mV，电量单位 %；电压必须按升序排列。
 # 该表依据用户提供的 CC 放电曲线估算，最终应使用整机实测数据校准。
 DISCHARGE_POINTS = (
-	(3200, 0),
-	(3420, 5),
-	(3500, 6),
-	(3570, 10),
-	(3650, 20),
-	(3690, 30),
-	(3720, 40),
-	(3760, 50),
-	(3810, 60),
-	(3880, 70),
-	(3950, 80),
-	(4000, 85),
-	(4100, 95),
-	(4200, 100),
+	(3200, 1), (3396, 10), (3483, 20), (3551, 30),
+	(3610, 40), (3667, 50), (3746, 60), (3844, 70),
+	(3954, 80), (4025, 86), (4074, 90), (4136, 95),
+	(4208, 99),
 )
 
-# 恒流恒压充电曲线的估算点。当前充电状态脚未接入，暂不启用该表。
-# 充电状态接入后，4.20V 仍按用户要求钳制为 100%。
+# 充电态曲线。4344mV为89%，4340mV以上连续稳定后进入恒压计时。
 CHARGE_POINTS = (
-	(3200, 0),
-	(3500, 5),
-	(3700, 8),
-	(3750, 10),
-	(3850, 30),
-	(3900, 45),
-	(4000, 60),
-	(4100, 80),
-	(4180, 95),
-	(4200, 100),
+	(3200, 1), (3655, 10), (3781, 20), (3910, 30),
+	(3960, 40), (3999, 50), (4049, 60), (4128, 70),
+	(4237, 80), (4299, 85), (4312, 86), (4324, 87),
+	(4337, 88), (4344, 89),
 )
 
 VOLTAGE_EMPTY_MV = 3200
-VOLTAGE_FULL_MV = 4200
 
 
 def _ticks_add(base_ms, delta_ms):
-	"""兼容不同固件的 ticks_add 接口。"""
 	try:
 		return utime.ticks_add(base_ms, delta_ms)
 	except Exception:
@@ -79,7 +72,6 @@ def _ticks_add(base_ms, delta_ms):
 
 
 def _ticks_diff(later_ms, earlier_ms):
-	"""兼容不同固件的 ticks_diff 接口。"""
 	try:
 		return utime.ticks_diff(later_ms, earlier_ms)
 	except Exception:
@@ -87,7 +79,6 @@ def _ticks_diff(later_ms, earlier_ms):
 
 
 def _interpolate(points, voltage_mv):
-	"""在分段曲线中按电压线性插值，结果四舍五入到 1%。"""
 	if voltage_mv <= points[0][0]:
 		return points[0][1]
 	if voltage_mv >= points[-1][0]:
@@ -108,11 +99,11 @@ def _interpolate(points, voltage_mv):
 
 
 class BatteryMonitor:
-	"""ADC0 电池监测状态机。"""
 
 	def __init__(self, adc=None, channel=None,
 				 divider_top_kohm=DIVIDER_TOP_KOHM,
-				 divider_bottom_kohm=DIVIDER_BOTTOM_KOHM):
+				 divider_bottom_kohm=DIVIDER_BOTTOM_KOHM,
+				 nchrg_gpio=14, nstdby_gpio=13, persistent_config=None):
 		self.adc = adc
 		if self.adc is None:
 			if ADC is None:
@@ -144,14 +135,198 @@ class BatteryMonitor:
 		self.raw_voltage_mv = None
 		self.filtered_voltage_mv = None
 		self.percent = None
+		self.estimated_percent = None
 		self.charging_state = None
 		self.last_error = None
 		self._last_reported_percent = None
+		self._nchrg_pin = self._make_status_pin(nchrg_gpio)
+		self._nstdby_pin = self._make_status_pin(nstdby_gpio)
+		self._charge_status_available = (self._nchrg_pin is not None and
+			self._nstdby_pin is not None)
+		self._full_low_count = 0
+		self._full_signal = False
+		self._cv_samples = []
+		self._cv_active = False
+		self._cv_started_ms = None
+		self._cv_elapsed_ms = 0
+		self._cv_anchor_percent = 90
+		self._cv_last_ms = None
+		self._cv_exit_count = 0
+		self._unplug_started_ms = None
+		self._last_drop_ms = None
+		self._charge_anchor_percent = None
+		self._discharge_samples = []
+		self._low_voltage_count = 0
+		self._dynamic_load = False
+		self._last_status_bits = None
+		self.persistent_config = persistent_config
+		self._full_confirmed = bool(persistent_config and
+			persistent_config.get("battery_full_confirmed", False))
+		self._full_signal = self._full_confirmed
+		self._auto_recharge = False
+		self._timed_100 = False
+		self._reconcile_target = None
+		self._reconcile_step_ms = None
+		self._reconcile_complete = False
+		self._last_drop_ms = None
+		self._restored_high = False
+		self._restore_check_samples = []
+		if persistent_config is not None:
+			saved_percent = persistent_config.get("battery_percent")
+			if (persistent_config.get("battery_high_active", False) and
+				saved_percent is not None and int(saved_percent) >= 90):
+				self.percent = int(saved_percent)
+				self._charge_anchor_percent = self.percent
+				self._restored_high = True
+				self._timed_100 = (self.percent == 100 and
+					not self._full_confirmed)
+				if 90 <= self.percent < 100:
+					self._cv_active = True
+					self._cv_anchor_percent = self.percent
+					self._cv_elapsed_ms = 0
 
 		self._open_adc()
 
+	def _make_status_pin(self, gpio):
+		if Pin is None or gpio is None:
+			return None
+		try:
+			pin_id = getattr(Pin, "GPIO{}".format(int(gpio)), int(gpio))
+			return Pin(pin_id, Pin.IN, Pin.PULL_PU, 1)
+		except Exception as error:
+			print("[电池] GPIO{}充电状态脚不可用：{}".format(gpio, error))
+			return None
+
+	def _read_charge_status(self):
+		if not self._charge_status_available:
+			return None, False
+		nchrg = int(self._nchrg_pin.read())
+		nstdby = int(self._nstdby_pin.read())
+		bits = (nchrg, nstdby)
+		changed = bits != self._last_status_bits
+		self._last_status_bits = bits
+		if nchrg == 0 and nstdby == 1:
+			return True, False
+		if nchrg == 1 and nstdby == 0:
+			return False, True
+		if nchrg == 1 and nstdby == 1:
+			return False, False
+		if changed:
+			print("[电池] SLM6335状态脚异常：NCHRG={} NSTDBY={}，保持原状态".format(
+				nchrg, nstdby))
+		return None, False
+
+	def _update_charge_status(self, now_ms, confirm_full=True):
+		charging, full = self._read_charge_status()
+		if charging is None:
+			return
+		previous = self.charging_state
+		previous_full = self._full_confirmed
+		previous_signal = self._full_signal
+		self.charging_state = charging
+		if charging and self._restored_high:
+			self._restored_high = False
+		if full and confirm_full:
+			self._full_low_count += 1
+		elif confirm_full:
+			self._full_low_count = 0
+		if self._full_low_count >= FULL_CONFIRM_SAMPLES:
+			if not self._full_signal:
+				print("[电池] SLM6335确认充满：NSTDBY=低")
+			self._full_signal = True
+			self._full_confirmed = True
+			self._auto_recharge = False
+			self._timed_100 = False
+			self.percent = 100
+			self._cv_active = False
+			self._cv_started_ms = None
+			self._cv_elapsed_ms = 0
+			self._cv_last_ms = None
+		elif self._full_signal and charging:
+			self._full_signal = False
+			self._full_confirmed = False
+			self._auto_recharge = True
+			self.percent = 100
+			self._cv_active = False
+			self._cv_last_ms = None
+			print("[电池] 检测到自动复充，保持100%等待再次充满")
+		elif self._full_signal and not full and not charging:
+			self._full_signal = False
+			self._full_confirmed = False
+			self._charge_anchor_percent = self.percent or 100
+			self._unplug_started_ms = now_ms
+			self._last_drop_ms = now_ms
+		if previous != charging:
+			self._charge_anchor_percent = self.percent
+			self._unplug_started_ms = (None if charging else now_ms)
+			if charging:
+				self._last_drop_ms = None
+				self._unplug_started_ms = None
+				self._reconcile_target = None
+				self._reconcile_step_ms = None
+				self._reconcile_complete = False
+			else:
+				self._auto_recharge = False
+				if self.percent is not None:
+					self._charge_anchor_percent = self.percent
+				self._unplug_started_ms = now_ms
+				self._last_drop_ms = now_ms
+				self._reconcile_target = None
+				self._reconcile_step_ms = None
+				self._reconcile_complete = False
+				self._cv_samples = []
+				self._cv_active = False
+				self._cv_last_ms = None
+				self._discharge_samples = []
+		if (previous_full != self._full_confirmed or
+			previous_signal != self._full_signal):
+			self._persist_display_state()
+
+	def set_charging_state(self, state):
+		"""供桌面测试或无状态脚硬件使用；真实设备优先读取GPIO。"""
+		if self._charge_status_available:
+			return self.percent
+		self.charging_state = None if state is None else bool(state)
+		return self.percent
+
+	def set_dynamic_load(self, active):
+		self._dynamic_load = bool(active)
+
+	def _persist_display_state(self):
+		if self.persistent_config is None:
+			return
+		percent = self.percent
+		if percent is not None and percent >= 90:
+			self.persistent_config.update(
+				battery_percent=int(percent), battery_high_active=True,
+				battery_full_confirmed=bool(self._full_confirmed))
+		elif percent is not None:
+			self.persistent_config.update(
+				battery_percent=None, battery_high_active=False,
+				battery_full_confirmed=bool(self._full_confirmed))
+
+	def _clear_restored_high_state(self):
+		self._restored_high = False
+		self._timed_100 = False
+		self._full_signal = False
+		self._full_confirmed = False
+		self._auto_recharge = False
+		self._unplug_started_ms = None
+		self._charge_anchor_percent = None
+		self._reconcile_target = None
+		self._reconcile_step_ms = None
+		self._reconcile_complete = True
+		self._last_drop_ms = None
+		if self.persistent_config is not None:
+			self.persistent_config.update(battery_percent=None,
+				battery_high_active=False, battery_full_confirmed=False)
+		print("[电池] 开机电压不高于{}mV，旧高电量记录已清除，按放电曲线显示{}%".format(
+			HIGH_BATTERY_RESTORE_CUTOFF_MV, self.estimated_percent))
+
+	def is_full_confirmed(self):
+		return bool(self._full_signal)
+
 	def _open_adc(self):
-		"""打开 ADC0；官方 ADC 对象通常使用 open() 无参数接口。"""
 		opener = getattr(self.adc, "open", None)
 		if opener is not None:
 			result = opener()
@@ -160,14 +335,12 @@ class BatteryMonitor:
 		self._adc_open = True
 
 	def close(self):
-		"""关闭 ADC 资源。"""
 		closer = getattr(self.adc, "close", None)
 		if closer is not None and self._adc_open:
 			closer()
 		self._adc_open = False
 
 	def _read_adc_mv(self):
-		"""通过官方 ADC0 接口读取节点电压，单位 mV。"""
 		if not self._adc_open:
 			self._open_adc()
 		value = self.adc.read(self.channel)
@@ -182,7 +355,6 @@ class BatteryMonitor:
 		return value
 
 	def adc_to_battery_mv(self, adc_mv):
-		"""按220k/82k分压比例，将ADC节点电压换算为电池电压。"""
 		adc_mv = int(adc_mv)
 		if adc_mv < 0:
 			raise ValueError("ADC电压不能为负数")
@@ -191,7 +363,6 @@ class BatteryMonitor:
 				self.divider_bottom_kohm // 2) // self.divider_bottom_kohm
 
 	def _trimmed_average(self, values):
-		"""去掉一个最大值和一个最小值后求平均。"""
 		ordered = sorted(values)
 		if len(ordered) <= 2:
 			return sum(ordered) // len(ordered)
@@ -199,38 +370,143 @@ class BatteryMonitor:
 		return (sum(middle) + len(middle) // 2) // len(middle)
 
 	def _median(self, values):
-		"""返回小窗口的中位数。"""
 		ordered = sorted(values)
 		return ordered[len(ordered) // 2]
 
 	def _curve_points(self):
-		"""根据充电状态选择电压曲线；未知状态暂按放电曲线处理。"""
 		if self.charging_state is True:
 			return CHARGE_POINTS
 		return DISCHARGE_POINTS
 
 	def voltage_to_percent(self, voltage_mv):
-		"""将电池电压换算为整数电量百分比。"""
 		voltage_mv = int(voltage_mv)
-		if voltage_mv >= VOLTAGE_FULL_MV:
+		return max(1, min(99, _interpolate(self._curve_points(), voltage_mv)))
+
+	def _apply_display_rules(self, mapped_percent, now_ms, sample_mv=None):
+		if self.filtered_voltage_mv <= VOLTAGE_EMPTY_MV:
+			self._low_voltage_count += 1
+		else:
+			self._low_voltage_count = 0
+		if self._low_voltage_count >= LOW_VOLTAGE_CONFIRM_SAMPLES:
+			return 1
+		if self._full_signal:
 			return 100
-		if voltage_mv <= VOLTAGE_EMPTY_MV:
-			return 0
-		return _interpolate(self._curve_points(), voltage_mv)
-
-	def set_charging_state(self, state):
-		"""设置充电状态：True=充电，False=未充电，None=未知。"""
-		if state not in (True, False, None):
-			raise ValueError("充电状态只能是 True、False 或 None")
-		self.charging_state = state
-		if self.filtered_voltage_mv is None:
+		if self._dynamic_load:
+			if self._cv_active:
+				self._cv_last_ms = now_ms
+			return self.percent if self.percent is not None else mapped_percent
+		if self.charging_state is True:
+			if self._auto_recharge:
+				return 100
+			if self._timed_100 and self.percent == 100:
+				return 100
+			cv_voltage = (self.filtered_voltage_mv if sample_mv is None else
+				int(sample_mv))
+			if (not self._booting and not self._cv_active and
+				cv_voltage >= CV_ENTER_MV):
+				self._cv_samples.append(cv_voltage)
+				if len(self._cv_samples) > CV_CONFIRM_SAMPLES:
+					self._cv_samples.pop(0)
+				if (len(self._cv_samples) == CV_CONFIRM_SAMPLES and
+					max(self._cv_samples) - min(self._cv_samples) <=
+					CV_STABLE_SPREAD_MV):
+					self._cv_active = True
+					self._cv_started_ms = now_ms
+					self._cv_elapsed_ms = 0
+					self._cv_anchor_percent = 90
+					self._cv_last_ms = now_ms
+					self._timed_100 = False
+					print("[电池] 连续{}次滤波电压稳定达到{}mV，进入恒压阶段，显示90%".format(
+						CV_CONFIRM_SAMPLES, CV_ENTER_MV))
+			elif not self._cv_active:
+				self._cv_samples = []
+			if self._cv_active:
+				if self._cv_last_ms is None:
+					self._cv_last_ms = now_ms
+				if cv_voltage < CV_EXIT_MV:
+					self._cv_exit_count += 1
+				else:
+					self._cv_exit_count = 0
+				if self._cv_exit_count >= CV_EXIT_CONFIRM_SAMPLES:
+					self._cv_active = False
+					self._cv_samples = []
+					self._cv_last_ms = None
+					self._cv_elapsed_ms = 0
+					print("[电池] 充电电压持续低于{}mV，退出恒压计时".format(
+						CV_EXIT_MV))
+				else:
+					if self._cv_last_ms is not None:
+						self._cv_elapsed_ms += max(0, _ticks_diff(
+							now_ms, self._cv_last_ms))
+					self._cv_last_ms = now_ms
+					value = min(100, self._cv_anchor_percent +
+						self._cv_elapsed_ms //
+						(CV_STEP_SECONDS * 1000))
+					self._timed_100 = value >= 100
+					return max(self.percent or 1, value)
+			value = min(89, mapped_percent)
+			return max(self.percent or 1, value)
+		if self._restored_high:
+			self._restore_check_samples.append(self.filtered_voltage_mv)
+			if len(self._restore_check_samples) > DISCHARGE_STABLE_SAMPLES:
+				self._restore_check_samples.pop(0)
+			if (len(self._restore_check_samples) == DISCHARGE_STABLE_SAMPLES and
+				max(self._restore_check_samples) -
+				min(self._restore_check_samples) <=
+				DISCHARGE_STABLE_SPREAD_MV and
+				self.filtered_voltage_mv <= HIGH_BATTERY_RESTORE_CUTOFF_MV):
+				self.percent = max(1, mapped_percent)
+				self._clear_restored_high_state()
+				return self.percent
+		if self._unplug_started_ms is not None:
+			hold_ms = _ticks_diff(now_ms, self._unplug_started_ms)
+			if hold_ms < UNPLUG_HOLD_MS:
+				return self._charge_anchor_percent or mapped_percent
+		self._discharge_samples.append(self.filtered_voltage_mv)
+		if len(self._discharge_samples) > DISCHARGE_STABLE_SAMPLES:
+			self._discharge_samples.pop(0)
+		if (len(self._discharge_samples) < DISCHARGE_STABLE_SAMPLES or
+			max(self._discharge_samples) - min(self._discharge_samples) >
+			DISCHARGE_STABLE_SPREAD_MV):
+			return self.percent if self.percent is not None else mapped_percent
+		if (not self._reconcile_complete and self.percent is not None and
+			mapped_percent < self.percent):
+			if self._reconcile_target is None:
+				gap = self.percent - mapped_percent
+				self._reconcile_target = mapped_percent
+				if gap > 0:
+					self._reconcile_step_ms = max(
+						UNPLUG_RECONCILE_MIN_STEP_MS,
+						min(UNPLUG_RECONCILE_MAX_STEP_MS,
+							UNPLUG_RECONCILE_TOTAL_MS // gap))
+					self._last_drop_ms = now_ms
+					print("[电池] 拔电平衡开始：当前{}%，目标{}%，每{}秒下降1%".format(
+						self.percent, mapped_percent,
+						self._reconcile_step_ms // 1000))
+			if self.percent > self._reconcile_target:
+				if _ticks_diff(now_ms, self._last_drop_ms) >= self._reconcile_step_ms:
+					self._last_drop_ms = now_ms
+					value = max(self._reconcile_target, self.percent - 1)
+					if value <= self._reconcile_target:
+						self._reconcile_complete = True
+					return value
+				return self.percent
+			self._reconcile_target = None
+			self._reconcile_step_ms = None
+			self._reconcile_complete = True
+			self._last_drop_ms = now_ms
 			return self.percent
-		self.percent = self.voltage_to_percent(self.filtered_voltage_mv)
-		self._last_reported_percent = None
-		return self.percent
+		if self.percent is not None and mapped_percent < self.percent:
+			if self._last_drop_ms is None or _ticks_diff(
+				now_ms, self._last_drop_ms) >= DISCHARGE_STEP_MS:
+				self._last_drop_ms = now_ms
+				return max(1, self.percent - 1)
+			return self.percent
+		return self.percent if self.percent is not None else max(1, mapped_percent)
 
-	def _update_filtered_voltage(self, voltage_mv, boot=False):
-		"""更新启动去极值平均或运行期中位数+EMA。"""
+	def _update_filtered_voltage(self, voltage_mv, boot=False, now_ms=None):
+		if now_ms is None:
+			now_ms = utime.ticks_ms()
 		self.raw_voltage_mv = voltage_mv
 		if boot:
 			self._boot_samples.append(voltage_mv)
@@ -252,17 +528,25 @@ class BatteryMonitor:
 							EMA_TOTAL_WEIGHT // 2) // EMA_TOTAL_WEIGHT
 
 		self.filtered_voltage_mv = int(filtered)
-		self.percent = self.voltage_to_percent(self.filtered_voltage_mv)
+		self.estimated_percent = self.voltage_to_percent(
+			self.filtered_voltage_mv)
+		self.percent = self._apply_display_rules(
+			self.estimated_percent, now_ms,
+			filtered)
+		if self._full_signal:
+			self._full_confirmed = True
+		if self.percent != self._last_reported_percent:
+			self._persist_display_state()
 		changed = self.percent != self._last_reported_percent
 		self._last_reported_percent = self.percent
 		return self.percent if changed else None
 
 	def tick(self, now_ms=None):
-		"""由主循环调用；返回变化后的百分比，否则返回 None。"""
 		if now_ms is None:
 			now_ms = utime.ticks_ms()
 		if _ticks_diff(now_ms, self._next_sample_ms) < 0:
 			return None
+		self._update_charge_status(now_ms, confirm_full=not self._booting)
 
 		try:
 			adc_mv = self._read_adc_mv()
@@ -276,12 +560,14 @@ class BatteryMonitor:
 			return None
 
 		if self._booting:
-			result = self._update_filtered_voltage(battery_mv, boot=True)
+			result = self._update_filtered_voltage(
+				battery_mv, boot=True, now_ms=now_ms)
 			self._last_sample_interval_ms = (
 				BOOT_SAMPLE_INTERVAL_MS if self._booting
 				else RUN_SAMPLE_INTERVAL_MS)
 		else:
-			result = self._update_filtered_voltage(battery_mv, boot=False)
+			result = self._update_filtered_voltage(
+				battery_mv, boot=False, now_ms=now_ms)
 			self._last_sample_interval_ms = RUN_SAMPLE_INTERVAL_MS
 
 		self._next_sample_ms = _ticks_add(
@@ -289,13 +575,13 @@ class BatteryMonitor:
 		return result
 
 	def get_voltage_mv(self):
-		"""返回当前EMA滤波后的电池电压，尚未就绪时返回 None。"""
 		return self.filtered_voltage_mv
 
 	def get_percent(self):
-		"""返回当前整数电量，尚未完成首次采样时返回 None。"""
 		return self.percent
 
+	def get_estimated_percent(self):
+		return self.estimated_percent
+
 	def is_ready(self):
-		"""是否已经完成开机首次滤波。"""
 		return not self._booting and self.percent is not None

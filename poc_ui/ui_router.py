@@ -32,6 +32,9 @@ class Router:
 			return False
 		self.busy = True
 		try:
+			leaving = self.current
+			if leaving is not None and hasattr(self.host, "before_leave_page"):
+				self.host.before_leave_page(leaving[0])
 			self.current = self.stack.pop()
 			if self.current[0] == "__root__":
 				self.current = None
@@ -43,5 +46,7 @@ class Router:
 			self.busy = False
 
 	def reset(self):
+		if self.current is not None and hasattr(self.host, "before_leave_page"):
+			self.host.before_leave_page(self.current[0])
 		self.stack = []
 		self.current = None

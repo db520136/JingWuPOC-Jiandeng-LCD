@@ -11,12 +11,10 @@ import _thread
 
 MSG_NETWORK_CHANGED = "network_changed"
 MSG_BATTERY_CHANGED = "battery_changed"
-MSG_GNSS_CHANGED = "gnss_changed"
 MSG_LOGIN_CHANGED = "login_changed"
 MSG_GROUP_CHANGED = "group_changed"
 MSG_SINGLE_CALL = "single_call"
 MSG_FLOOR_CHANGED = "floor_changed"
-MSG_AUDIO_CHANGED = "audio_changed"
 MSG_LAMP_CHANGED = "lamp_changed"
 MSG_DOUBLE_CLICK = "double_click"
 MSG_ERROR = "error"

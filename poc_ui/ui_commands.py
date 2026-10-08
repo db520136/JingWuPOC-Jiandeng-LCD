@@ -22,10 +22,15 @@ CMD_RELEASE_FLOOR = "release_floor"
 CMD_SINGLE_CALL = "single_call"
 CMD_ACCEPT_SINGLE_CALL = "accept_single_call"
 CMD_REJECT_SINGLE_CALL = "reject_single_call"
-CMD_SET_VOLUME = "set_volume"
 CMD_CHANGE_VOLUME = "change_volume"
 CMD_SET_LAMP_MODE = "set_lamp_mode"
 CMD_SET_LAMP_BRIGHTNESS = "set_lamp_brightness"
+CMD_COMMIT_LAMP_BRIGHTNESS = "commit_lamp_brightness"
+CMD_SET_DOUBLE_CLICK_ENABLED = "set_double_click_enabled"  # 启用或关闭加速度计双击中断。
+CMD_SET_SCREEN_BRIGHTNESS = "set_screen_brightness"  # 设置背光PWM亮度。
+CMD_COMMIT_SCREEN_BRIGHTNESS = "commit_screen_brightness"
+CMD_SET_SLEEP_TIMEOUT = "set_sleep_timeout"  # 设置自动息屏时间，None表示禁用。
+CMD_WAKE_SCREEN = "wake_screen"  # 对讲事件恢复亮屏；LCD操作仍由低优先级Worker执行。
 CMD_REFRESH_NETWORK = "refresh_network"
 CMD_REFRESH_GNSS = "refresh_gnss"
 CMD_DOUBLE_CLICK = "double_click"
@@ -47,6 +52,10 @@ class UICommandQueue:
 		self._periodic_taken_count = 0
 		self._periodic_deferred = False
 		self._stop_pending = False
+		self._screen_timeout_pending = False
+		self._hardware_key_signal_count = 0
+		self._hardware_key_taken_count = 0
+		self._lamp_key_long_pending = False
 		self._ui_busy = False
 		self._sequence = 0
 		self._items = []
@@ -103,11 +112,46 @@ class UICommandQueue:
 			self._wake.release()
 		return True
 
-	def signal_isr(self, command_type, payload=None, priority=PRIORITY_P2):
-		"""兼容旧调用；当前ISR只允许投递加速度双击事件。"""
-		if command_type != CMD_ACCEL_DOUBLE_CLICK_IRQ:
-			return False
-		return self.signal_double_click_isr()
+	def put_latest(self, command_type, payload=None, priority=PRIORITY_P2):
+		"""连续调节只保留最新目标值，不改变普通事件的合并规则。"""
+		self._lock.acquire()
+		try:
+			for item in self._items:
+				if item["type"] == command_type:
+					item["payload"] = payload
+					return True
+			if len(self._items) >= self.max_length:
+				return False
+			self._items.append({"type": str(command_type), "payload": payload,
+				"priority": int(priority), "sequence": self._sequence})
+			self._sequence += 1
+			should_wake = not self._wake_pending
+			if should_wake:
+				self._wake_pending = True
+		finally:
+			self._lock.release()
+		if should_wake:
+			self._wake.release()
+		return True
+
+	def signal_screen_timeout_isr(self):
+		"""息屏Timer使用独立事件槽，不与双击/周期/停止事件互相覆盖。"""
+		self._screen_timeout_pending = True
+		self._release_once_isr()
+
+	def signal_hardware_key_isr(self):
+		"""物理功能键中断使用独立计数槽，不与其他事件互相覆盖。"""
+		self._hardware_key_signal_count += 1
+		self._release_once_isr()
+		return True
+
+	def signal_lamp_key_long_isr(self):
+		self._lamp_key_long_pending = True
+		self._release_once_isr()
+		return True
+
+	def is_ui_busy(self):
+		return self._ui_busy
 
 	def signal_double_click_isr(self):
 		"""GPIO中断投递双击；同类事件未处理前自动合并。"""
@@ -153,6 +197,8 @@ class UICommandQueue:
 		self._lock.acquire()
 		try:
 			stop_pending = self._stop_pending
+			screen_timeout_pending = self._screen_timeout_pending
+			self._screen_timeout_pending = False
 			double_click_signal_count = self._double_click_signal_count
 			double_click_count = (double_click_signal_count -
 								  self._double_click_taken_count)
@@ -162,12 +208,19 @@ class UICommandQueue:
 							  self._periodic_taken_count)
 			periodic_pending = periodic_count > 0 and not self._ui_busy
 			periodic_deferred = self._periodic_deferred
+			hardware_key_signal_count = self._hardware_key_signal_count
+			hardware_key_pending = (hardware_key_signal_count !=
+									self._hardware_key_taken_count)
+			lamp_key_long_pending = self._lamp_key_long_pending
+			self._lamp_key_long_pending = False
 			self._stop_pending = False
 			if double_click_pending:
 				self._double_click_taken_count = double_click_signal_count
 			if periodic_pending:
 				self._periodic_taken_count = periodic_signal_count
 				self._periodic_deferred = False
+			if hardware_key_pending:
+				self._hardware_key_taken_count = hardware_key_signal_count
 			items = self._items
 			self._items = []
 			self._wake_pending = False
@@ -175,11 +228,16 @@ class UICommandQueue:
 										 item["sequence"]))
 			result = (stop_pending, double_click_pending,
 					periodic_pending, periodic_deferred,
-					double_click_count, periodic_count, items)
+					double_click_count, periodic_count, items,
+					screen_timeout_pending, hardware_key_pending,
+					lamp_key_long_pending)
 			# 取批次期间可能又有 ISR/Timer 事件，以计数器为准补一次唤醒。
-			follow_up = (self._stop_pending or
+			follow_up = (self._stop_pending or self._screen_timeout_pending or
+						 self._lamp_key_long_pending or
 						 self._double_click_signal_count !=
 						 self._double_click_taken_count or
+						 self._hardware_key_signal_count !=
+						 self._hardware_key_taken_count or
 						 (self._periodic_signal_count !=
 						  self._periodic_taken_count and not self._ui_busy) or
 						 bool(self._items))
@@ -191,34 +249,14 @@ class UICommandQueue:
 			self._wake.release()
 		return result
 
-	def wait_and_drain(self, max_items=0):
-		"""阻塞等待命令并一次性取出当前批次。"""
-		self._wake.acquire()
-		events = self.take_events()
-		return events[6]
-
-	def drain_nowait(self, max_items=0):
-		self._lock.acquire()
-		try:
-			if max_items is None or int(max_items) <= 0:
-				items = self._items
-				self._items = []
-			else:
-				count = min(len(self._items), int(max_items))
-				items = self._items[:count]
-				self._items = self._items[count:]
-			if not self._items:
-				self._wake_pending = False
-			items.sort(key=lambda item: (item["priority"],
-										 item["sequence"]))
-			return items
-		finally:
-			self._lock.release()
-
 	def pending_count(self):
 		self._lock.acquire()
 		try:
 			return (len(self._items) +
+					(1 if self._screen_timeout_pending else 0) +
+					(1 if self._lamp_key_long_pending else 0) +
+					(1 if self._hardware_key_signal_count !=
+					 self._hardware_key_taken_count else 0) +
 					(1 if self._double_click_signal_count !=
 					 self._double_click_taken_count else 0) +
 					(1 if self._periodic_signal_count !=
@@ -242,61 +280,3 @@ class UICommandQueue:
 			self._lock.release()
 		self._wake.release()
 		return True
-
-
-class UICommandClient:
-	"""供页面调用的显式命令门面。所有方法均不执行实际业务。"""
-
-	def __init__(self, queue):
-		self.queue = queue
-
-	def login(self, police_no):
-		return self.queue.put(CMD_LOGIN, str(police_no), PRIORITY_P1)
-
-	def logout(self):
-		return self.queue.put(CMD_LOGOUT, None, PRIORITY_P1)
-
-	def join_group(self, group_id):
-		return self.queue.put(CMD_JOIN_GROUP, group_id, PRIORITY_P1)
-
-	def leave_group(self):
-		return self.queue.put(CMD_LEAVE_GROUP, None, PRIORITY_P1)
-
-	def request_floor(self, call_type="group"):
-		return self.queue.put(CMD_REQUEST_FLOOR, str(call_type), PRIORITY_P0)
-
-	def release_floor(self):
-		return self.queue.put(CMD_RELEASE_FLOOR, None, PRIORITY_P0)
-
-	def single_call(self, person_key, target_device_id):
-		return self.queue.put(
-			CMD_SINGLE_CALL, (person_key, target_device_id), PRIORITY_P1)
-
-	def accept_single_call(self):
-		return self.queue.put(CMD_ACCEPT_SINGLE_CALL, None, PRIORITY_P1)
-
-	def reject_single_call(self):
-		return self.queue.put(CMD_REJECT_SINGLE_CALL, None, PRIORITY_P1)
-
-	def set_volume(self, level):
-		return self.queue.put(CMD_SET_VOLUME, int(level), PRIORITY_P1)
-
-	def change_volume(self, delta):
-		return self.queue.put(CMD_CHANGE_VOLUME, int(delta), PRIORITY_P1)
-
-	def set_lamp_mode(self, mode):
-		return self.queue.put(CMD_SET_LAMP_MODE, str(mode), PRIORITY_P2)
-
-	def set_lamp_brightness(self, percent):
-		return self.queue.put(
-			CMD_SET_LAMP_BRIGHTNESS, int(percent), PRIORITY_P2)
-
-	def refresh_network(self):
-		return self.queue.put(CMD_REFRESH_NETWORK, None, PRIORITY_P2)
-
-	def refresh_gnss(self):
-		return self.queue.put(CMD_REFRESH_GNSS, None, PRIORITY_P2)
-
-	def double_click(self):
-		"""供硬件事件适配器使用；UI 页面通常不调用此方法。"""
-		return self.queue.put(CMD_DOUBLE_CLICK, None, PRIORITY_P2)

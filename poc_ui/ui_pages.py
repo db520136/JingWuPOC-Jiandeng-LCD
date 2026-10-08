@@ -7,11 +7,15 @@ import utime
 try:
 	from usr.font_port import (text_style_blue, text_style_green,
 							   text_style_red, text_style_white,
-							   status_style_white)
+							   status_style_white, regular_style_white,
+							   regular_style_green, regular_style_blue,
+							   regular_style_red)
 except Exception:
 	from font_port import (text_style_blue, text_style_green,
 						   text_style_red, text_style_white,
-						   status_style_white)
+						   status_style_white, regular_style_white,
+						   regular_style_green, regular_style_blue,
+						   regular_style_red)
 
 BLACK = lv.color_hex(0x000000)
 WHITE = lv.color_hex(0xFFFFFF)
@@ -23,6 +27,14 @@ BLUE = lv.color_hex(0x12618A)
 # 登录输入框使用设计稿取样得到的深灰色（RGB 42,42,42）。
 LOGIN_INPUT_BG = lv.color_hex(0x2A2A2A)
 ASSET_ROOT = "U:/"
+NETWORK_ICON_PATHS = {
+	None: "wifi_0.jpg",
+	"极弱": "wifi_1.jpg",
+	"弱": "wifi_2.jpg",
+	"一般": "wifi_3.jpg",
+	"强": "wifi_4.jpg",
+	"极好": "wifi_5.jpg",
+}
 LIST_ROW_STEP = 52
 LIST_ROW_HEIGHT = 48
 LIST_VISIBLE_ROWS = 4
@@ -31,6 +43,12 @@ LIST_SETTLE_STABLE_MS = 120
 OPTION_SELECTED_BG = lv.color_hex(0x0A3D47)
 OPTION_DOT_OFF = lv.color_hex(0x8FA7B3)
 DISABLED_TEXT = lv.color_hex(0x68747A)
+CALL_POPUP_MAX_DURATION_MS = 70000
+VOLUME_POPUP_DURATION_MS = 2000
+
+
+def _asset_path(path):
+	return ASSET_ROOT + path
 
 
 def _remove_frame(obj):
@@ -87,14 +105,22 @@ def _make_fixed(obj):
 
 
 def _label(parent, text, x, y, w, h, color=WHITE,
-		   align=lv.TEXT_ALIGN.LEFT, status=False):
+		   align=lv.TEXT_ALIGN.LEFT, status=False, regular=False):
 	obj = lv.label(parent)
 	_remove_frame(obj)
 	obj.set_pos(int(x), int(y))
 	obj.set_size(int(w), int(h))
 	obj.set_text(str(text))
 	obj.set_style_text_align(align, lv.PART.MAIN)
-	if status:
+	if regular and color is GREEN:
+		style = regular_style_green(color)
+	elif regular and color is CYAN:
+		style = regular_style_blue(color)
+	elif regular and color is RED:
+		style = regular_style_red(color)
+	elif regular:
+		style = regular_style_white(color)
+	elif status:
 		style = status_style_white(color)
 	elif color is GREEN:
 		style = text_style_green(color)
@@ -142,7 +168,7 @@ def _image(parent, path, x, y, w, h, callback=None, host=None):
 	image.set_pos(int(x), int(y))
 	image.set_size(int(w), int(h))
 	try:
-		image.set_src(ASSET_ROOT + path)
+		image.set_src(_asset_path(path))
 	except Exception:
 		# 单张资源缺失时保留页面结构，不阻断 UI 启动。
 		pass
@@ -163,14 +189,100 @@ class PageFactory:
 		self.app = app
 		self._status_labels = {}
 		self._location_labels = {}
+		self._location_detail_voltage_label = None
+		self._device_version_labels = {}
+		self._network_labels = {}
+		self._status_network_icon_path = None
 		self._root_indicator_dots = []
 		self._status_context = "police"
 		self._status_police_no = "M100001"
 		self._list_scroll_states = []
 		self._list_scroll_timer = None
 		self._confirm_overlay = None
+		self._confirm_dialog = None
 		self._confirm_label = None
+		self._popup_line2 = None
+		self._confirm_cancel_button = None
+		self._confirm_accept_button = None
 		self._pending_confirm = None
+		self._pending_cancel = None
+		self._pending_confirm_text = None
+		self._popup_mode = None
+		self._popup_signature = None
+		self._popup_until_ms = None
+		self._comm_radio_views = {}
+		self._upgrade_views = []
+		self._volume_overlay = None
+		self._volume_overlay_slider = None
+		self._volume_overlay_label = None
+		self._volume_overlay_until_ms = None
+		self._volume_page_view = None
+
+	def create_volume_overlay(self, parent):
+		"""创建实体音量键使用的非交互临时音量条。"""
+		overlay = lv.obj(parent)
+		_remove_frame(overlay)
+		_make_fixed(overlay)
+		overlay.set_pos(13, 163)
+		overlay.set_size(270, 56)
+		overlay.set_style_bg_color(GRAY, lv.PART.MAIN)
+		overlay.set_style_bg_opa(255, lv.PART.MAIN)
+		try:
+			overlay.set_style_radius(6, lv.PART.MAIN)
+			overlay.clear_flag(lv.obj.FLAG.CLICKABLE)
+		except Exception:
+			pass
+		slider = lv.slider(overlay)
+		_remove_frame(slider)
+		slider.set_pos(56, 18)
+		slider.set_size(158, 20)
+		slider.set_range(0, 11)
+		slider.set_value(11, lv.ANIM.OFF)
+		slider.set_style_bg_color(lv.color_hex(0x26343C), lv.PART.MAIN)
+		slider.set_style_bg_opa(255, lv.PART.MAIN)
+		slider.set_style_radius(10, lv.PART.MAIN)
+		slider.set_style_bg_color(CYAN, lv.PART.INDICATOR)
+		slider.set_style_bg_opa(255, lv.PART.INDICATOR)
+		slider.set_style_radius(10, lv.PART.INDICATOR)
+		slider.set_style_bg_opa(0, lv.PART.KNOB)
+		try:
+			slider.clear_flag(lv.obj.FLAG.CLICKABLE)
+		except Exception:
+			pass
+		value_label = _label(
+			overlay, "11", 220, 11, 40, 33, CYAN, lv.TEXT_ALIGN.CENTER)
+		overlay.add_flag(lv.obj.FLAG.HIDDEN)
+		self._volume_overlay = overlay
+		self._volume_overlay_slider = slider
+		self._volume_overlay_label = value_label
+		return overlay
+
+	def show_volume_overlay(self, volume, duration_ms=VOLUME_POPUP_DURATION_MS):
+		if self._volume_overlay is None:
+			return False
+		value = max(0, min(11, int(volume)))
+		self._volume_overlay_slider.set_value(value, lv.ANIM.OFF)
+		self._volume_overlay_label.set_text(str(value))
+		self._volume_overlay_until_ms = utime.ticks_add(
+			utime.ticks_ms(), int(duration_ms))
+		self._volume_overlay.clear_flag(lv.obj.FLAG.HIDDEN)
+		self._volume_overlay.invalidate()
+		return True
+
+	def hide_volume_overlay(self):
+		if self._volume_overlay is None:
+			return False
+		self._volume_overlay.add_flag(lv.obj.FLAG.HIDDEN)
+		self._volume_overlay_until_ms = None
+		return True
+
+	def process_volume_overlay(self):
+		if self._volume_overlay_until_ms is None:
+			return False
+		if utime.ticks_diff(
+				utime.ticks_ms(), self._volume_overlay_until_ms) < 0:
+			return False
+		return self.hide_volume_overlay()
 
 	def create_confirm_dialog(self, parent):
 		"""创建唯一一套确认弹窗及全屏输入遮罩。"""
@@ -194,30 +306,100 @@ class PageFactory:
 		dialog.set_style_bg_opa(255, lv.PART.MAIN)
 		try:
 			dialog.set_style_radius(6, lv.PART.MAIN)
+			dialog.clear_flag(lv.obj.FLAG.CLICKABLE)
 		except Exception:
 			pass
 
 		self._confirm_label = _label(
 			dialog, "确认修改？", 0, 40, 264, 40,
 			WHITE, lv.TEXT_ALIGN.CENTER)
-		_button(dialog, "取消", 25, 104, 95, 45,
+		self._popup_line2 = _label(
+			dialog, "", 12, 58, 240, 36, WHITE, lv.TEXT_ALIGN.LEFT)
+		self._popup_line2.add_flag(lv.obj.FLAG.HIDDEN)
+		self._confirm_cancel_button = _button(dialog, "取消", 25, 104, 95, 45,
 				lambda event: self.cancel_confirm_dialog(), self.app, RED)
-		_button(dialog, "确认", 144, 104, 95, 45,
+		self._confirm_accept_button = _button(dialog, "确认", 144, 104, 95, 45,
 				lambda event: self.accept_confirm_dialog(), self.app, GREEN)
 
 		self._confirm_overlay = overlay
+		self._confirm_dialog = dialog
 		overlay.add_flag(lv.obj.FLAG.HIDDEN)
 		return overlay
 
-	def show_confirm_dialog(self, text, on_confirm):
-		"""显示公共弹窗；同一时刻只保存一个待确认动作。"""
-		if self._confirm_overlay is None or on_confirm is None:
+	def _set_popup_locked(self, locked):
+		if self._confirm_overlay is None:
+			return
+		try:
+			if locked:
+				self._confirm_overlay.add_flag(lv.obj.FLAG.CLICKABLE)
+			else:
+				self._confirm_overlay.clear_flag(lv.obj.FLAG.CLICKABLE)
+		except Exception:
+			pass
+
+	def _set_popup_buttons(self, visible):
+		for button in (self._confirm_cancel_button,
+					   self._confirm_accept_button):
+			if button is None:
+				continue
+			if visible:
+				button.clear_flag(lv.obj.FLAG.HIDDEN)
+			else:
+				button.add_flag(lv.obj.FLAG.HIDDEN)
+
+	def _show_popup(self, mode, line1, line2, color, locked,
+					duration_ms=None, signature=None):
+		if self._confirm_overlay is None:
 			return False
-		if self._pending_confirm is not None:
-			return False
-		self._pending_confirm = on_confirm
-		self._confirm_label.set_text(str(text))
-		self._confirm_label.invalidate()
+		dialog = self._confirm_dialog
+		is_confirm = mode == "confirm"
+		if is_confirm:
+			confirm_text = str(line1)
+			dialog.set_pos(16, 35)
+			dialog.set_size(264, 164)
+			if "\n" in confirm_text:
+				self._confirm_label.set_pos(12, 15)
+				self._confirm_label.set_size(240, 72)
+				try:
+					self._confirm_label.set_style_text_line_space(
+						4, lv.PART.MAIN)
+				except Exception:
+					pass
+			else:
+				self._confirm_label.set_pos(0, 40)
+				self._confirm_label.set_size(264, 40)
+				try:
+					self._confirm_label.set_style_text_line_space(
+						0, lv.PART.MAIN)
+				except Exception:
+					pass
+			self._confirm_label.set_style_text_align(
+				lv.TEXT_ALIGN.CENTER, lv.PART.MAIN)
+			self._popup_line2.add_flag(lv.obj.FLAG.HIDDEN)
+		else:
+			dialog.set_pos(13, 65)
+			dialog.set_size(270, 110)
+			self._confirm_label.set_pos(14, 17 if line2 else 36)
+			self._confirm_label.set_size(242, 36)
+			self._confirm_label.set_style_text_align(
+				lv.TEXT_ALIGN.LEFT if line2 else lv.TEXT_ALIGN.CENTER,
+				lv.PART.MAIN)
+			if line2:
+				self._popup_line2.set_text(str(line2))
+				self._popup_line2.clear_flag(lv.obj.FLAG.HIDDEN)
+			else:
+				self._popup_line2.add_flag(lv.obj.FLAG.HIDDEN)
+		dialog.set_style_bg_color(color, lv.PART.MAIN)
+		self._confirm_label.set_text(str(line1))
+		self._set_popup_buttons(is_confirm)
+		self._set_popup_locked(bool(locked))
+		self._popup_mode = mode
+		self._popup_signature = signature
+		if duration_ms is None:
+			self._popup_until_ms = None
+		else:
+			self._popup_until_ms = utime.ticks_add(
+				utime.ticks_ms(), int(duration_ms))
 		self._confirm_overlay.clear_flag(lv.obj.FLAG.HIDDEN)
 		try:
 			self._confirm_overlay.move_foreground()
@@ -226,20 +408,168 @@ class PageFactory:
 		self._confirm_overlay.invalidate()
 		return True
 
+	def show_confirm_dialog(self, text, on_confirm, on_cancel=None,
+						 signature=None):
+		"""显示公共弹窗；同一时刻只保存一个待确认动作。"""
+		if self._confirm_overlay is None or on_confirm is None:
+			return False
+		if self._pending_confirm is not None:
+			return False
+		self._pending_confirm = on_confirm
+		self._pending_cancel = on_cancel
+		self._pending_confirm_text = str(text)
+		return self._show_popup(
+			"confirm", text, None, BLUE, True,
+			signature=signature or ("confirm", str(text)))
+
 	def cancel_confirm_dialog(self):
 		"""取消待确认动作，不修改页面状态。"""
+		callback = self._pending_cancel
 		self._pending_confirm = None
-		if self._confirm_overlay is not None:
-			self._confirm_overlay.add_flag(lv.obj.FLAG.HIDDEN)
+		self._pending_cancel = None
+		self._pending_confirm_text = None
+		self._hide_popup()
+		if callback is not None:
+			callback()
 
 	def accept_confirm_dialog(self):
 		"""先关闭弹窗，再执行一次待确认动作。"""
 		callback = self._pending_confirm
 		self._pending_confirm = None
-		if self._confirm_overlay is not None:
-			self._confirm_overlay.add_flag(lv.obj.FLAG.HIDDEN)
+		self._pending_cancel = None
+		self._pending_confirm_text = None
+		self._hide_popup()
 		if callback is not None:
 			callback()
+
+	def _hide_popup(self):
+		if self._confirm_overlay is not None:
+			self._confirm_overlay.add_flag(lv.obj.FLAG.HIDDEN)
+		self._popup_mode = None
+		self._popup_signature = None
+		self._popup_until_ms = None
+
+	def show_progress_popup(self, line1, line2=None, locked=True,
+						 signature=None, duration_ms=None):
+		return self._show_popup(
+			"progress", line1, line2, BLUE, locked,
+			duration_ms=duration_ms, signature=signature)
+
+	def hide_connection_popup(self):
+		"""关闭连接进度或结果弹框，不影响登录、确认和讲话弹框。"""
+		if self.connection_popup_state() is None:
+			return False
+		self._hide_popup()
+		return True
+
+	def hide_login_progress_popup(self):
+		"""只关闭登录进度，不关闭蜂窝网络或TCP连接提示。"""
+		if (self._popup_mode == "progress" and
+				isinstance(self._popup_signature, tuple) and
+				self._popup_signature and
+				self._popup_signature[0] == "login"):
+			self._hide_popup()
+			return True
+		return False
+
+	def hide_logout_popup(self):
+		if (self._popup_mode == "progress" and
+				isinstance(self._popup_signature, tuple) and
+				self._popup_signature and
+				self._popup_signature[0] == "logout"):
+			self._hide_popup()
+			return True
+		return False
+
+	def show_connection_result_popup(self, text, success, duration_ms,
+									signature):
+		return self._show_popup(
+			"transient", text, None, GREEN if success else RED, False,
+			duration_ms, signature)
+
+	def connection_popup_state(self):
+		if (self._popup_mode not in ("progress", "transient") or
+				not isinstance(self._popup_signature, tuple) or
+				len(self._popup_signature) < 3 or
+				self._popup_signature[0] != "connection"):
+			return None
+		return self._popup_signature[1], self._popup_signature[2]
+
+	def show_call_popup(self, line1, line2, remote, signature):
+		return self._show_popup(
+			"call", line1, line2, RED if remote else GREEN, True,
+			CALL_POPUP_MAX_DURATION_MS, signature)
+
+	def show_transient_popup(self, line1, line2=None, duration_ms=2000,
+							 color=RED, signature=None):
+		return self._show_popup(
+			"transient", line1, line2, color, False,
+			duration_ms, signature)
+
+	def show_key_notice(self, text, success=True, duration_ms=2000,
+						signature=None):
+		return self._show_popup(
+			"transient", text, None, BLUE if success else RED, False,
+			duration_ms, signature or ("key_notice", str(text)))
+
+	def can_show_low_priority_popup(self):
+		return self._popup_mode is None and self._pending_confirm is None
+
+	def show_ota_progress(self, text, duration_ms=None, signature=None,
+						  locked=True):
+		return self._show_popup(
+			"progress", text, None, BLUE, bool(locked), duration_ms,
+			signature or ("ota", "progress", str(text)))
+
+	def show_ota_result(self, text, success, duration_ms, signature=None):
+		return self._show_popup(
+			"transient", text, None, GREEN if success else RED, False,
+			duration_ms, signature or ("ota", "result", str(text)))
+
+	def hide_ota_popup(self):
+		if (not isinstance(self._popup_signature, tuple) or
+				not self._popup_signature or self._popup_signature[0] != "ota"):
+			return False
+		self._pending_confirm = None
+		self._pending_cancel = None
+		self._pending_confirm_text = None
+		self._hide_popup()
+		return True
+
+	def hide_communication_popup(self):
+		if self._popup_mode == "confirm":
+			return
+		if self._pending_confirm is not None:
+			self._show_popup(
+				"confirm", self._pending_confirm_text, None,
+				BLUE, True,
+				signature=("confirm", self._pending_confirm_text))
+		else:
+			self._hide_popup()
+
+	def process_popup(self):
+		if self._popup_until_ms is None:
+			return False
+		if utime.ticks_diff(utime.ticks_ms(), self._popup_until_ms) < 0:
+			return False
+		was_call = self._popup_mode == "call"
+		self.hide_communication_popup()
+		return was_call
+
+	def call_popup_visible(self):
+		return self._popup_mode == "call"
+
+	def connection_popup_blocked(self):
+		"""确认事务和讲话提示拥有更高优先级，连接提示稍后再显示。"""
+		if (isinstance(self._popup_signature, tuple) and
+				self._popup_signature and
+				self._popup_signature[0] == "key_notice"):
+			return False
+		if self._popup_mode in ("confirm", "call") or self._pending_confirm is not None:
+			return True
+		if self._popup_mode in ("progress", "transient"):
+			return self.connection_popup_state() is None
+		return False
 
 	def create_status_bar(self, parent):
 		bar = lv.obj(parent)
@@ -251,7 +581,9 @@ class PageFactory:
 		bar.set_style_bg_opa(255, lv.PART.MAIN)
 		self._status_labels["police"] = _label(
 			bar, "M100001", 23, 3, 105, 24, WHITE, lv.TEXT_ALIGN.LEFT, True)
-		self._status_network_icon = _image(bar, "wifi_5.jpg", 143, 3, 24, 24)
+		self._status_network_icon = _image(
+			bar, "wifi_0.jpg", 143, 3, 24, 24)
+		self._status_network_icon_path = NETWORK_ICON_PATHS[None]
 		self._status_labels["battery"] = _label(
 			bar, "电量：99%", 170, 3, 110, 24, WHITE, lv.TEXT_ALIGN.RIGHT, True)
 		return bar
@@ -318,9 +650,14 @@ class PageFactory:
 		labels = self._status_labels
 		if not labels:
 			return
-		police_no = snapshot.get("police_no") or "M100001"
+		police_no = ("游客" if snapshot.get("identity_mode") == "guest" else
+			(snapshot.get("police_no") or "M100001"))
 		self._status_police_no = str(police_no)
-		connected = bool(snapshot.get("network_connected"))
+		# 状态栏显示的是POC传输是否可用：蜂窝网络和TCP Socket必须同时正常。
+		connected = bool(snapshot.get("network_connected") and
+			snapshot.get("network_ready") and
+			snapshot.get("tcp_socket_connected"))
+		signal_level = snapshot.get("signal_level")
 		battery = snapshot.get("battery_percent")
 		if self._status_context == "settings":
 			labels["police"].set_text("设置")
@@ -328,13 +665,32 @@ class PageFactory:
 		else:
 			labels["police"].set_text(str(police_no))
 			labels["police"].set_style_text_color(WHITE, lv.PART.MAIN)
-		try:
-			self._status_network_icon.set_src(
-				ASSET_ROOT + ("wifi_5.jpg" if connected else "wifi_0.jpg"))
-		except Exception:
-			pass
+		if not connected:
+			icon_name = NETWORK_ICON_PATHS[None]
+		else:
+			# 网络正常但信号值尚未读到时显示最低一格；只有确认断网才显示 X。
+			icon_name = NETWORK_ICON_PATHS.get(signal_level, "wifi_1.jpg")
+		if icon_name != self._status_network_icon_path:
+			try:
+				self._status_network_icon.set_src(_asset_path(icon_name))
+				self._status_network_icon_path = icon_name
+				self._status_network_icon.invalidate()
+			except Exception:
+				pass
 		labels["battery"].set_text("电量：{}".format(
 			"--" if battery is None else "{}%".format(battery)))
+		if snapshot.get("battery_full_confirmed"):
+			battery_color = WHITE
+		elif snapshot.get("battery_charging") is True:
+			battery_color = GREEN
+		else:
+			try:
+				battery_color = (RED if battery is not None and
+					int(battery) <= 20 else WHITE)
+			except Exception:
+				battery_color = WHITE
+		labels["battery"].set_style_text_color(battery_color, lv.PART.MAIN)
+		labels["battery"].invalidate()
 
 	def create_login_page(self, parent):
 		page = lv.obj(parent)
@@ -344,13 +700,14 @@ class PageFactory:
 		page.set_size(self.app.width, self.app.height)
 		page.set_style_bg_color(BLACK, lv.PART.MAIN)
 		page.set_style_bg_opa(255, lv.PART.MAIN)
-		self.app.login_prefix = "M"
 		self.app.login_m_button = _button(
 			page, "M", 5, 4, 44, 38,
-			lambda e: self.app.set_login_prefix("M"), self.app, BLUE)
+			lambda e: self.app.set_login_prefix("M"), self.app,
+			BLUE if self.app.login_prefix == "M" else GRAY)
 		self.app.login_f_button = _button(
 			page, "F", 53, 4, 44, 38,
-			lambda e: self.app.set_login_prefix("F"), self.app, GRAY)
+			lambda e: self.app.set_login_prefix("F"), self.app,
+			BLUE if self.app.login_prefix == "F" else GRAY)
 		input_box = lv.obj(page)
 		_remove_frame(input_box)
 		_make_fixed(input_box)
@@ -360,7 +717,8 @@ class PageFactory:
 		input_box.set_style_bg_opa(255, lv.PART.MAIN)
 		input_box.set_style_radius(6, lv.PART.MAIN)
 		self.app.login_display = _label(
-			input_box, "", 8, 2, 174, 34, WHITE, lv.TEXT_ALIGN.LEFT)
+			input_box, self.app.login_digits, 8, 2, 174, 34, WHITE,
+			lv.TEXT_ALIGN.LEFT)
 		keys = (("1", "2", "3"), ("4", "5", "6"),
 				("7", "8", "9"), ("删除", "0", "确认"))
 		key_w, key_h, gap_x, gap_y = 93, 44, 4, 4
@@ -419,37 +777,105 @@ class PageFactory:
 		return page
 
 	def _make_location(self, page):
-		specs = (("name", "潘一"), ("longitude", "经度：120.7899°"),
-				 ("latitude", "纬度：120.7899°"), ("altitude", "海拔：80.1"),
-				 ("satellites", "卫星数量：12"))
+		values = self._location_values(self._snapshot())
+		specs = values[:5]
 		ys = (3, 39, 75, 111, 147)
 		for index, item in enumerate(specs):
-			self._location_labels[item[0]] = _label(
-				page, item[1], 8, ys[index], 184, 33, WHITE,
-				lv.TEXT_ALIGN.LEFT)
+			if item[0] in ("longitude", "latitude"):
+				caption = "经度：" if item[0] == "longitude" else "纬度："
+				_label(page, caption, 8, ys[index], 72, 33, WHITE,
+					   lv.TEXT_ALIGN.LEFT)
+				self._location_labels[item[0]] = _label(
+					page, item[1], 80, ys[index] + 5, 110, 22, WHITE,
+					lv.TEXT_ALIGN.LEFT, regular=True)
+			else:
+				self._location_labels[item[0]] = _label(
+					page, item[1], 8, ys[index], 184, 33, WHITE,
+					lv.TEXT_ALIGN.LEFT)
 		self._location_labels["time"] = _label(
-			page, "10:44:59", 190, 48, 100, 33, WHITE,
+			page, values[5][1], 190, 18, 100, 33, WHITE,
 			lv.TEXT_ALIGN.CENTER)
 		self._location_labels["weekday"] = _label(
-			page, "星期三", 190, 84, 100, 33, WHITE,
+			page, values[6][1], 190, 54, 100, 33, WHITE,
 			lv.TEXT_ALIGN.CENTER)
 		_image(page, "location_icon_92.jpg", 196, 112, 92, 92,
 			   lambda e: self.app.open_child("location_detail"), self.app)
 
 	def refresh_state(self, snapshot):
 		self.refresh_status(snapshot)
-		values = (("name", snapshot.get("location_name") or "潘一"),
-				  ("longitude", "经度：{}°".format(snapshot.get("longitude") or "120.7899")),
-				  ("latitude", "纬度：{}°".format(snapshot.get("latitude") or "120.7899")),
-				  ("altitude", "海拔：{}".format(snapshot.get("altitude") or "80.1")),
-				  ("satellites", "卫星数量：{}".format(snapshot.get("satellites") or "12")),
-				  ("time", snapshot.get("location_time") or "10:44:59"),
-				  ("weekday", snapshot.get("location_weekday") or "星期三"))
+		if self._volume_page_view is not None:
+			value = int(snapshot["audio_volume"])
+			self._volume_page_view["slider"].set_value(value, lv.ANIM.OFF)
+			self._volume_page_view["label"].set_text(str(value))
+			self._volume_page_view["slider"].invalidate()
+			self._volume_page_view["label"].invalidate()
+		for state_key, view in self._comm_radio_views.items():
+			rows, selection, none_key = view
+			value = snapshot[state_key]
+			value = none_key if value is None else value
+			if selection["value"] != value:
+				selection["value"] = value
+				for item_key, row_info in rows.items():
+					self._set_radio_visual(row_info, item_key == value)
+		values = self._location_values(snapshot)
 		for key, value in values:
 			label = self._location_labels.get(key)
 			if label is not None:
 				label.set_text(str(value))
 				label.invalidate()
+		if self._location_detail_voltage_label is not None:
+			self._location_detail_voltage_label.set_text("用户")
+			self._location_detail_voltage_label.invalidate()
+		for key, label in self._device_version_labels.items():
+			label.set_text(str(snapshot[key]))
+			label.invalidate()
+		for key, _caption, text, color in self._network_values(snapshot):
+			label = self._network_labels.get(key)
+			if label is not None:
+				label.set_text(str(text))
+				label.set_style_text_color(color, lv.PART.MAIN)
+				label.invalidate()
+		for view in tuple(self._upgrade_views):
+			view["version"].set_text(str(snapshot["software_version"]))
+			view["status"].set_text(str(snapshot["upgrade_status"]))
+			tone = snapshot.get("upgrade_status_tone")
+			color = GREEN if tone == "success" else RED if tone == "error" else WHITE
+			view["status"].set_style_text_color(color, lv.PART.MAIN)
+			button = view["button"]
+			try:
+				if snapshot.get("ota_thread_active"):
+					button.clear_flag(lv.obj.FLAG.CLICKABLE)
+				else:
+					button.add_flag(lv.obj.FLAG.CLICKABLE)
+			except Exception:
+				pass
+			view["version"].invalidate()
+			view["status"].invalidate()
+			button.invalidate()
+
+	@staticmethod
+	def _location_values(snapshot):
+		longitude = snapshot["longitude"]
+		latitude = snapshot["latitude"]
+		longitude_text = snapshot.get("longitude_text")
+		latitude_text = snapshot.get("latitude_text")
+		altitude = snapshot["altitude"]
+		satellites = snapshot["satellites"]
+		if longitude_text is None and longitude is not None:
+			longitude_text = str(longitude)
+		if latitude_text is None and latitude is not None:
+			latitude_text = str(latitude)
+		return (("name", snapshot.get("location_name") or snapshot["police_name"]),
+			("longitude", "{}{}".format(
+				"--" if longitude_text is None else longitude_text,
+				"" if longitude_text is None else "°")),
+			("latitude", "{}{}".format(
+				"--" if latitude_text is None else latitude_text,
+				"" if latitude_text is None else "°")),
+			("altitude", "海拔：{}".format("--" if altitude is None else "{:.1f}".format(float(altitude)))),
+			("satellites", "卫星数量：{}".format("--" if satellites is None else satellites)),
+			("time", snapshot["location_time"] or "--:--:--"),
+			("weekday", snapshot["location_weekday"] or "--"))
 
 	def child(self, name, params=None, parent=None):
 		page = lv.obj(parent if parent is not None else self.app.child_screen)
@@ -498,9 +924,18 @@ class PageFactory:
 
 	def _make_location_detail(self, page):
 		_revision, snapshot = self.app.state_store.get_snapshot()
-		police_name = snapshot.get("police_name") or "潘荣丰"
-		police_no = snapshot.get("police_no") or "M100001"
-		_label(page, "用户", 0, 18, 296, 33, WHITE, lv.TEXT_ALIGN.CENTER)
+		police_name = snapshot.get("police_name") or "--"
+		police_no = ("游客" if snapshot.get("identity_mode") == "guest" else
+			(snapshot.get("police_no") or "--"))
+		voltage_label = _label(
+			page, "用户",
+			0, 18, 296, 33, WHITE, lv.TEXT_ALIGN.CENTER)
+		self._location_detail_voltage_label = voltage_label
+
+		def forget_voltage_label(event):
+			if self._location_detail_voltage_label is voltage_label:
+				self._location_detail_voltage_label = None
+		page.add_event_cb(forget_voltage_label, lv.EVENT.DELETE, None)
 		_label(page, police_name, 0, 70, 296, 33, WHITE, lv.TEXT_ALIGN.CENTER)
 		_label(page, "警号：{}".format(police_no), 0, 122, 296, 33, WHITE,
 			   lv.TEXT_ALIGN.CENTER)
@@ -533,7 +968,8 @@ class PageFactory:
 		row.invalidate()
 
 	def _radio_row(self, parent, y, text, value, selected, enabled,
-				   on_select, rows, selection, require_confirm):
+				   on_select, rows, selection, require_confirm,
+				   confirmed_state_key=None):
 		row = lv.btn(parent)
 		_remove_frame(row)
 		row.set_pos(4, int(y))
@@ -565,6 +1001,11 @@ class PageFactory:
 			def commit_selection():
 				if not on_select(key):
 					return
+				if (confirmed_state_key is not None and
+						(self.app.communication_controller is not None or
+						 self.app.low_priority_worker is not None)):
+					# 命令入队不代表硬件或协议成功，等待共享状态确认。
+					return
 				selection["value"] = key
 				for item_key in rows:
 					self._set_radio_visual(rows[item_key], item_key == key)
@@ -577,7 +1018,8 @@ class PageFactory:
 		return row
 
 	def _make_radio_page(self, page, title, options, selected, on_select,
-						 list_mode=False, require_confirm=False):
+						 list_mode=False, require_confirm=False,
+						 confirmed_state_key=None):
 		rows = {}
 		selection = {"value": selected}
 		if list_mode:
@@ -594,9 +1036,17 @@ class PageFactory:
 			self._radio_row(
 				parent, start_y + index * step, option[1], option[0],
 				option[0] == selected, option[2], on_select, rows,
-				selection, require_confirm)
+				selection, require_confirm, confirmed_state_key)
 		if list_mode:
 			self._finish_list_viewport(parent, len(options))
+		if confirmed_state_key is not None:
+			view = (rows, selection, options[0][0])
+			self._comm_radio_views[confirmed_state_key] = view
+
+			def forget_view(event):
+				if self._comm_radio_views.get(confirmed_state_key) is view:
+					self._comm_radio_views.pop(confirmed_state_key, None)
+			page.add_event_cb(forget_view, lv.EVENT.DELETE, None)
 
 	def _make_shoulder_mode(self, page):
 		snapshot = self._snapshot()
@@ -605,17 +1055,22 @@ class PageFactory:
 				   ("diagonal", "红蓝对角闪", True))
 		self._make_radio_page(
 			page, "肩灯模式", options, snapshot["lamp_mode"],
-			self.app.select_lamp_mode, require_confirm=True)
+			self.app.select_lamp_mode, require_confirm=True,
+			confirmed_state_key="lamp_mode")
 
 	def _make_double_click_mode(self, page):
 		snapshot = self._snapshot()
 		options = ((True, "开启", True), (False, "关闭", True))
 		self._make_radio_page(
 			page, "双击模式", options, snapshot["double_click_enabled"],
-			self.app.select_double_click, require_confirm=True)
+			self.app.select_double_click, require_confirm=True,
+			confirmed_state_key="double_click_enabled")
 
 	def _make_group_mode(self, page):
 		snapshot = self._snapshot()
+		if (snapshot.get("identity_mode") == "guest" or
+				snapshot.get("poc_enabled") is not True):
+			return
 		selected = snapshot["confirmed_group_id"]
 		selected = "__none_group__" if selected is None else selected
 		options = [("__none_group__", "无/退出", True)]
@@ -623,34 +1078,53 @@ class PageFactory:
 			options.append((group["id"], group["name"], True))
 		self._make_radio_page(
 			page, "", tuple(options), selected, self.app.select_group,
-			list_mode=True, require_confirm=True)
+			list_mode=True, require_confirm=True,
+			confirmed_state_key="confirmed_group_id")
 
 	def _make_single_mode(self, page):
 		snapshot = self._snapshot()
+		if (snapshot.get("identity_mode") == "guest" or
+				snapshot.get("poc_enabled") is not True):
+			return
 		selected = snapshot["single_peer"]
 		selected = "__none_person__" if selected is None else selected
 		options = [("__none_person__", "无/解散", True)]
 		for person in snapshot["person_items"]:
-			if person["is_self"]:
+			# 单呼只能选择当前在线成员；离线成员不进入三级页面列表。
+			if person["is_self"] or not person["online"]:
 				continue
-			online = bool(person["online"])
-			text = person["name"] if online else person["name"] + "（离线）"
-			options.append((person["key"], text, online))
+			options.append((person["key"], person["name"], True))
 		self._make_radio_page(
 			page, "", tuple(options), selected, self.app.select_person,
-			list_mode=True, require_confirm=True)
+			list_mode=True, require_confirm=True,
+			confirmed_state_key="single_peer")
 
 	def _make_device_info(self, page):
 		snapshot = self._snapshot()
 		_label(page, "设备信息", 0, 4, self.app.content_width, 33,
 			   CYAN, lv.TEXT_ALIGN.CENTER)
-		values = (("软件版本：", snapshot["software_version"]),
-				  ("硬件版本：", snapshot["hardware_version"]),
-				  ("固件版本：", snapshot["firmware_version"]))
+		values = (("software_version", "软件版本:", 72),
+				  ("hardware_version", "硬件版本:", 72),
+				  ("firmware_version", "固件版本:", 72),
+				  ("device_id", "设备ID:", 56))
+		labels = {}
 		for index, item in enumerate(values):
-			y = 48 + index * 44
-			_label(page, item[0], 16, y, 120, 33, WHITE, lv.TEXT_ALIGN.LEFT)
-			_label(page, item[1], 136, y, 144, 33, CYAN, lv.TEXT_ALIGN.LEFT)
+			y = 44 + index * 40
+			key, caption, caption_width = item
+			_label(page, caption, 12, y, caption_width, 22,
+				   WHITE, lv.TEXT_ALIGN.LEFT, regular=True)
+			value_x = 12 + caption_width
+			label = _label(page, snapshot[key], value_x, y,
+					   self.app.content_width - value_x - 12, 22,
+					   CYAN, lv.TEXT_ALIGN.LEFT, regular=True)
+			label.set_long_mode(lv.label.LONG.SCROLL_CIRCULAR)
+			labels[key] = label
+		self._device_version_labels = labels
+
+		def forget_labels(event):
+			if self._device_version_labels is labels:
+				self._device_version_labels = {}
+		page.add_event_cb(forget_labels, lv.EVENT.DELETE, None)
 
 	def _make_brightness_symbol(self, page, x, y, size, level):
 		"""绘制同款大小太阳，以图标尺寸表达高低亮度。"""
@@ -699,7 +1173,8 @@ class PageFactory:
 		return holder
 
 	def _make_vertical_slider(self, page, title, minimum, maximum, value,
-							  on_change, suffix="", mode="brightness"):
+							  on_change, suffix="", mode="brightness",
+							  setting=None):
 		content_height = self.app.content_height
 		slider_x = 130
 		slider_y = 10
@@ -711,9 +1186,6 @@ class PageFactory:
 				page, 82, slider_y, 32, "high")
 			self._make_brightness_symbol(
 				page, 82, content_height - 10 - 32, 32, "low")
-		else:
-			_image(page, "settings_volume.jpg", 80,
-				   (content_height - 40) // 2, 40, 40)
 		slider = lv.slider(page)
 		_remove_frame(slider)
 		slider.set_pos(slider_x, slider_y)
@@ -737,24 +1209,38 @@ class PageFactory:
 			value_label.set_text("{}{}".format(new_value, suffix))
 			value_label.invalidate()
 		slider.add_event_cb(value_changed, lv.EVENT.VALUE_CHANGED, None)
+		if setting is not None:
+			slider.add_event_cb(
+				lambda event: self.app.commit_slider_setting(setting),
+				lv.EVENT.RELEASED, None)
+		return slider, value_label
 
 	def _make_brightness(self, page):
 		snapshot = self._snapshot()
 		self._make_vertical_slider(
 			page, "屏幕亮度", 5, 100, snapshot["screen_brightness"],
-			self.app.set_screen_brightness, "%", "brightness")
+			self.app.set_screen_brightness, "%", "brightness",
+			"screen_brightness")
 
 	def _make_lamp_brightness(self, page):
 		snapshot = self._snapshot()
 		self._make_vertical_slider(
 			page, "肩灯亮度", 5, 100, snapshot["lamp_brightness"],
-			self.app.set_lamp_brightness, "%", "brightness")
+			self.app.set_lamp_brightness, "%", "brightness",
+			"lamp_brightness")
 
 	def _make_volume(self, page):
 		snapshot = self._snapshot()
-		self._make_vertical_slider(
+		slider, value_label = self._make_vertical_slider(
 			page, "", 0, 11, snapshot["audio_volume"],
-			self.app.set_audio_volume, "", "volume")
+			self.app.set_audio_volume, "", "volume", "audio_volume")
+		view = {"slider": slider, "label": value_label}
+		self._volume_page_view = view
+
+		def forget_view(event):
+			if self._volume_page_view is view:
+				self._volume_page_view = None
+		page.add_event_cb(forget_view, lv.EVENT.DELETE, None)
 
 	def _make_sleep(self, page):
 		snapshot = self._snapshot()
@@ -770,18 +1256,41 @@ class PageFactory:
 		snapshot = self._snapshot()
 		_label(page, "网络状态", 0, 4, self.app.content_width, 33,
 			   CYAN, lv.TEXT_ALIGN.CENTER)
-		connected = bool(snapshot["network_connected"])
-		items = (("SIM卡号：", snapshot["iccid"] or "未识别到",
-				  WHITE if snapshot["iccid"] else RED),
-				 ("信号值：", snapshot["signal_level"] or "无",
-				  GREEN if snapshot["signal_level"] in ("极好", "强") else WHITE),
-				 ("网络状态：", "成功连接" if connected else "连接失败",
-				  GREEN if connected else RED))
-		for index, item in enumerate(items):
+		labels = {}
+		for index, item in enumerate(self._network_values(snapshot)):
 			y = 50 + index * 50
-			_label(page, item[0], 16, y, 114, 33, WHITE, lv.TEXT_ALIGN.LEFT)
-			_label(page, item[1], 130, y, 154, 33, item[2],
-				   lv.TEXT_ALIGN.LEFT)
+			_label(page, item[1], 16, y, 80, 22, WHITE,
+				   lv.TEXT_ALIGN.LEFT, regular=True)
+			labels[item[0]] = _label(
+				page, item[2], 100, y, 184, 22, item[3],
+				lv.TEXT_ALIGN.LEFT, regular=True)
+		self._network_labels = labels
+
+		def forget_labels(event):
+			if self._network_labels is labels:
+				self._network_labels = {}
+		page.add_event_cb(forget_labels, lv.EVENT.DELETE, None)
+
+		_button(page, "刷新", self.app.content_width - 92, 174, 84, 30,
+				self.app.refresh_network, self.app, BLUE)
+
+	@staticmethod
+	def _network_values(snapshot):
+		connected = bool(snapshot["network_connected"])
+		signal_level = snapshot.get("signal_level")
+		signal_dbm = snapshot.get("signal_dbm")
+		if signal_level and signal_dbm is not None:
+			# 仅保留两个空格，避免等级和dBm数值之间间距过大导致右侧截断。
+			signal_text = "{}  {} dBm".format(signal_level, signal_dbm)
+		else:
+			signal_text = signal_level or "无"
+		return (("iccid", "SIM卡号：", snapshot["iccid"] or "--",
+				 WHITE if snapshot["iccid"] else RED),
+				("signal", "信号值：", signal_text,
+				 GREEN if signal_level in ("极好", "强") else WHITE),
+				("network", "网络状态：",
+				 "成功连接" if connected else "连接失败",
+				 GREEN if connected else RED))
 
 	def _make_fall_detection(self, page):
 		snapshot = self._snapshot()
@@ -794,19 +1303,29 @@ class PageFactory:
 		snapshot = self._snapshot()
 		_label(page, "升级", 0, 4, self.app.content_width, 33,
 			   CYAN, lv.TEXT_ALIGN.CENTER)
-		_label(page, "当前版本：", 20, 54, 130, 33, WHITE, lv.TEXT_ALIGN.LEFT)
-		_label(page, snapshot["firmware_version"], 150, 54, 126, 33,
+		_label(page, "当前软件版本：", 12, 54, 160, 33, WHITE, lv.TEXT_ALIGN.LEFT)
+		version = _label(page, snapshot["software_version"], 172, 54, 112, 33,
 			   CYAN, lv.TEXT_ALIGN.LEFT)
 		status = _label(page, snapshot["upgrade_status"], 8, 100,
-						self.app.content_width - 16, 33, WHITE,
+						self.app.content_width - 16, 33,
+						GREEN if snapshot.get("upgrade_status_tone") == "success" else WHITE,
 						lv.TEXT_ALIGN.CENTER)
 
 		def check_upgrade(event):
-			status.set_text(self.app.preview_check_upgrade())
-			status.set_style_text_color(GREEN, lv.PART.MAIN)
-			status.invalidate()
-		_button(page, "检查更新", 48, 152, 200, 48,
-				check_upgrade, self.app, BLUE)
+			self.app.check_upgrade()
+		button = _button(page, "查询新版本", 48, 152, 200, 48,
+					 check_upgrade, self.app, BLUE)
+		view = {"version": version, "status": status, "button": button}
+		self._upgrade_views.append(view)
+		if snapshot.get("ota_thread_active"):
+			try:
+				button.clear_flag(lv.obj.FLAG.CLICKABLE)
+			except Exception:
+				pass
+		def forget_upgrade(event):
+			self._upgrade_views = [item for item in self._upgrade_views
+				if item is not view]
+		page.add_event_cb(forget_upgrade, lv.EVENT.DELETE, None)
 
 	def _make_settings(self, page):
 		viewport = self._new_list_viewport(page)
@@ -817,7 +1336,7 @@ class PageFactory:
 				("settings_sleep.jpg", "息屏时间", "sleep"),
 				("settings_network.jpg", "网络状态", "network"),
 				("settings_fall_detection.jpg", "跌倒检测", "fall_detection"),
-				(None, "升级", "upgrade"))
+				("settings_upgrade.jpg", "升级", "upgrade"))
 		for index, row_data in enumerate(rows):
 			row = lv.btn(viewport)
 			_remove_frame(row)
@@ -831,7 +1350,7 @@ class PageFactory:
 			row.set_style_bg_color(GRAY, lv.PART.MAIN)
 			row.set_style_bg_opa(255, lv.PART.MAIN)
 			if row_data[0] is not None:
-				_image(row, row_data[0], 8, 8, 32, 32)
+				_image(row, row_data[0], 6, 6, 36, 36)
 			_label(row, row_data[1], 48, 7, 228, 33, WHITE,
 				   lv.TEXT_ALIGN.LEFT)
 			def guarded_row(event, target=row_data[2]):

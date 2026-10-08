@@ -49,6 +49,10 @@ settings_sleep.jpg
 settings_network.jpg
 settings_fall_detection.jpg
 wifi_0.jpg
+wifi_1.jpg
+wifi_2.jpg
+wifi_3.jpg
+wifi_4.jpg
 wifi_5.jpg
 ```
 

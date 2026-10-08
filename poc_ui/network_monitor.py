@@ -1,9 +1,4 @@
 # -*- coding: utf-8 -*-
-"""EC800M 网络、SIM 和信号状态读取服务。
-
-本模块只负责一次读取和状态缓存，不创建线程、不 sleep，也不访问 LVGL；
-调度由 ``low_priority_worker.py`` 负责。
-"""
 
 import utime
 
@@ -43,7 +38,6 @@ SIGNAL_VERY_GOOD = "极好"
 
 
 def classify_signal(signal):
-	"""把 dBm 整数转换为信号等级；无法转换时返回 None。"""
 	try:
 		value = int(signal)
 	except Exception:
@@ -74,7 +68,6 @@ def _ticks_diff(later_ms, earlier_ms):
 
 
 class NetworkMonitor:
-	"""无内部线程的网络状态缓存；由外部 Worker 显式调用刷新。"""
 
 	def __init__(self, signal_interval_ms=SIGNAL_REFRESH_INTERVAL_MS):
 		self.signal_interval_ms = max(1000, int(signal_interval_ms))
@@ -142,7 +135,6 @@ class NetworkMonitor:
 			return None
 
 	def _read_network_status(self):
-		"""读取网络就绪状态；只使用已确认的 EC800M 接口。"""
 		stage = None
 		state = None
 		connected = False
@@ -200,7 +192,6 @@ class NetworkMonitor:
 		return connected, stage, state, error
 
 	def refresh_once(self, now_ms=None, force_signal=True):
-		"""由外部 Worker 调用一次，刷新网络、SIM、信号并返回最新快照。"""
 		if now_ms is None:
 			now_ms = utime.ticks_ms()
 		signal_due = (force_signal or self._signal_refresh_requested or
@@ -263,40 +254,5 @@ class NetworkMonitor:
 		self._lock_acquire()
 		try:
 			return self._snapshot_locked()
-		finally:
-			self._lock_release()
-
-	def get_sim_iccid(self):
-		"""读取并缓存 ICCID；不启动线程。"""
-		value = self._read_iccid()
-		self._lock_acquire()
-		try:
-			if value != self.iccid:
-				self.iccid = value
-				self._bump_revision()
-		finally:
-			self._lock_release()
-		return value
-
-	def get_signal_info(self):
-		"""读取并缓存信号信息；不启动线程。"""
-		value = self._read_signal()
-		level = classify_signal(value)
-		self._lock_acquire()
-		try:
-			if value != self.signal_dbm or level != self.signal_level:
-				self.signal_dbm = value
-				self.signal_level = level
-				self._bump_revision()
-		finally:
-			self._lock_release()
-		return value, level
-
-	def get_network_status(self):
-		"""返回缓存的网络状态，不访问硬件。"""
-		self._lock_acquire()
-		try:
-			return (self.network_connected, self.network_stage,
-					self.network_state)
 		finally:
 			self._lock_release()

@@ -1,8 +1,4 @@
 # -*- coding: utf-8 -*-
-"""独立的 LCD/LVGL 显示适配层。
-
-本文件只负责显示硬件和 LVGL display driver，不包含页面或业务逻辑。
-"""
 
 import lvgl as lv
 from machine import LCD
@@ -15,7 +11,7 @@ DISPLAY_BUFFER_LINES = 100
 DISPLAY_BOOT_CLEAR_LINES = 20
 # EC800M 图片缓存容量（缓存项数量，不是字节数）。页面图片统一使用
 # 标准 JPG，缓存初始化放在显示层，避免页面或业务线程重复清空缓存。
-IMAGE_CACHE_SIZE = 8
+IMAGE_CACHE_SIZE = 12
 
 XSTART_H, XSTART_L, YSTART_H, YSTART_L = 0xF0, 0xF1, 0xF2, 0xF3
 XEND_H, XEND_L, YEND_H, YEND_L = 0xE0, 0xE1, 0xE2, 0xE3
@@ -58,7 +54,6 @@ _INVALID_P = bytearray((
 
 
 class DisplayPort:
-	"""ST7789/LCD 到 LVGL 的最小适配。"""
 
 	def __init__(self, width=LCD_WIDTH, height=LCD_HEIGHT,
 				 buffer_lines=DISPLAY_BUFFER_LINES):
@@ -78,10 +73,7 @@ class DisplayPort:
 			_INVALID_P, bytearray((0, 0, 0x11, 2, 0, 120, 0, 0, 0x21,
 								   0, 0, 0x29)),
 			bytearray((0, 0, 0x28, 2, 0, 120, 0, 0, 0x10)), None)
-		try:
-			self.lcd.lcd_display_on()
-		except Exception:
-			pass
+		# _INIT_P 已包含 0x29（显示开启），不再重复调用 lcd_display_on。
 		try:
 			self._clear_display_memory()
 		except Exception:
@@ -115,8 +107,25 @@ class DisplayPort:
 		self.display = self.display_driver.register()
 		return self
 
+	def enter_sleep(self):
+		if self.lcd is None:
+			return False
+		try:
+			self.lcd.lcd_display_off()
+		except Exception:
+			return False
+		return True
+
+	def leave_sleep(self):
+		if self.lcd is None:
+			return False
+		try:
+			self.lcd.lcd_display_on()
+		except Exception:
+			return False
+		return True
+
 	def _clear_display_memory(self):
-		"""清除面板 GRAM 中的历史画面，防止启动时出现残留页面。"""
 		block_lines = min(DISPLAY_BOOT_CLEAR_LINES, self.height)
 		clear_block = bytearray(self.width * block_lines * 2)
 		y = 0
@@ -128,7 +137,6 @@ class DisplayPort:
 			y += lines
 
 	def present_initial_frame(self):
-		"""在首个主循环前立即刷新已加载的登录页面。"""
 		try:
 			lv.refr_now(self.display)
 		except Exception:

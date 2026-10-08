@@ -1,5 +1,4 @@
 # -*- coding: utf-8 -*-
-"""外置 Flash 字库和 LVGL 文本样式适配。"""
 
 import lvgl as lv
 import uos
@@ -17,7 +16,6 @@ _mounted = False
 
 
 def mount_external_flash():
-	"""挂载已烧录字库的外置 NOR Flash。"""
 	global _mounted
 	if _mounted:
 		return True
@@ -33,7 +31,6 @@ def mount_external_flash():
 
 def make_text_style(style_name, color, font_path=BODY_FONT_PATH,
 					line_height=BODY_FONT_LINE_HEIGHT):
-	"""返回共享文字样式；字体和颜色组合只创建一次。"""
 	cached = _styles.get(style_name)
 	if cached is not None:
 		return cached
@@ -67,4 +64,24 @@ def text_style_red(color):
 
 def status_style_white(color):
 	return make_text_style("status_white", color, STATUS_FONT_PATH,
+						   STATUS_FONT_LINE_HEIGHT)
+
+
+def regular_style_white(color):
+	return make_text_style("regular_white", color, STATUS_FONT_PATH,
+						   STATUS_FONT_LINE_HEIGHT)
+
+
+def regular_style_green(color):
+	return make_text_style("regular_green", color, STATUS_FONT_PATH,
+						   STATUS_FONT_LINE_HEIGHT)
+
+
+def regular_style_blue(color):
+	return make_text_style("regular_blue", color, STATUS_FONT_PATH,
+						   STATUS_FONT_LINE_HEIGHT)
+
+
+def regular_style_red(color):
+	return make_text_style("regular_red", color, STATUS_FONT_PATH,
 						   STATUS_FONT_LINE_HEIGHT)
