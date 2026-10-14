@@ -1,22 +1,11 @@
 # -*- coding: utf-8 -*-
-"""正式 UI 页面（纯 UI 基线，不访问任何真实业务硬件）。"""
-
 import lvgl as lv
 import utime
-
-try:
-	from usr.font_port import (text_style_blue, text_style_green,
-							   text_style_red, text_style_white,
-							   status_style_white, regular_style_white,
-							   regular_style_green, regular_style_blue,
-							   regular_style_red)
-except Exception:
-	from font_port import (text_style_blue, text_style_green,
+from usr.font_port import (text_style_blue, text_style_green,
 						   text_style_red, text_style_white,
 						   status_style_white, regular_style_white,
 						   regular_style_green, regular_style_blue,
 						   regular_style_red)
-
 BLACK = lv.color_hex(0x000000)
 WHITE = lv.color_hex(0xFFFFFF)
 CYAN = lv.color_hex(0x00D7FF)
@@ -24,7 +13,6 @@ GRAY = lv.color_hex(0x303840)
 GREEN = lv.color_hex(0x168A45)
 RED = lv.color_hex(0xE00000)
 BLUE = lv.color_hex(0x12618A)
-# 登录输入框使用设计稿取样得到的深灰色（RGB 42,42,42）。
 LOGIN_INPUT_BG = lv.color_hex(0x2A2A2A)
 ASSET_ROOT = "U:/"
 NETWORK_ICON_PATHS = {
@@ -45,12 +33,8 @@ OPTION_DOT_OFF = lv.color_hex(0x8FA7B3)
 DISABLED_TEXT = lv.color_hex(0x68747A)
 CALL_POPUP_MAX_DURATION_MS = 70000
 VOLUME_POPUP_DURATION_MS = 2000
-
-
 def _asset_path(path):
 	return ASSET_ROOT + path
-
-
 def _remove_frame(obj):
 	obj.set_style_border_width(0, lv.PART.MAIN)
 	obj.set_style_border_opa(0, lv.PART.MAIN)
@@ -74,10 +58,7 @@ def _remove_frame(obj):
 		obj.set_style_pad_all(0, lv.PART.SCROLLBAR)
 	except Exception:
 		pass
-
-
 def _make_fixed(obj):
-	"""将页面或控件设为固定对象，不参与任何方向滚动。"""
 	try:
 		obj.clear_flag(lv.obj.FLAG.SCROLLABLE)
 	except Exception:
@@ -102,8 +83,6 @@ def _make_fixed(obj):
 		obj.set_style_pad_all(0, lv.PART.MAIN)
 	except Exception:
 		pass
-
-
 def _label(parent, text, x, y, w, h, color=WHITE,
 		   align=lv.TEXT_ALIGN.LEFT, status=False, regular=False):
 	obj = lv.label(parent)
@@ -132,8 +111,6 @@ def _label(parent, text, x, y, w, h, color=WHITE,
 		style = text_style_white(color)
 	obj.add_style(style, lv.PART.MAIN)
 	return obj
-
-
 def _button(parent, text, x, y, w, h, callback, host=None,
 			color=GRAY, text_color=WHITE):
 	btn = lv.btn(parent)
@@ -160,8 +137,6 @@ def _button(parent, text, x, y, w, h, callback, host=None,
 				callback(event)
 		btn.add_event_cb(guarded_callback, lv.EVENT.CLICKED, None)
 	return btn
-
-
 def _image(parent, path, x, y, w, h, callback=None, host=None):
 	image = lv.img(parent)
 	_remove_frame(image)
@@ -182,14 +157,13 @@ def _image(parent, path, x, y, w, h, callback=None, host=None):
 				callback(event)
 		image.add_event_cb(guarded_image, lv.EVENT.CLICKED, None)
 	return image
-
-
 class PageFactory:
 	def __init__(self, app):
 		self.app = app
 		self._status_labels = {}
 		self._location_labels = {}
 		self._location_detail_voltage_label = None
+		self._location_detail_name_label = None
 		self._device_version_labels = {}
 		self._network_labels = {}
 		self._status_network_icon_path = None
@@ -217,9 +191,7 @@ class PageFactory:
 		self._volume_overlay_label = None
 		self._volume_overlay_until_ms = None
 		self._volume_page_view = None
-
 	def create_volume_overlay(self, parent):
-		"""创建实体音量键使用的非交互临时音量条。"""
 		overlay = lv.obj(parent)
 		_remove_frame(overlay)
 		_make_fixed(overlay)
@@ -256,7 +228,6 @@ class PageFactory:
 		self._volume_overlay_slider = slider
 		self._volume_overlay_label = value_label
 		return overlay
-
 	def show_volume_overlay(self, volume, duration_ms=VOLUME_POPUP_DURATION_MS):
 		if self._volume_overlay is None:
 			return False
@@ -268,14 +239,12 @@ class PageFactory:
 		self._volume_overlay.clear_flag(lv.obj.FLAG.HIDDEN)
 		self._volume_overlay.invalidate()
 		return True
-
 	def hide_volume_overlay(self):
 		if self._volume_overlay is None:
 			return False
 		self._volume_overlay.add_flag(lv.obj.FLAG.HIDDEN)
 		self._volume_overlay_until_ms = None
 		return True
-
 	def process_volume_overlay(self):
 		if self._volume_overlay_until_ms is None:
 			return False
@@ -283,9 +252,7 @@ class PageFactory:
 				utime.ticks_ms(), self._volume_overlay_until_ms) < 0:
 			return False
 		return self.hide_volume_overlay()
-
 	def create_confirm_dialog(self, parent):
-		"""创建唯一一套确认弹窗及全屏输入遮罩。"""
 		overlay = lv.obj(parent)
 		_remove_frame(overlay)
 		_make_fixed(overlay)
@@ -296,7 +263,6 @@ class PageFactory:
 			overlay.add_flag(lv.obj.FLAG.CLICKABLE)
 		except Exception:
 			pass
-
 		dialog = lv.obj(overlay)
 		_remove_frame(dialog)
 		_make_fixed(dialog)
@@ -309,7 +275,6 @@ class PageFactory:
 			dialog.clear_flag(lv.obj.FLAG.CLICKABLE)
 		except Exception:
 			pass
-
 		self._confirm_label = _label(
 			dialog, "确认修改？", 0, 40, 264, 40,
 			WHITE, lv.TEXT_ALIGN.CENTER)
@@ -320,12 +285,10 @@ class PageFactory:
 				lambda event: self.cancel_confirm_dialog(), self.app, RED)
 		self._confirm_accept_button = _button(dialog, "确认", 144, 104, 95, 45,
 				lambda event: self.accept_confirm_dialog(), self.app, GREEN)
-
 		self._confirm_overlay = overlay
 		self._confirm_dialog = dialog
 		overlay.add_flag(lv.obj.FLAG.HIDDEN)
 		return overlay
-
 	def _set_popup_locked(self, locked):
 		if self._confirm_overlay is None:
 			return
@@ -336,7 +299,6 @@ class PageFactory:
 				self._confirm_overlay.clear_flag(lv.obj.FLAG.CLICKABLE)
 		except Exception:
 			pass
-
 	def _set_popup_buttons(self, visible):
 		for button in (self._confirm_cancel_button,
 					   self._confirm_accept_button):
@@ -346,7 +308,6 @@ class PageFactory:
 				button.clear_flag(lv.obj.FLAG.HIDDEN)
 			else:
 				button.add_flag(lv.obj.FLAG.HIDDEN)
-
 	def _show_popup(self, mode, line1, line2, color, locked,
 					duration_ms=None, signature=None):
 		if self._confirm_overlay is None:
@@ -407,10 +368,8 @@ class PageFactory:
 			pass
 		self._confirm_overlay.invalidate()
 		return True
-
 	def show_confirm_dialog(self, text, on_confirm, on_cancel=None,
 						 signature=None):
-		"""显示公共弹窗；同一时刻只保存一个待确认动作。"""
 		if self._confirm_overlay is None or on_confirm is None:
 			return False
 		if self._pending_confirm is not None:
@@ -421,9 +380,7 @@ class PageFactory:
 		return self._show_popup(
 			"confirm", text, None, BLUE, True,
 			signature=signature or ("confirm", str(text)))
-
 	def cancel_confirm_dialog(self):
-		"""取消待确认动作，不修改页面状态。"""
 		callback = self._pending_cancel
 		self._pending_confirm = None
 		self._pending_cancel = None
@@ -431,9 +388,7 @@ class PageFactory:
 		self._hide_popup()
 		if callback is not None:
 			callback()
-
 	def accept_confirm_dialog(self):
-		"""先关闭弹窗，再执行一次待确认动作。"""
 		callback = self._pending_confirm
 		self._pending_confirm = None
 		self._pending_cancel = None
@@ -441,29 +396,23 @@ class PageFactory:
 		self._hide_popup()
 		if callback is not None:
 			callback()
-
 	def _hide_popup(self):
 		if self._confirm_overlay is not None:
 			self._confirm_overlay.add_flag(lv.obj.FLAG.HIDDEN)
 		self._popup_mode = None
 		self._popup_signature = None
 		self._popup_until_ms = None
-
 	def show_progress_popup(self, line1, line2=None, locked=True,
 						 signature=None, duration_ms=None):
 		return self._show_popup(
 			"progress", line1, line2, BLUE, locked,
 			duration_ms=duration_ms, signature=signature)
-
 	def hide_connection_popup(self):
-		"""关闭连接进度或结果弹框，不影响登录、确认和讲话弹框。"""
 		if self.connection_popup_state() is None:
 			return False
 		self._hide_popup()
 		return True
-
 	def hide_login_progress_popup(self):
-		"""只关闭登录进度，不关闭蜂窝网络或TCP连接提示。"""
 		if (self._popup_mode == "progress" and
 				isinstance(self._popup_signature, tuple) and
 				self._popup_signature and
@@ -471,7 +420,6 @@ class PageFactory:
 			self._hide_popup()
 			return True
 		return False
-
 	def hide_logout_popup(self):
 		if (self._popup_mode == "progress" and
 				isinstance(self._popup_signature, tuple) and
@@ -480,13 +428,11 @@ class PageFactory:
 			self._hide_popup()
 			return True
 		return False
-
 	def show_connection_result_popup(self, text, success, duration_ms,
 									signature):
 		return self._show_popup(
 			"transient", text, None, GREEN if success else RED, False,
 			duration_ms, signature)
-
 	def connection_popup_state(self):
 		if (self._popup_mode not in ("progress", "transient") or
 				not isinstance(self._popup_signature, tuple) or
@@ -494,38 +440,31 @@ class PageFactory:
 				self._popup_signature[0] != "connection"):
 			return None
 		return self._popup_signature[1], self._popup_signature[2]
-
 	def show_call_popup(self, line1, line2, remote, signature):
 		return self._show_popup(
 			"call", line1, line2, RED if remote else GREEN, True,
 			CALL_POPUP_MAX_DURATION_MS, signature)
-
 	def show_transient_popup(self, line1, line2=None, duration_ms=2000,
 							 color=RED, signature=None):
 		return self._show_popup(
 			"transient", line1, line2, color, False,
 			duration_ms, signature)
-
 	def show_key_notice(self, text, success=True, duration_ms=2000,
 						signature=None):
 		return self._show_popup(
 			"transient", text, None, BLUE if success else RED, False,
 			duration_ms, signature or ("key_notice", str(text)))
-
 	def can_show_low_priority_popup(self):
 		return self._popup_mode is None and self._pending_confirm is None
-
 	def show_ota_progress(self, text, duration_ms=None, signature=None,
 						  locked=True):
 		return self._show_popup(
 			"progress", text, None, BLUE, bool(locked), duration_ms,
 			signature or ("ota", "progress", str(text)))
-
 	def show_ota_result(self, text, success, duration_ms, signature=None):
 		return self._show_popup(
 			"transient", text, None, GREEN if success else RED, False,
 			duration_ms, signature or ("ota", "result", str(text)))
-
 	def hide_ota_popup(self):
 		if (not isinstance(self._popup_signature, tuple) or
 				not self._popup_signature or self._popup_signature[0] != "ota"):
@@ -535,7 +474,6 @@ class PageFactory:
 		self._pending_confirm_text = None
 		self._hide_popup()
 		return True
-
 	def hide_communication_popup(self):
 		if self._popup_mode == "confirm":
 			return
@@ -546,7 +484,6 @@ class PageFactory:
 				signature=("confirm", self._pending_confirm_text))
 		else:
 			self._hide_popup()
-
 	def process_popup(self):
 		if self._popup_until_ms is None:
 			return False
@@ -555,12 +492,9 @@ class PageFactory:
 		was_call = self._popup_mode == "call"
 		self.hide_communication_popup()
 		return was_call
-
 	def call_popup_visible(self):
 		return self._popup_mode == "call"
-
 	def connection_popup_blocked(self):
-		"""确认事务和讲话提示拥有更高优先级，连接提示稍后再显示。"""
 		if (isinstance(self._popup_signature, tuple) and
 				self._popup_signature and
 				self._popup_signature[0] == "key_notice"):
@@ -570,7 +504,6 @@ class PageFactory:
 		if self._popup_mode in ("progress", "transient"):
 			return self.connection_popup_state() is None
 		return False
-
 	def create_status_bar(self, parent):
 		bar = lv.obj(parent)
 		_remove_frame(bar)
@@ -587,9 +520,7 @@ class PageFactory:
 		self._status_labels["battery"] = _label(
 			bar, "电量：99%", 170, 3, 110, 24, WHITE, lv.TEXT_ALIGN.RIGHT, True)
 		return bar
-
 	def create_root_indicator(self, parent):
-		"""创建覆盖在一级页面之上的唯一一组四页指示圆点。"""
 		holder = lv.obj(parent)
 		_remove_frame(holder)
 		_make_fixed(holder)
@@ -612,9 +543,7 @@ class PageFactory:
 			self._root_indicator_dots.append((dot, center_x))
 		self.update_root_indicator(0)
 		return holder
-
 	def update_root_indicator(self, active_index):
-		"""按已吸附的一级页面索引更新圆点，不参与手势判定。"""
 		try:
 			selected = int(active_index)
 		except Exception:
@@ -629,9 +558,7 @@ class PageFactory:
 								   lv.PART.MAIN)
 			dot.set_style_bg_opa(255, lv.PART.MAIN)
 			dot.invalidate()
-
 	def set_status_context(self, context):
-		"""同步固定状态栏左侧上下文，不改变状态栏位置。"""
 		self._status_context = ("settings" if context == "settings"
 								else "police")
 		labels = self._status_labels
@@ -645,7 +572,6 @@ class PageFactory:
 			label.set_text(self._status_police_no)
 			label.set_style_text_color(WHITE, lv.PART.MAIN)
 		label.invalidate()
-
 	def refresh_status(self, snapshot):
 		labels = self._status_labels
 		if not labels:
@@ -691,7 +617,6 @@ class PageFactory:
 				battery_color = WHITE
 		labels["battery"].set_style_text_color(battery_color, lv.PART.MAIN)
 		labels["battery"].invalidate()
-
 	def create_login_page(self, parent):
 		page = lv.obj(parent)
 		_remove_frame(page)
@@ -740,12 +665,8 @@ class PageFactory:
 					button_color = GRAY
 				_button(page, value, x, y, key_w, key_h, callback, self.app,
 						button_color)
-		# 本页面没有提示语、标题或空白滚动区域；最后一行控件结束于234px，
-		# 保留6px安全边距，避免圆角边缘贴屏造成裁切。
 		return page
-
 	def update_login_prefix(self, prefix):
-		"""更新登录页 M/F 前缀按钮的选中状态。"""
 		selected = str(prefix)
 		if self.app.login_m_button is not None:
 			self.app.login_m_button.set_style_bg_color(
@@ -755,7 +676,6 @@ class PageFactory:
 			self.app.login_f_button.set_style_bg_color(
 				BLUE if selected == "F" else GRAY, lv.PART.MAIN)
 			self.app.login_f_button.invalidate()
-
 	def root(self, name, title, parent=None):
 		page = lv.obj(parent if parent is not None else self.app.root_content)
 		_remove_frame(page)
@@ -775,7 +695,6 @@ class PageFactory:
 			_label(page, title, 0, 126, self.app.content_width, 40,
 				   WHITE, lv.TEXT_ALIGN.CENTER)
 		return page
-
 	def _make_location(self, page):
 		values = self._location_values(self._snapshot())
 		specs = values[:5]
@@ -800,7 +719,6 @@ class PageFactory:
 			lv.TEXT_ALIGN.CENTER)
 		_image(page, "location_icon_92.jpg", 196, 112, 92, 92,
 			   lambda e: self.app.open_child("location_detail"), self.app)
-
 	def refresh_state(self, snapshot):
 		self.refresh_status(snapshot)
 		if self._volume_page_view is not None:
@@ -826,6 +744,10 @@ class PageFactory:
 		if self._location_detail_voltage_label is not None:
 			self._location_detail_voltage_label.set_text("用户")
 			self._location_detail_voltage_label.invalidate()
+		if self._location_detail_name_label is not None:
+			self._location_detail_name_label.set_text(
+				snapshot.get("police_name") or "--")
+			self._location_detail_name_label.invalidate()
 		for key, label in self._device_version_labels.items():
 			label.set_text(str(snapshot[key]))
 			label.invalidate()
@@ -852,7 +774,6 @@ class PageFactory:
 			view["version"].invalidate()
 			view["status"].invalidate()
 			button.invalidate()
-
 	@staticmethod
 	def _location_values(snapshot):
 		longitude = snapshot["longitude"]
@@ -876,7 +797,6 @@ class PageFactory:
 			("satellites", "卫星数量：{}".format("--" if satellites is None else satellites)),
 			("time", snapshot["location_time"] or "--:--:--"),
 			("weekday", snapshot["location_weekday"] or "--"))
-
 	def child(self, name, params=None, parent=None):
 		page = lv.obj(parent if parent is not None else self.app.child_screen)
 		_remove_frame(page)
@@ -921,7 +841,6 @@ class PageFactory:
 		else:
 			self._make_placeholder(page, name)
 		return page
-
 	def _make_location_detail(self, page):
 		_revision, snapshot = self.app.state_store.get_snapshot()
 		police_name = snapshot.get("police_name") or "--"
@@ -931,30 +850,32 @@ class PageFactory:
 			page, "用户",
 			0, 18, 296, 33, WHITE, lv.TEXT_ALIGN.CENTER)
 		self._location_detail_voltage_label = voltage_label
-
 		def forget_voltage_label(event):
 			if self._location_detail_voltage_label is voltage_label:
 				self._location_detail_voltage_label = None
 		page.add_event_cb(forget_voltage_label, lv.EVENT.DELETE, None)
-		_label(page, police_name, 0, 70, 296, 33, WHITE, lv.TEXT_ALIGN.CENTER)
+		name_label = _label(
+			page, police_name, 0, 70, 296, 33, WHITE, lv.TEXT_ALIGN.CENTER)
+		self._location_detail_name_label = name_label
+		def forget_name_label(event):
+			if self._location_detail_name_label is name_label:
+				self._location_detail_name_label = None
+		page.add_event_cb(forget_name_label, lv.EVENT.DELETE, None)
 		_label(page, "警号：{}".format(police_no), 0, 122, 296, 33, WHITE,
 			   lv.TEXT_ALIGN.CENTER)
 		_button(page, "切换用户", 4, 170, 288, 40,
 				lambda e: self.show_confirm_dialog(
 					"确认退出登录？", self.app.logout_to_login),
 				self.app, RED)
-
 	def _make_choice_page(self, page, title, choices):
 		_label(page, title, 0, 8, 296, 33, CYAN, lv.TEXT_ALIGN.CENTER)
 		for index, choice in enumerate(choices):
 			_button(page, choice[0], 18, 56 + index * 60, 260, 48,
 					lambda e, target=choice[1]: self.app.open_child(target),
 					self.app, GRAY)
-
 	def _snapshot(self):
 		_revision, snapshot = self.app.state_store.get_snapshot()
 		return snapshot
-
 	@staticmethod
 	def _set_radio_visual(row_info, selected):
 		row, dot, label, enabled = row_info
@@ -966,7 +887,6 @@ class PageFactory:
 			CYAN if selected else (WHITE if enabled else DISABLED_TEXT),
 			lv.PART.MAIN)
 		row.invalidate()
-
 	def _radio_row(self, parent, y, text, value, selected, enabled,
 				   on_select, rows, selection, require_confirm,
 				   confirmed_state_key=None):
@@ -991,13 +911,11 @@ class PageFactory:
 		info = (row, dot, label, bool(enabled))
 		rows[value] = info
 		self._set_radio_visual(info, selected)
-
 		def choose(event, key=value, allowed=bool(enabled)):
 			if not allowed or not self.app.can_click_current_touch():
 				return
 			if key == selection["value"]:
 				return
-
 			def commit_selection():
 				if not on_select(key):
 					return
@@ -1009,14 +927,12 @@ class PageFactory:
 				selection["value"] = key
 				for item_key in rows:
 					self._set_radio_visual(rows[item_key], item_key == key)
-
 			if require_confirm:
 				self.show_confirm_dialog("确认修改？", commit_selection)
 			else:
 				commit_selection()
 		row.add_event_cb(choose, lv.EVENT.CLICKED, None)
 		return row
-
 	def _make_radio_page(self, page, title, options, selected, on_select,
 						 list_mode=False, require_confirm=False,
 						 confirmed_state_key=None):
@@ -1042,12 +958,10 @@ class PageFactory:
 		if confirmed_state_key is not None:
 			view = (rows, selection, options[0][0])
 			self._comm_radio_views[confirmed_state_key] = view
-
 			def forget_view(event):
 				if self._comm_radio_views.get(confirmed_state_key) is view:
 					self._comm_radio_views.pop(confirmed_state_key, None)
 			page.add_event_cb(forget_view, lv.EVENT.DELETE, None)
-
 	def _make_shoulder_mode(self, page):
 		snapshot = self._snapshot()
 		options = (("off", "关闭", True),
@@ -1057,7 +971,6 @@ class PageFactory:
 			page, "肩灯模式", options, snapshot["lamp_mode"],
 			self.app.select_lamp_mode, require_confirm=True,
 			confirmed_state_key="lamp_mode")
-
 	def _make_double_click_mode(self, page):
 		snapshot = self._snapshot()
 		options = ((True, "开启", True), (False, "关闭", True))
@@ -1065,7 +978,6 @@ class PageFactory:
 			page, "双击模式", options, snapshot["double_click_enabled"],
 			self.app.select_double_click, require_confirm=True,
 			confirmed_state_key="double_click_enabled")
-
 	def _make_group_mode(self, page):
 		snapshot = self._snapshot()
 		if (snapshot.get("identity_mode") == "guest" or
@@ -1080,7 +992,6 @@ class PageFactory:
 			page, "", tuple(options), selected, self.app.select_group,
 			list_mode=True, require_confirm=True,
 			confirmed_state_key="confirmed_group_id")
-
 	def _make_single_mode(self, page):
 		snapshot = self._snapshot()
 		if (snapshot.get("identity_mode") == "guest" or
@@ -1098,7 +1009,6 @@ class PageFactory:
 			page, "", tuple(options), selected, self.app.select_person,
 			list_mode=True, require_confirm=True,
 			confirmed_state_key="single_peer")
-
 	def _make_device_info(self, page):
 		snapshot = self._snapshot()
 		_label(page, "设备信息", 0, 4, self.app.content_width, 33,
@@ -1120,14 +1030,11 @@ class PageFactory:
 			label.set_long_mode(lv.label.LONG.SCROLL_CIRCULAR)
 			labels[key] = label
 		self._device_version_labels = labels
-
 		def forget_labels(event):
 			if self._device_version_labels is labels:
 				self._device_version_labels = {}
 		page.add_event_cb(forget_labels, lv.EVENT.DELETE, None)
-
 	def _make_brightness_symbol(self, page, x, y, size, level):
-		"""绘制同款大小太阳，以图标尺寸表达高低亮度。"""
 		holder = lv.obj(page)
 		_remove_frame(holder)
 		_make_fixed(holder)
@@ -1140,7 +1047,6 @@ class PageFactory:
 		ray_length = max(5, draw_size // 4)
 		core_size = max(8, draw_size // 2)
 		core_pos = draw_pos + (draw_size - core_size) // 2
-
 		def part(px, py, pw, ph, radius=0):
 			item = lv.obj(holder)
 			_remove_frame(item)
@@ -1153,7 +1059,6 @@ class PageFactory:
 				item.set_style_radius(int(radius), lv.PART.MAIN)
 			except Exception:
 				pass
-
 		part(core_pos, core_pos, core_size, core_size, core_size // 2)
 		center = core_pos + core_size // 2 - rays // 2
 		edge = draw_pos
@@ -1171,7 +1076,6 @@ class PageFactory:
 		for item in ray_items:
 			part(item[0], item[1], item[2], item[3], rays // 2)
 		return holder
-
 	def _make_vertical_slider(self, page, title, minimum, maximum, value,
 							  on_change, suffix="", mode="brightness",
 							  setting=None):
@@ -1202,7 +1106,6 @@ class PageFactory:
 		value_label = _label(
 			page, "{}{}".format(value, suffix), slider_x + slider_width + 10,
 			86, 110, 33, CYAN, lv.TEXT_ALIGN.LEFT)
-
 		def value_changed(event):
 			target = event.get_target()
 			new_value = on_change(int(target.get_value()))
@@ -1214,21 +1117,18 @@ class PageFactory:
 				lambda event: self.app.commit_slider_setting(setting),
 				lv.EVENT.RELEASED, None)
 		return slider, value_label
-
 	def _make_brightness(self, page):
 		snapshot = self._snapshot()
 		self._make_vertical_slider(
 			page, "屏幕亮度", 5, 100, snapshot["screen_brightness"],
 			self.app.set_screen_brightness, "%", "brightness",
 			"screen_brightness")
-
 	def _make_lamp_brightness(self, page):
 		snapshot = self._snapshot()
 		self._make_vertical_slider(
 			page, "肩灯亮度", 5, 100, snapshot["lamp_brightness"],
 			self.app.set_lamp_brightness, "%", "brightness",
 			"lamp_brightness")
-
 	def _make_volume(self, page):
 		snapshot = self._snapshot()
 		slider, value_label = self._make_vertical_slider(
@@ -1236,12 +1136,10 @@ class PageFactory:
 			self.app.set_audio_volume, "", "volume", "audio_volume")
 		view = {"slider": slider, "label": value_label}
 		self._volume_page_view = view
-
 		def forget_view(event):
 			if self._volume_page_view is view:
 				self._volume_page_view = None
 		page.add_event_cb(forget_view, lv.EVENT.DELETE, None)
-
 	def _make_sleep(self, page):
 		snapshot = self._snapshot()
 		options = ((10, "10秒", True), (15, "15秒", True),
@@ -1251,7 +1149,6 @@ class PageFactory:
 			page, "", options, snapshot["sleep_timeout_seconds"],
 			self.app.select_sleep_timeout,
 			list_mode=True, require_confirm=True)
-
 	def _make_network(self, page):
 		snapshot = self._snapshot()
 		_label(page, "网络状态", 0, 4, self.app.content_width, 33,
@@ -1265,22 +1162,18 @@ class PageFactory:
 				page, item[2], 100, y, 184, 22, item[3],
 				lv.TEXT_ALIGN.LEFT, regular=True)
 		self._network_labels = labels
-
 		def forget_labels(event):
 			if self._network_labels is labels:
 				self._network_labels = {}
 		page.add_event_cb(forget_labels, lv.EVENT.DELETE, None)
-
 		_button(page, "刷新", self.app.content_width - 92, 174, 84, 30,
 				self.app.refresh_network, self.app, BLUE)
-
 	@staticmethod
 	def _network_values(snapshot):
 		connected = bool(snapshot["network_connected"])
 		signal_level = snapshot.get("signal_level")
 		signal_dbm = snapshot.get("signal_dbm")
 		if signal_level and signal_dbm is not None:
-			# 仅保留两个空格，避免等级和dBm数值之间间距过大导致右侧截断。
 			signal_text = "{}  {} dBm".format(signal_level, signal_dbm)
 		else:
 			signal_text = signal_level or "无"
@@ -1291,14 +1184,12 @@ class PageFactory:
 				("network", "网络状态：",
 				 "成功连接" if connected else "连接失败",
 				 GREEN if connected else RED))
-
 	def _make_fall_detection(self, page):
 		snapshot = self._snapshot()
 		options = ((True, "开启", True), (False, "关闭", True))
 		self._make_radio_page(
 			page, "跌倒检测", options, snapshot["fall_detection_enabled"],
 			self.app.select_fall_detection)
-
 	def _make_upgrade(self, page):
 		snapshot = self._snapshot()
 		_label(page, "升级", 0, 4, self.app.content_width, 33,
@@ -1310,7 +1201,6 @@ class PageFactory:
 						self.app.content_width - 16, 33,
 						GREEN if snapshot.get("upgrade_status_tone") == "success" else WHITE,
 						lv.TEXT_ALIGN.CENTER)
-
 		def check_upgrade(event):
 			self.app.check_upgrade()
 		button = _button(page, "查询新版本", 48, 152, 200, 48,
@@ -1326,7 +1216,6 @@ class PageFactory:
 			self._upgrade_views = [item for item in self._upgrade_views
 				if item is not view]
 		page.add_event_cb(forget_upgrade, lv.EVENT.DELETE, None)
-
 	def _make_settings(self, page):
 		viewport = self._new_list_viewport(page)
 		rows = (("settings_device.jpg", "设备信息", "device_info"),
@@ -1358,7 +1247,6 @@ class PageFactory:
 					self.app.open_child(target)
 			row.add_event_cb(guarded_row, lv.EVENT.CLICKED, None)
 		self._finish_list_viewport(viewport, len(rows))
-
 	def _new_list_viewport(self, page):
 		viewport = lv.obj(page)
 		_remove_frame(viewport)
@@ -1366,7 +1254,6 @@ class PageFactory:
 		viewport.set_size(self.app.content_width, self.app.content_height)
 		viewport.set_style_bg_color(BLACK, lv.PART.MAIN)
 		viewport.set_style_bg_opa(255, lv.PART.MAIN)
-		# 210px内容区配合48px行高和4px行距，一屏完整显示四项。
 		viewport.set_style_pad_bottom(6, lv.PART.MAIN)
 		viewport.set_scroll_dir(lv.DIR.VER)
 		viewport.set_scrollbar_mode(lv.SCROLLBAR_MODE.OFF)
@@ -1380,9 +1267,7 @@ class PageFactory:
 		except Exception:
 			pass
 		return viewport
-
 	def _finish_list_viewport(self, viewport, item_count):
-		"""完成内容尺寸计算，并绑定不截断惯性的整行收尾。"""
 		try:
 			viewport.update_layout()
 		except Exception:
@@ -1404,7 +1289,6 @@ class PageFactory:
 		last_row_start = max(
 			0, (int(item_count) - LIST_VISIBLE_ROWS) * LIST_ROW_STEP)
 		self._bind_list_scroll_settle(viewport, last_row_start)
-
 	def _bind_list_scroll_settle(self, viewport, last_row_start):
 		state = {
 			"viewport": viewport,
@@ -1433,7 +1317,6 @@ class PageFactory:
 				self._pause_list_scroll_timer()
 			except Exception:
 				self._list_scroll_timer = None
-
 	@staticmethod
 	def _read_list_scroll_y(viewport):
 		try:
@@ -1443,7 +1326,6 @@ class PageFactory:
 				return int(lv.obj_get_scroll_y(viewport))
 			except Exception:
 				return None
-
 	def _pause_list_scroll_timer(self):
 		timer = self._list_scroll_timer
 		if timer is None:
@@ -1452,7 +1334,6 @@ class PageFactory:
 			timer.pause()
 		except Exception:
 			pass
-
 	def _resume_list_scroll_timer(self):
 		timer = self._list_scroll_timer
 		if timer is None:
@@ -1462,9 +1343,7 @@ class PageFactory:
 			timer.resume()
 		except Exception:
 			pass
-
 	def _list_scroll_activity(self, state):
-		"""只记录原生滚动活动，不修改跟手或惯性过程。"""
 		if state["settling"] or state not in self._list_scroll_states:
 			return
 		now = utime.ticks_ms()
@@ -1476,23 +1355,18 @@ class PageFactory:
 		state["stable_since"] = now
 		if not was_tracking:
 			self._resume_list_scroll_timer()
-
 	def _list_scroll_deleted(self, state):
-		"""列表销毁后解除引用，避免定时器持有失效的LVGL对象。"""
 		self._list_scroll_states = [
 			item for item in self._list_scroll_states if item is not state]
 		if not any(item["tracking"] for item in self._list_scroll_states):
 			self._pause_list_scroll_timer()
-
 	def _list_scroll_poll(self, timer):
-		"""原生惯性真正静止后，再将活动列表补齐到最近的完整行。"""
 		now = utime.ticks_ms()
 		for state in tuple(self._list_scroll_states):
 			if state["tracking"]:
 				self._poll_one_list_scroll(state, now)
 		if not any(item["tracking"] for item in self._list_scroll_states):
 			self._pause_list_scroll_timer()
-
 	def _poll_one_list_scroll(self, state, now):
 		viewport = state["viewport"]
 		scroll_y = self._read_list_scroll_y(viewport)
@@ -1542,7 +1416,6 @@ class PageFactory:
 			return
 		state["last_y"] = None
 		state["stable_since"] = now
-
 	def _make_placeholder(self, page, name):
 		titles = {"shoulder_mode": "肩灯模式", "double_click_mode": "双击模式",
 				  "group_mode": "组呼模式", "single_mode": "单呼模式",

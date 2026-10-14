@@ -1,15 +1,9 @@
 # -*- coding: utf-8 -*-
-"""RTP 基础组包工具，供新的 RTP 收发线程复用。"""
-
-
 RTP_HEADER_SIZE = 12
 RTP_PAYLOAD_TYPE_PCMA = 8
 RTP_PAYLOAD_SIZE = 160
-
-
 def build_rtp_packet(sequence, timestamp, ssrc, payload=b"", marker=0,
 					 payload_type=RTP_PAYLOAD_TYPE_PCMA):
-	"""构造 RTP 固定头和负载，不访问 socket 或硬件。"""
 	sequence = int(sequence) & 0xFFFF
 	timestamp = int(timestamp) & 0xFFFFFFFF
 	ssrc = int(ssrc) & 0xFFFFFFFF
@@ -22,10 +16,7 @@ def build_rtp_packet(sequence, timestamp, ssrc, payload=b"", marker=0,
 				   (timestamp >> 8) & 0xFF, timestamp & 0xFF)) +
 			bytes(((ssrc >> 24) & 0xFF, (ssrc >> 16) & 0xFF,
 				   (ssrc >> 8) & 0xFF, ssrc & 0xFF)) + payload)
-
-
 def parse_rtp_packet(packet):
-	"""解析本项目使用的 RTP 包，返回头字段和负载。"""
 	if packet is None or len(packet) < RTP_HEADER_SIZE:
 		return None
 	data = bytes(packet)

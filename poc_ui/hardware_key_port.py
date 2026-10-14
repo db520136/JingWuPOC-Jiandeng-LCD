@@ -1,12 +1,9 @@
 # -*- coding: utf-8 -*-
-
 try:
 	from machine import ExtInt, Pin
 except ImportError:
 	ExtInt = None
 	Pin = None
-
-
 KEY_VOLUME_UP = "volume_up"
 KEY_VOLUME_DOWN = "volume_down"
 KEY_AUX_1 = "aux_1"
@@ -20,13 +17,9 @@ KEY_LAMP_RELEASE = "lamp_release"
 FUNCTION_KEY_ACTIONS = (
 	KEY_VOLUME_UP, KEY_VOLUME_DOWN, KEY_AUX_1, KEY_AUX_2,
 	KEY_PTT_PRESS, KEY_PTT_RELEASE)
-
 KEY_ACTIVE_LEVEL = 0
 KEY_DEBOUNCE_MS = 30
-
-
 class HardwareKeyPort:
-
 	def __init__(self, notify_callback, volume_up_gpio=30,
 				 volume_down_gpio=31, ptt_gpio=29, screen_gpio=5,
 				 lamp_gpio=28,
@@ -50,7 +43,6 @@ class HardwareKeyPort:
 		self._lamp_pressed = False
 		self._irqs = []
 		self.running = False
-
 	def _pin_id(self, gpio):
 		if gpio == 5:
 			return Pin.GPIO5
@@ -63,7 +55,6 @@ class HardwareKeyPort:
 		if gpio == 31:
 			return Pin.GPIO31
 		raise ValueError("当前固件按键GPIO未建档：{}".format(gpio))
-
 	def _extint_id(self, gpio):
 		if gpio == 5:
 			return ExtInt.GPIO5
@@ -76,20 +67,16 @@ class HardwareKeyPort:
 		if gpio == 31:
 			return ExtInt.GPIO31
 		raise ValueError("当前固件按键中断GPIO未建档：{}".format(gpio))
-
 	def _make_input(self, gpio):
 		return Pin(self._pin_id(gpio), Pin.IN, Pin.PULL_PU, 1)
-
 	def _on_irq(self, *args):
 		# 中断上下文不读GPIO、不消抖、不打印、不执行业务。
 		self.notify_callback()
-
 	def _make_irq(self, gpio):
 		irq = ExtInt(self._extint_id(gpio), ExtInt.IRQ_RISING_FALLING,
 					 ExtInt.PULL_PU, self._on_irq)
 		irq.enable()
 		return irq
-
 	def start(self):
 		if self.running:
 			return False
@@ -134,7 +121,6 @@ class HardwareKeyPort:
 		except Exception:
 			self.stop()
 			raise
-
 	def stop(self):
 		for irq in self._irqs:
 			try:
@@ -148,7 +134,6 @@ class HardwareKeyPort:
 		self.screen_pin = None
 		self.lamp_pin = None
 		self.running = False
-
 	def poll_pressed_edges(self):
 		if not self.running:
 			return ()
@@ -182,7 +167,6 @@ class HardwareKeyPort:
 		self._screen_pressed = screen_pressed
 		self._lamp_pressed = lamp_pressed
 		return tuple(actions)
-
 	def lamp_pressed(self):
 		return bool(self.lamp_pin is not None and
 			int(self.lamp_pin.read()) == KEY_ACTIVE_LEVEL)

@@ -1,31 +1,12 @@
 # -*- coding: utf-8 -*-
-"""通信发送线程使用的有界优先级命令队列。
-
-队列只保存控制命令。RTP_AUDIO_FRAME 是高频实时流，不进入这里，发送线程
-应直接从音频缓冲获取并发送。该模块不访问 socket、UI 或任何硬件。
-"""
-
 import _thread
-
-try:
-	from usr.comm_commands import (BOUNDED_QUEUE_COMMANDS,
-								   CMD_RELEASE_FLOOR,
-								   CMD_RTP_ACTIVATE,
-								   CMD_RTP_AUDIO_STOP,
-								   COALESCIBLE_COMMANDS,
-								   NON_DROPPABLE_COMMANDS, command_priority)
-except ImportError:
-	from comm_commands import (BOUNDED_QUEUE_COMMANDS,
+from usr.comm_commands import (BOUNDED_QUEUE_COMMANDS,
 							   CMD_RELEASE_FLOOR,
 							   CMD_RTP_ACTIVATE,
 							   CMD_RTP_AUDIO_STOP,
 							   COALESCIBLE_COMMANDS,
 							   NON_DROPPABLE_COMMANDS, command_priority)
-
-
 class CommunicationCommandQueue:
-	"""单消费者通信命令队列，使用一个 wake gate 避免重复 release。"""
-
 	def __init__(self, max_length=32):
 		self.max_length = max(1, int(max_length))
 		self._lock = _thread.allocate_lock()
@@ -53,7 +34,6 @@ class CommunicationCommandQueue:
 		# 普通32项容量，因此普通队列满也不会拒绝松键事务。
 		self._urgent_stop = None
 		self._urgent_release = None
-
 	def _append_item(self, command_type, payload, priority):
 		item = {
 			"type": command_type,
@@ -63,7 +43,6 @@ class CommunicationCommandQueue:
 		}
 		self._sequence += 1
 		return item
-
 	def _take_urgent_locked(self):
 		items = []
 		if self._urgent_stop is not None:
@@ -74,13 +53,7 @@ class CommunicationCommandQueue:
 			self._urgent_release = None
 		items.sort(key=lambda item: (item["priority"], item["sequence"]))
 		return items
-
 	def submit(self, command_type, payload=None, priority=None):
-		"""投递一个命令。
-
-		P0/P1 或标记为不可丢弃的命令在队列满时返回 False；P2/P3 命令
-		允许淘汰一个最低优先级旧项。可合并命令已有同类项时只返回 True。
-		"""
 		if command_type not in BOUNDED_QUEUE_COMMANDS:
 			return False
 		if priority is None:
@@ -146,9 +119,7 @@ class CommunicationCommandQueue:
 					self._lock.release()
 				return False
 		return accepted
-
 	def signal_stop(self):
-		"""记录独立停止事件，保证空闲阻塞线程可以退出。"""
 		should_wake = False
 		self._lock.acquire()
 		try:
@@ -161,9 +132,7 @@ class CommunicationCommandQueue:
 		if should_wake:
 			self._wake.release()
 		return True
-
 	def begin_logout(self):
-		"""丢弃尚未发送的旧会话命令，只保留一次本地停音频。"""
 		should_wake = False
 		self._lock.acquire()
 		try:
@@ -180,13 +149,9 @@ class CommunicationCommandQueue:
 		if should_wake:
 			self._wake.release()
 		return True
-
 	def wait(self):
-		"""阻塞等待一次或多次命令/停止事件。"""
 		self._wake.acquire()
-
 	def take_batch(self):
-		"""原子取得当前批次，返回 ``(stop_pending, items)``。"""
 		self._lock.acquire()
 		try:
 			stop_pending = self._stop_pending
@@ -204,17 +169,13 @@ class CommunicationCommandQueue:
 		if follow_up:
 			self._wake.release()
 		return stop_pending, items
-
 	def take_urgent_batch(self):
-		"""批次处理中取走后来到达的PTT松键紧急命令。"""
 		self._lock.acquire()
 		try:
 			return self._take_urgent_locked()
 		finally:
 			self._lock.release()
-
 	def take_batch_nowait(self):
-		"""音频实时循环使用：有唤醒令牌时取走一批，否则返回空批次。"""
 		self._lock.acquire()
 		try:
 			pending = self._wake_pending
@@ -224,7 +185,6 @@ class CommunicationCommandQueue:
 			return False, []
 		self._wake.acquire()
 		return self.take_batch()
-
 	def pending_count(self):
 		self._lock.acquire()
 		try:

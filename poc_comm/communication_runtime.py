@@ -1,25 +1,9 @@
 # -*- coding: utf-8 -*-
-"""新通信架构的三线程运行时管理层。
-
-本模块固定管理 TCP 接收、UDP/RTP 接收和 TCP/RTP 统一发送三个 Worker；不访问
-UI，也不实现 POC 协议状态机。Socket 由上层显式创建并传入，便于独立验证。
-"""
-
-try:
-	from usr.communication_queue import CommunicationCommandQueue
-	from usr.communication_send_worker import CommunicationSendWorker
-	from usr.rtp_receive_worker import RTPReceiveWorker
-	from usr.tcp_receive_worker import TCPReceiveWorker
-except ImportError:
-	from communication_queue import CommunicationCommandQueue
-	from communication_send_worker import CommunicationSendWorker
-	from rtp_receive_worker import RTPReceiveWorker
-	from tcp_receive_worker import TCPReceiveWorker
-
-
+from usr.communication_queue import CommunicationCommandQueue
+from usr.communication_send_worker import CommunicationSendWorker
+from usr.rtp_receive_worker import RTPReceiveWorker
+from usr.tcp_receive_worker import TCPReceiveWorker
 class CommunicationRuntime:
-	"""管理一组 TCP/UDP Socket 及其三个通信 Worker。"""
-
 	def __init__(self, tcp_socket, udp_socket, server_ip,
 				 udp_server_port=None, read_audio_frame=None,
 				 write_audio_frame=None, event_callback=None,
@@ -45,39 +29,26 @@ class CommunicationRuntime:
 		self.send = None
 		self.session = None
 		self.running = False
-
 	def attach_session(self, session):
-		"""挂载可选的 PTT/协议会话；必须在运行时启动前调用。"""
 		if self.running:
 			raise RuntimeError("运行时运行中不能更换通信会话")
 		if session is None:
 			raise ValueError("session不能为空")
 		self.session = session
 		return True
-
 	def _on_tcp_event(self, event):
 		self._emit("tcp", event)
-
 	def _on_rtp_event(self, event):
 		self._emit("rtp", event)
-
 	def _on_send_event(self, event):
 		self._emit("send", event)
-
 	def _emit(self, source, event):
 		wrapped = {"source": source, "event": event}
 		if self.session is not None:
 			self.session.on_runtime_event(wrapped)
 		if self.event_callback is not None:
 			self.event_callback(wrapped)
-
 	def start(self, session_threaded=True, session_wake_callback=None):
-		"""启动三个 Worker；失败时回收已启动对象和 Socket。
-
-		``session_threaded=False`` 用于正式 UI 入口：PTT 状态机由上层
-		唯一通信业务线程调用 ``poll_once``，避免额外创建 PTT 线程。
-		独立通信测试默认保持原有内部线程模式。
-		"""
 		if self.running:
 			return False
 		self.tcp_receive = TCPReceiveWorker(
@@ -120,37 +91,26 @@ class CommunicationRuntime:
 			self.rtp_receive = None
 			self.send = None
 			raise
-
 	def submit(self, command_type, payload=None, priority=None):
-		"""向唯一发送线程投递一个有界命令。"""
 		return self.commands.submit(command_type, payload, priority)
-
 	def cancel_rtp_activation(self, retry_key=None, server_port=None):
-		"""通知发送Worker停止指定远端首包激活重试。"""
-		try:
-			from usr.comm_commands import CMD_RTP_ACTIVATE_CANCEL
-		except ImportError:
-			from comm_commands import CMD_RTP_ACTIVATE_CANCEL
+		from usr.comm_commands import CMD_RTP_ACTIVATE_CANCEL
 		payload = {"retry_key": retry_key}
 		if server_port is not None:
 			payload["server_port"] = server_port
 		return self.submit(CMD_RTP_ACTIVATE_CANCEL, payload)
-
 	def set_rtp_receive_context(self, group_id, call_type, server_port):
 		if self.rtp_receive is None:
 			return False
 		self.rtp_receive.set_receive_context(
 			group_id, call_type, server_port)
 		return True
-
 	def clear_rtp_receive_context(self):
 		if self.rtp_receive is None:
 			return False
 		self.rtp_receive.clear_receive_context()
 		return True
-
 	def begin_logout(self):
-		"""同步隔离收发Worker；之后只允许退出包和停止命令。"""
 		if self.rtp_receive is not None:
 			self.rtp_receive.clear_receive_context()
 		if self.send is not None:
@@ -158,9 +118,7 @@ class CommunicationRuntime:
 		if self.session is not None:
 			self.session.begin_logout()
 		return True
-
 	def stop(self):
-		"""停止三个 Worker 并关闭 Socket；重复调用安全。"""
 		self.running = False
 		if self.session is not None:
 			self.session.stop()
@@ -171,7 +129,6 @@ class CommunicationRuntime:
 		if self.rtp_receive is not None:
 			self.rtp_receive.stop()
 		self._close_sockets()
-
 	def _close_sockets(self):
 		try:
 			self.tcp_socket.close()
@@ -181,9 +138,7 @@ class CommunicationRuntime:
 			self.udp_socket.close()
 		except Exception:
 			pass
-
 	def reconnect(self, tcp_socket, udp_socket, udp_server_port=None):
-		"""替换已断开的 Socket 并重启 Worker；协议登录由上层负责。"""
 		if tcp_socket is None or udp_socket is None:
 			raise ValueError("重连Socket不能为None")
 		# 调用方可能已经先 stop() 释放旧 Socket（例如需要先重新 bind

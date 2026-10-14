@@ -1,15 +1,7 @@
 # -*- coding: utf-8 -*-
-"""单线程RTP接收和轻量抖动缓冲。"""
-
 import _thread
 import utime
-
-try:
-	from usr.rtp_protocol import RTP_PAYLOAD_SIZE, parse_rtp_packet
-except ImportError:
-	from rtp_protocol import RTP_PAYLOAD_SIZE, parse_rtp_packet
-
-
+from usr.rtp_protocol import RTP_PAYLOAD_SIZE, parse_rtp_packet
 RTP_RX_FIRST_PACKET = "rtp_first_packet"
 RTP_RX_ERROR = "rtp_receive_error"
 RTP_ACTIVE_TIMEOUT_S = 0.020
@@ -18,15 +10,9 @@ RTP_IDLE_AFTER_MS = 5000
 RTP_START_PACKETS = 5
 RTP_MAX_PACKETS = 24
 RTP_SILENCE_FRAME = bytes((0xD5,)) * RTP_PAYLOAD_SIZE
-
-
 def _seq_distance(sequence, expected):
 	return (int(sequence) - int(expected)) & 0xFFFF
-
-
 class RTPReceiveWorker:
-	"""空闲永久阻塞，收到当前会话首包后进入20ms接收节奏。"""
-
 	def __init__(self, socket_obj, packet_callback, receive_size=1024,
 				 write_audio_frame=None):
 		if socket_obj is None:
@@ -49,7 +35,6 @@ class RTPReceiveWorker:
 		self._started = False
 		self._next_play_ms = None
 		self._last_rtp_ms = None
-
 	def start(self):
 		if self.running:
 			return False
@@ -62,7 +47,6 @@ class RTPReceiveWorker:
 			self.running = False
 			self.thread_id = None
 			raise
-
 	def stop(self):
 		self.running = False
 		self.clear_receive_context()
@@ -70,9 +54,7 @@ class RTPReceiveWorker:
 			self.socket.close()
 		except Exception:
 			pass
-
 	def set_receive_context(self, group_id, call_type, server_port):
-		"""保存允许接收的远端讲话上下文，不唤醒永久阻塞Socket。"""
 		self._lock.acquire()
 		try:
 			if (self._requested_context is not None and
@@ -88,16 +70,13 @@ class RTPReceiveWorker:
 			return dict(self._requested_context)
 		finally:
 			self._lock.release()
-
 	def clear_receive_context(self):
-		"""使当前上下文失效；活跃模式最多20ms后恢复永久阻塞。"""
 		self._lock.acquire()
 		try:
 			self._generation += 1
 			self._requested_context = None
 		finally:
 			self._lock.release()
-
 	def _read_context(self):
 		self._lock.acquire()
 		try:
@@ -105,26 +84,22 @@ class RTPReceiveWorker:
 					dict(self._requested_context))
 		finally:
 			self._lock.release()
-
 	def _clear_jitter(self):
 		self._buffer = {}
 		self._expected_sequence = None
 		self._started = False
 		self._next_play_ms = None
 		self._last_rtp_ms = None
-
 	def _resync_jitter(self, sequence):
 		self._buffer = {}
 		self._expected_sequence = int(sequence) & 0xFFFF
 		self._started = False
 		self._next_play_ms = None
-
 	def _set_idle_mode(self):
 		self._clear_jitter()
 		self._worker_mode = "idle"
 		self._current_context = None
 		self.socket.settimeout(None)
-
 	def _set_active_mode(self, context, parsed, now):
 		self._clear_jitter()
 		self._worker_mode = "active"
@@ -136,7 +111,6 @@ class RTPReceiveWorker:
 		self.packet_callback({
 			"type": RTP_RX_FIRST_PACKET,
 			"payload": dict(context)})
-
 	@staticmethod
 	def _valid_packet(packet):
 		parsed = parse_rtp_packet(packet)
@@ -145,7 +119,6 @@ class RTPReceiveWorker:
 				len(parsed["payload"]) != RTP_PAYLOAD_SIZE):
 			return None
 		return parsed
-
 	@staticmethod
 	def _source_matches(address, context):
 		if not isinstance(address, (tuple, list)) or len(address) < 2:
@@ -154,7 +127,6 @@ class RTPReceiveWorker:
 			return int(address[1]) == int(context["server_port"])
 		except Exception:
 			return False
-
 	def _push_packet(self, parsed):
 		sequence = parsed["sequence"]
 		if sequence in self._buffer:
@@ -171,7 +143,6 @@ class RTPReceiveWorker:
 			self._resync_jitter(sequence)
 			self._buffer[sequence] = parsed["payload"]
 		return True
-
 	def _play_one(self):
 		if self._expected_sequence is None:
 			return False
@@ -185,7 +156,6 @@ class RTPReceiveWorker:
 		if self.write_audio_frame is not None:
 			self.write_audio_frame(frame, require_active=True)
 		return True
-
 	def _drive_playback(self, now):
 		if not self._started:
 			if len(self._buffer) < RTP_START_PACKETS:
@@ -198,7 +168,6 @@ class RTPReceiveWorker:
 				break
 			self._next_play_ms = utime.ticks_add(
 				self._next_play_ms, RTP_PACKET_INTERVAL_MS)
-
 	@staticmethod
 	def _is_timeout(error):
 		errno = getattr(error, "errno", None)
@@ -207,7 +176,6 @@ class RTPReceiveWorker:
 		text = str(error).lower()
 		return ("eagain" in text or "timed out" in text or
 				"timeout" in text)
-
 	def _active_tick(self, now):
 		context = self._read_context()
 		if context is None or context != self._current_context:
@@ -219,7 +187,6 @@ class RTPReceiveWorker:
 			self._set_idle_mode()
 			return
 		self._drive_playback(now)
-
 	def _run(self):
 		try:
 			while self.running:

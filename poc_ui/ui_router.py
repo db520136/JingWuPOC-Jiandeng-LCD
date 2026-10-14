@@ -1,14 +1,10 @@
 # -*- coding: utf-8 -*-
-"""二级/三级页面路由器。"""
-
-
 class Router:
 	def __init__(self, host):
 		self.host = host
 		self.stack = []
 		self.current = None
 		self.busy = False
-
 	def push(self, page_name, page_factory=None, params=None):
 		if self.busy:
 			return False
@@ -26,7 +22,6 @@ class Router:
 			return True
 		finally:
 			self.busy = False
-
 	def pop(self):
 		if self.busy or not self.stack:
 			return False
@@ -44,7 +39,6 @@ class Router:
 			return True
 		finally:
 			self.busy = False
-
 	def reset(self):
 		if self.current is not None and hasattr(self.host, "before_leave_page"):
 			self.host.before_leave_page(self.current[0])

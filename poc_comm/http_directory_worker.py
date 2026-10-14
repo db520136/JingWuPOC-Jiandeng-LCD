@@ -1,33 +1,22 @@
 # -*- coding: utf-8 -*-
-"""一次性HTTP名单获取线程。"""
-
 import _thread
 import utime
-
 try:
 	import request
 except ImportError:
 	request = None
-
-
 HTTP_REQUEST_TIMEOUT_S = 5
-
-
 def _group_id(value):
 	number = int(value)
 	if number < 0 or number > 0xFFFFFFFF:
 		raise ValueError("组ID超出uint32范围")
 	return number
-
-
 def _first_value(item, keys):
 	for key in keys:
 		value = item.get(key)
 		if value is not None:
 			return value
 	return None
-
-
 def parse_directory_payload(payload, device_id, police_no=None):
 	data = payload.get("data") if isinstance(payload, dict) else None
 	if not isinstance(data, list):
@@ -92,8 +81,6 @@ def parse_directory_payload(payload, device_id, police_no=None):
 	else:
 		poc_enabled = None
 	return groups, [people_by_code[key] for key in people_order], poc_enabled
-
-
 def fetch_directory(url, device_id, police_no=None, timeout_s=HTTP_REQUEST_TIMEOUT_S,
 					request_module=None):
 	http = request if request_module is None else request_module
@@ -106,7 +93,6 @@ def fetch_directory(url, device_id, police_no=None, timeout_s=HTTP_REQUEST_TIMEO
 		if int(response.status_code) != 200:
 			raise RuntimeError("HTTP状态码={}".format(response.status_code))
 		payload = response.json()
-		print("[通信][HTTP诊断] 成员信息完整数据：{}".format(payload))
 		return parse_directory_payload(payload, device_id, police_no)
 	finally:
 		if response is not None:
@@ -114,11 +100,7 @@ def fetch_directory(url, device_id, police_no=None, timeout_s=HTTP_REQUEST_TIMEO
 				response.close()
 			except Exception:
 				pass
-
-
 class HTTPDirectoryWorker:
-	"""每个实例只运行一次，请求结束后线程自然退出。"""
-
 	def __init__(self, url, device_id, callback,
 				 timeout_s=HTTP_REQUEST_TIMEOUT_S, request_module=None):
 		self.url = str(url)
@@ -128,7 +110,6 @@ class HTTPDirectoryWorker:
 		self.request_module = request_module
 		self.thread_id = None
 		self.running = False
-
 	def start(self, request_id, police_no=None):
 		if self.running:
 			return False
@@ -141,7 +122,6 @@ class HTTPDirectoryWorker:
 			self.running = False
 			self.thread_id = None
 			raise
-
 	def _run(self, request_id, police_no):
 		started = utime.ticks_ms()
 		result = None
@@ -165,4 +145,4 @@ class HTTPDirectoryWorker:
 					"elapsed_ms": elapsed,
 				})
 			except Exception as callback_error:
-				print("[通信][HTTP] 结果回传失败：{}".format(callback_error))
+				pass

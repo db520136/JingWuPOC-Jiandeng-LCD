@@ -1,56 +1,22 @@
 # -*- coding: utf-8 -*-
-"""隔离的 TCP/RTP 统一发送 Worker。
-
-这是第三阶段的新发送层，目前不由主入口启动。该线程是新架构中唯一执行
-TCP ``send()`` 和 UDP ``sendto()`` 的位置：
-
-* TCP 控制命令的 payload 必须是已经按协议组好的 ``bytes``；
-* ``CMD_TCP_PRIORITY_RESPONSE`` 的 payload 也是完整 TCP 帧；
-* ``CMD_RTP_ACTIVATE`` 的 payload 是 UDP 目标端口整数，或包含
-  ``server_port`` 的字典；
-* RTP 音频帧由显式注入的 ``read_audio_frame()`` 提供，不进入命令队列。
-
-协议状态机、重试计时和登录/麦权状态仍由上层后续迁移；本文件只负责发送
-边界、P0 实时流和队列调度，不访问 UI，不进行动态属性探测。
-"""
-
 import _thread
 import utime
-
-try:
-	from usr.comm_commands import (CMD_ACCEPT_SINGLE_CALL,
-								   CMD_DISSOLVE_SINGLE_CALL, CMD_FORCE_LOGIN,
-								   CMD_FORCE_RELEASE_FLOOR, CMD_GNSS_UPLOAD,
-								   CMD_JOIN_GROUP, CMD_LEAVE_GROUP,
-								   CMD_LOGIN, CMD_LOGOUT, CMD_PTT_DOWN,
-								   CMD_PTT_UP, CMD_RELEASE_FLOOR,
-								   CMD_REQUEST_FLOOR, CMD_REJECT_SINGLE_CALL,
-								   CMD_RTP_ACTIVATE, CMD_RTP_ACTIVATE_CANCEL,
-								   CMD_RTP_AUDIO_START,
-								   CMD_RTP_AUDIO_STOP, CMD_SINGLE_CALL,
-								   CMD_STATUS_SYNC, CMD_STOP_ALL,
-								   CMD_TCP_HEARTBEAT,
-								   CMD_TCP_PRIORITY_RESPONSE)
-	from usr.communication_queue import CommunicationCommandQueue
-	from usr.rtp_protocol import RTP_PAYLOAD_SIZE, build_rtp_packet
-except ImportError:
-	from comm_commands import (CMD_ACCEPT_SINGLE_CALL,
+from usr.comm_commands import (CMD_ACCEPT_SINGLE_CALL,
 							   CMD_DISSOLVE_SINGLE_CALL, CMD_FORCE_LOGIN,
 							   CMD_FORCE_RELEASE_FLOOR, CMD_GNSS_UPLOAD,
-							   CMD_JOIN_GROUP, CMD_LEAVE_GROUP, CMD_LOGIN,
-							   CMD_LOGOUT, CMD_PTT_DOWN, CMD_PTT_UP,
-							   CMD_RELEASE_FLOOR, CMD_REQUEST_FLOOR,
-								   CMD_REJECT_SINGLE_CALL, CMD_RTP_ACTIVATE,
-								   CMD_RTP_ACTIVATE_CANCEL,
-							   CMD_RTP_AUDIO_START, CMD_RTP_AUDIO_STOP,
-							   CMD_SINGLE_CALL, CMD_STATUS_SYNC, CMD_STOP_ALL,
-							   CMD_TCP_HEARTBEAT, CMD_TCP_PRIORITY_RESPONSE)
-	from communication_queue import CommunicationCommandQueue
-	from rtp_protocol import RTP_PAYLOAD_SIZE, build_rtp_packet
-
-
+							   CMD_JOIN_GROUP, CMD_LEAVE_GROUP,
+							   CMD_LOGIN, CMD_LOGOUT, CMD_PTT_DOWN,
+							   CMD_PTT_UP, CMD_RELEASE_FLOOR,
+							   CMD_REQUEST_FLOOR, CMD_REJECT_SINGLE_CALL,
+							   CMD_RTP_ACTIVATE, CMD_RTP_ACTIVATE_CANCEL,
+							   CMD_RTP_AUDIO_START,
+							   CMD_RTP_AUDIO_STOP, CMD_SINGLE_CALL,
+							   CMD_STATUS_SYNC, CMD_STOP_ALL,
+							   CMD_TCP_HEARTBEAT,
+							   CMD_TCP_PRIORITY_RESPONSE)
+from usr.communication_queue import CommunicationCommandQueue
+from usr.rtp_protocol import RTP_PAYLOAD_SIZE, build_rtp_packet
 RTP_ACTIVATE_PAYLOAD = b"\x00"
-
 TCP_COMMANDS = (
 	CMD_LOGIN, CMD_FORCE_LOGIN, CMD_LOGOUT, CMD_JOIN_GROUP,
 	CMD_LEAVE_GROUP, CMD_SINGLE_CALL, CMD_ACCEPT_SINGLE_CALL,
@@ -58,11 +24,7 @@ TCP_COMMANDS = (
 	CMD_RELEASE_FLOOR, CMD_FORCE_RELEASE_FLOOR, CMD_TCP_HEARTBEAT,
 	CMD_GNSS_UPLOAD, CMD_STATUS_SYNC, CMD_TCP_PRIORITY_RESPONSE,
 )
-
-
 class CommunicationSendWorker:
-	"""统一发送线程；一个实例拥有 TCP/UDP 两个发送 socket。"""
-
 	def __init__(self, tcp_socket=None, udp_socket=None,
 				 read_audio_frame=None, event_callback=None,
 				 command_queue=None, server_ip="", udp_server_port=None,
@@ -94,7 +56,6 @@ class CommunicationSendWorker:
 		self._tcp_attempts = {}
 		self._activate_retries = {}
 		self.logout_pending = False
-
 	def start(self):
 		if self.running:
 			return False
@@ -106,22 +67,18 @@ class CommunicationSendWorker:
 			self.running = False
 			self.thread_id = None
 			raise
-
 	def stop(self):
 		self.running = False
 		self.commands.signal_stop()
-
 	def begin_logout(self):
 		self.logout_pending = True
 		self.audio_active = False
 		self.first_audio_marker = 0
 		self._activate_retries = {}
 		return self.commands.begin_logout()
-
 	def _emit(self, event_type, payload=None):
 		if self.event_callback is not None:
 			self.event_callback({"type": event_type, "payload": payload})
-
 	@staticmethod
 	def _packet_from_payload(payload):
 		if not isinstance(payload, (bytes, bytearray)):
@@ -129,7 +86,6 @@ class CommunicationSendWorker:
 		if len(payload) <= 0:
 			return None
 		return bytes(payload)
-
 	def _send_tcp_packet(self, command_type, packet, attempt):
 		if self.logout_pending and command_type != CMD_LOGOUT:
 			return False
@@ -168,7 +124,6 @@ class CommunicationSendWorker:
 				"error": error,
 			})
 			return False
-
 	def _udp_port_from_payload(self, payload):
 		if isinstance(payload, dict):
 			if "server_port" not in payload:
@@ -185,7 +140,6 @@ class CommunicationSendWorker:
 		if port <= 0 or port > 65535:
 			return None
 		return port
-
 	def _send_udp_rtp(self, payload, marker=0):
 		if self.logout_pending:
 			return False
@@ -206,7 +160,6 @@ class CommunicationSendWorker:
 		self.sequence = (self.sequence + 1) & 0xFFFF
 		self.timestamp = (self.timestamp + len(payload)) & 0xFFFFFFFF
 		return True
-
 	def _send_activate(self, payload):
 		port = self._udp_port_from_payload(payload)
 		if port is None:
@@ -224,21 +177,18 @@ class CommunicationSendWorker:
 			# 远端占麦打洞不能改写本机正在发送音频的目标端口。
 			if isinstance(payload, dict) and payload.get("probe"):
 				self.udp_server_port = previous_port
-
 	@staticmethod
 	def _activate_retry_key(payload, port=None):
 		if isinstance(payload, dict) and payload.get("retry_key") is not None:
 			key = payload.get("retry_key")
 			return tuple(key) if isinstance(key, list) else key
 		return ("udp", int(port)) if port is not None else None
-
 	def _cancel_activate_retry(self, payload):
 		port = self._udp_port_from_payload(payload)
 		key = self._activate_retry_key(payload, port)
 		if key in self._activate_retries:
 			del self._activate_retries[key]
 			self._emit("rtp_activate_retry_cancelled", {"retry_key": key})
-
 	def _start_activate_retry(self, payload):
 		if not isinstance(payload, dict) or not payload.get("probe"):
 			return
@@ -249,7 +199,6 @@ class CommunicationSendWorker:
 		self._activate_retries[key] = {
 			"payload": dict(payload), "port": port, "retry_count": 0,
 			"deadline": utime.ticks_add(utime.ticks_ms(), 500)}
-
 	def _process_activate_retries(self):
 		now = utime.ticks_ms()
 		for key, state in list(self._activate_retries.items()):
@@ -266,7 +215,6 @@ class CommunicationSendWorker:
 				del self._activate_retries[key]
 				self._emit("rtp_activate_timeout", {
 					"retry_key": key, "server_port": state["port"]})
-
 	def _start_audio(self, payload):
 		if payload is not None:
 			port = self._udp_port_from_payload(payload)
@@ -283,7 +231,6 @@ class CommunicationSendWorker:
 		self.audio_failures = 0
 		self._emit("rtp_audio_started", self.udp_server_port)
 		return True
-
 	def _stop_audio(self):
 		if self.audio_active:
 			self._emit("rtp_audio_stopped", {
@@ -292,7 +239,6 @@ class CommunicationSendWorker:
 				"failed_frames": self.audio_failures})
 		self.audio_active = False
 		self.first_audio_marker = 0
-
 	def _send_audio_frame(self):
 		if self.logout_pending:
 			return False
@@ -311,7 +257,6 @@ class CommunicationSendWorker:
 				self._emit("rtp_audio_first_frame_sent", self.udp_server_port)
 			self.first_audio_marker = 0
 		return sent
-
 	def _handle_command(self, item):
 		command_type = item["type"]
 		payload = item["payload"]
@@ -357,16 +302,13 @@ class CommunicationSendWorker:
 				"request_cnt": ((packet[7] << 8) | packet[8]) if len(packet) >= 9 else None,
 				"attempt": attempt,
 				"bytes": len(packet)})
-
 	def _handle_batch(self, items):
-		"""普通批次执行期间允许PTT松键命令插到下一条执行。"""
 		pending = list(items)
 		while pending and self.running:
 			self._handle_command(pending.pop(0))
 			urgent = self.commands.take_urgent_batch()
 			if urgent:
 				pending = urgent + pending
-
 	def _run(self):
 		try:
 			while self.running:
@@ -386,7 +328,6 @@ class CommunicationSendWorker:
 							break
 						self._handle_batch(items)
 					continue
-
 				# 音频发送是 P0 实时流；单个音频帧不经过普通命令队列。
 				if not self._send_audio_frame():
 					utime.sleep_ms(1)

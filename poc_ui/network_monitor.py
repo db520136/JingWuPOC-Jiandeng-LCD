@@ -1,33 +1,25 @@
 # -*- coding: utf-8 -*-
-
 import utime
-
 try:
 	import _thread
 except Exception:
 	_thread = None
-
 try:
 	import sim
 except Exception:
 	sim = None
-
 try:
 	import net
 except Exception:
 	net = None
-
 try:
 	import dataCall
 except Exception:
 	dataCall = None
-
 try:
 	import checkNet
 except Exception:
 	checkNet = None
-
-
 SIGNAL_REFRESH_INTERVAL_MS = 30000
 NETWORK_DIRECT_STATUS = True
 SIGNAL_VERY_WEAK = "极弱"
@@ -35,8 +27,6 @@ SIGNAL_WEAK = "弱"
 SIGNAL_GENERAL = "一般"
 SIGNAL_STRONG = "强"
 SIGNAL_VERY_GOOD = "极好"
-
-
 def classify_signal(signal):
 	try:
 		value = int(signal)
@@ -51,24 +41,17 @@ def classify_signal(signal):
 	if value <= -85:
 		return SIGNAL_STRONG
 	return SIGNAL_VERY_GOOD
-
-
 def _ticks_add(base_ms, delta_ms):
 	try:
 		return utime.ticks_add(base_ms, delta_ms)
 	except Exception:
 		return base_ms + delta_ms
-
-
 def _ticks_diff(later_ms, earlier_ms):
 	try:
 		return utime.ticks_diff(later_ms, earlier_ms)
 	except Exception:
 		return later_ms - earlier_ms
-
-
 class NetworkMonitor:
-
 	def __init__(self, signal_interval_ms=SIGNAL_REFRESH_INTERVAL_MS):
 		self.signal_interval_ms = max(1000, int(signal_interval_ms))
 		self.iccid = None
@@ -88,18 +71,14 @@ class NetworkMonitor:
 				self._lock = _thread.allocate_lock()
 			except Exception:
 				self._lock = None
-
 	def _lock_acquire(self):
 		if self._lock is not None:
 			self._lock.acquire()
-
 	def _lock_release(self):
 		if self._lock is not None:
 			self._lock.release()
-
 	def _bump_revision(self):
 		self._revision += 1
-
 	def _read_iccid(self):
 		if sim is None:
 			return None
@@ -115,7 +94,6 @@ class NetworkMonitor:
 			return value
 		except Exception:
 			return None
-
 	def _read_signal(self):
 		if net is None:
 			return None
@@ -133,7 +111,6 @@ class NetworkMonitor:
 			return value
 		except Exception:
 			return None
-
 	def _read_network_status(self):
 		stage = None
 		state = None
@@ -190,7 +167,6 @@ class NetworkMonitor:
 			error = exc
 			self.last_error = exc
 		return connected, stage, state, error
-
 	def refresh_once(self, now_ms=None, force_signal=True):
 		if now_ms is None:
 			now_ms = utime.ticks_ms()
@@ -226,7 +202,6 @@ class NetworkMonitor:
 		finally:
 			self._lock_release()
 		return snapshot
-
 	def _snapshot_locked(self):
 		return {
 			"iccid": self.iccid,
@@ -236,7 +211,6 @@ class NetworkMonitor:
 			"network_stage": self.network_stage,
 			"network_state": self.network_state,
 		}
-
 	def get_snapshot_if_changed(self):
 		if self._revision == self._reported_revision:
 			return None
@@ -249,7 +223,6 @@ class NetworkMonitor:
 			return snapshot
 		finally:
 			self._lock_release()
-
 	def get_snapshot(self):
 		self._lock_acquire()
 		try:

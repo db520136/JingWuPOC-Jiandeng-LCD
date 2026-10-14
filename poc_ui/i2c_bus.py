@@ -1,17 +1,11 @@
 # -*- coding: utf-8 -*-
-
 import _thread
-
 from machine import I2C
-
-
 class SharedI2CBus:
-
 	def __init__(self, i2c=None):
 		self._i2c = i2c if i2c is not None else I2C(
 			I2C.I2C0, I2C.STANDARD_MODE)
 		self._lock = _thread.allocate_lock()
-
 	def write(self, slave_address, register_buffer, register_length,
 			  data_buffer, data_length):
 		self._lock.acquire()
@@ -25,7 +19,6 @@ class SharedI2CBus:
 			)
 		finally:
 			self._lock.release()
-
 	def read(self, slave_address, register_buffer, register_length,
 			 data_buffer, data_length, delay):
 		self._lock.acquire()
@@ -40,12 +33,8 @@ class SharedI2CBus:
 			)
 		finally:
 			self._lock.release()
-
-
 _default_bus = None
 _default_bus_lock = _thread.allocate_lock()
-
-
 def get_i2c0():
 	global _default_bus
 	_default_bus_lock.acquire()

@@ -1,40 +1,20 @@
 # -*- coding: utf-8 -*-
-"""EC800M 音频硬件端口。
-
-本文件是新通信架构唯一直接操作音频硬件和 GPIO27 喇叭使能脚的模块：
-
-* 麦克风：G.711 A-law 采集，整理为每包 160 字节；
-* 远端语音：接收 160 字节 G.711 A-law 帧并写入 PCM；
-* 按键提示音：使用同一 PCM/G.711 输出链路；
-* GPIO27：初始化低电平保持1ms；开启使用硬件要求的脉冲序列，关闭拉低。
-
-PTT GPIO29 不在这里处理，由 ``communication_session.py`` 负责。文件只使用
-已确认的 QuecPython 固件接口，不进行动态属性探测。
-"""
-
 import _thread
 import utime
-
 try:
 	from machine import Pin
 except ImportError:
 	Pin = None
-
 try:
 	import audio
 except ImportError:
 	audio = None
-
 try:
 	import G711
 except ImportError:
 	G711 = None
-
-
 SPEAKER_ENABLE_GPIO = 27
 PCM_SAMPLE_RATE = 8000
-# 与旧版 POC_Old/main.py 的 PCM 配置保持一致：底层使用 4 个周期缓冲。
-# 这样新旧架构在 EC800M 上使用相同的采集/播放缓冲深度，便于实机对比。
 PCM_PERIOD_COUNT = 4
 PCM_FRAME_SIZE = 160
 KEY_BEEP_G711_DATA = bytes((0xD5, 0xD5, 0x2A, 0x2A)) * 40
@@ -42,10 +22,7 @@ KEY_BEEP_HOLD_MS = 30
 KEY_BEEP_FRAME_COUNT = 8
 FORCED_LOGOUT_TTS_TEXT = "账号强制下线"
 FORCED_LOGOUT_TTS_WAIT_MS = 3500
-
-
 def play_forced_logout_tts(volume):
-	"""PCM已关闭后独占音频输出；返回前关闭TTS和功放。"""
 	if Pin is None or audio is None:
 		raise RuntimeError("machine.Pin或audio模块不可用")
 	pin = Pin(Pin.GPIO27, Pin.OUT, Pin.PULL_DISABLE, 0)
@@ -69,11 +46,7 @@ def play_forced_logout_tts(volume):
 		pin.write(0)
 		if tts is not None:
 			tts.close()
-
-
 class AudioPort:
-	"""统一管理麦克风采集、远端播放和 GPIO27。"""
-
 	def __init__(self, speaker_gpio=SPEAKER_ENABLE_GPIO,
 				 pcm_periodcnt=PCM_PERIOD_COUNT, volume=11):
 		self.speaker_gpio = int(speaker_gpio)
@@ -89,7 +62,6 @@ class AudioPort:
 		self.capture_cache = bytearray()
 		self._playback_error_logged = False
 		self._lock = _thread.allocate_lock()
-
 	def start(self):
 		if self.running:
 			return True
@@ -113,7 +85,6 @@ class AudioPort:
 		self.playback_active = False
 		self.running = True
 		return True
-
 	def set_volume(self, volume):
 		value = max(0, min(11, int(volume)))
 		self._lock.acquire()
@@ -124,7 +95,6 @@ class AudioPort:
 			return value
 		finally:
 			self._lock.release()
-
 	def speaker_on(self):
 		if self.speaker_pin is None or self.speaker_enabled:
 			return
@@ -136,13 +106,11 @@ class AudioPort:
 		self.speaker_pin.write(0)
 		self.speaker_pin.write(1)
 		self.speaker_enabled = True
-
 	def speaker_off(self):
 		if self.speaker_pin is None:
 			return
 		self.speaker_pin.write(0)
 		self.speaker_enabled = False
-
 	def start_playback(self):
 		self._lock.acquire()
 		try:
@@ -154,7 +122,6 @@ class AudioPort:
 			return True
 		finally:
 			self._lock.release()
-
 	def write_playback_frame(self, frame, require_active=False):
 		if frame is None or len(frame) != PCM_FRAME_SIZE:
 			return False
@@ -176,7 +143,6 @@ class AudioPort:
 			return False
 		finally:
 			self._lock.release()
-
 	def stop_playback(self):
 		self._lock.acquire()
 		try:
@@ -185,9 +151,7 @@ class AudioPort:
 			self.speaker_off()
 		finally:
 			self._lock.release()
-
 	def play_key_beep(self):
-		"""播放一次按键提示音；远端语音播放期间不抢占喇叭。"""
 		self._lock.acquire()
 		try:
 			if (not self.running or self.g711 is None or
@@ -209,9 +173,7 @@ class AudioPort:
 		finally:
 			self._lock.release()
 		return True
-
 	def read_capture_frame(self):
-		"""读取并整理一帧 160 字节 G.711 A-law 数据。"""
 		self._lock.acquire()
 		try:
 			if not self.running or self.g711 is None:
@@ -230,7 +192,6 @@ class AudioPort:
 			return None
 		finally:
 			self._lock.release()
-
 	def close(self):
 		self._lock.acquire()
 		try:

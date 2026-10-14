@@ -1,23 +1,11 @@
 # -*- coding: utf-8 -*-
-"""UI 可读取的业务状态快照。
-
-业务线程通过显式的 update_* 方法写入状态，UI 主线程只读取快照；本模块
-不依赖 LVGL，也不访问任何硬件。状态写入使用一把短临界区锁，快照读取
-返回独立字典，避免 UI 持有业务线程内部对象。
-"""
-
 import _thread
-
-
 class UIStateStore:
-	"""线程安全的 UI 状态存储，采用版本号通知变化。"""
-
 	def __init__(self, initial_settings=None):
 		self._lock = _thread.allocate_lock()
 		self._revision = 0
 		self._reported_revision = -1
 		self._state = {
-			# 网络和 SIM
 			"network_connected": False,
 			# 传输层连接状态：与POC登录/运行态分开，供状态栏判断。
 			"network_ready": False,
@@ -34,12 +22,10 @@ class UIStateStore:
 			"connection_duration_ms": None,
 			"connection_events": (),
 			"guest_relogin_prompt_revision": 0,
-			# 电池
 			"battery_percent": None,
 			"battery_voltage_mv": None,
 			"battery_charging": None,
 			"battery_full_confirmed": False,
-			# GNSS
 			"gnss_state": None,
 			"gnss_fix": False,
 			"latitude": None,
@@ -51,7 +37,6 @@ class UIStateStore:
 			"satellites": None,
 			"location_time": None,
 			"location_weekday": None,
-			# POC/TCP 会话
 			"tcp_connected": False,
 			"login_state": "idle",
 			"login_result": None,
@@ -78,20 +63,17 @@ class UIStateStore:
 			"single_error": None,
 			# None表示HTTP尚未确认本机权限；True/False对应ON/OFF。
 			"poc_enabled": None,
-			# RTP 和按键
 			"audio_tx_active": False,
 			"audio_rx_active": False,
 			"audio_volume": 11,
 			"volume_key_event_revision": 0,
 			"volume_key_event_value": 11,
-			# 本机显示与交互设置
 			"screen_brightness": 100,
 			"screen_sleeping": False,
 			"sleep_timeout_seconds": 30,
 			# 已进入游客或正常业务页面；网络/TCP状态不得改变该资格。
 			"business_page_active": False,
 			"fall_detection_enabled": False,
-			# 肩灯和运动
 			"lamp_mode": "off",
 			"lamp_brightness": 42,
 			"lamp_alarm_active": False,
@@ -100,10 +82,8 @@ class UIStateStore:
 			"key_notice_text": None,
 			"key_notice_success": True,
 			"key_notice_duration_ms": None,
-			# 对讲名单由业务层归一化后整体替换，页面不解析原始接口数据。
 			"group_items": (),
 			"person_items": (),
-			# 设备与升级信息
 			"software_version": "--",
 			"hardware_version": "--",
 			"firmware_version": "--",
@@ -118,11 +98,9 @@ class UIStateStore:
 			"ota_event_kind": None,
 			"ota_event_text": None,
 			"ota_event_duration_ms": None,
-			# 当前纯 UI 基线使用的身份快照；后续由真实接口更新。
 			"identity_mode": "normal",
 			"police_name": "--",
 			"police_no": "M100001",
-			# 统一错误字段，供 UI 显示最近一次可见错误
 			"last_error_domain": None,
 			"last_error_text": None,
 		}
@@ -134,10 +112,8 @@ class UIStateStore:
 			if isinstance(initial_settings.get("double_click_enabled"), bool):
 				self._state["double_click_enabled"] = initial_settings[
 					"double_click_enabled"]
-
 	def _changed(self):
 		self._revision += 1
-
 	def _update(self, values):
 		self._lock.acquire()
 		try:
@@ -151,7 +127,6 @@ class UIStateStore:
 			return changed
 		finally:
 			self._lock.release()
-
 	def update_network(self, connected, stage, state, iccid,
 					   signal_dbm, signal_level):
 		return self._update({
@@ -162,19 +137,15 @@ class UIStateStore:
 			"signal_dbm": signal_dbm,
 			"signal_level": signal_level,
 		})
-
 	def update_transport(self, network_ready=None, tcp_connected=None):
-		"""更新网络/TCP传输层状态，不改变登录和POC会话状态。"""
 		values = {}
 		if network_ready is not None:
 			values["network_ready"] = bool(network_ready)
 		if tcp_connected is not None:
 			values["tcp_socket_connected"] = bool(tcp_connected)
 		return self._update(values) if values else False
-
 	def publish_connection_event(self, stage, status, text, duration_ms=None,
 								 user_visible=False):
-		"""发布蜂窝网络或POC TCP连接阶段事件，供UI限时提示。"""
 		self._lock.acquire()
 		try:
 			self._state["connection_event_revision"] += 1
@@ -194,7 +165,6 @@ class UIStateStore:
 			return revision
 		finally:
 			self._lock.release()
-
 	def publish_guest_relogin_prompt(self):
 		self._lock.acquire()
 		try:
@@ -203,9 +173,7 @@ class UIStateStore:
 			return self._state["guest_relogin_prompt_revision"]
 		finally:
 			self._lock.release()
-
 	def publish_forced_logout(self):
-		"""服务器强退且本机会话已清理完成；每次只通知UI一次。"""
 		self._lock.acquire()
 		try:
 			self._state["forced_logout_revision"] += 1
@@ -213,11 +181,9 @@ class UIStateStore:
 			return self._state["forced_logout_revision"]
 		finally:
 			self._lock.release()
-
 	def clear_guest_relogin_prompt(self):
 		# 修订号保持单调，UI只需记录已消费的修订号即可。
 		return False
-
 	def update_battery(self, percent, voltage_mv, charging,
 					full_confirmed=False):
 		return self._update({
@@ -226,7 +192,6 @@ class UIStateStore:
 			"battery_charging": charging,
 			"battery_full_confirmed": bool(full_confirmed),
 		})
-
 	def update_location(self, location_name, latitude, longitude, altitude,
 						satellites, location_time, location_weekday):
 		return self._update({
@@ -238,21 +203,17 @@ class UIStateStore:
 			"location_time": location_time,
 			"location_weekday": location_weekday,
 		})
-
 	def update_identity(self, police_name, police_no):
 		return self._update({
 			"police_name": police_name,
 			"police_no": police_no,
 		})
-
 	def update_identity_mode(self, mode):
 		value = "guest" if str(mode) == "guest" else "normal"
 		return self._update({"identity_mode": value})
-
 	def update_poc_access(self, enabled):
 		value = None if enabled is None else bool(enabled)
 		return self._update({"poc_enabled": value})
-
 	def update_poc(self, tcp_connected, login_state, login_error,
 				   confirmed_group_id, floor_state, floor_group_id,
 				   single_state, single_peer):
@@ -266,10 +227,8 @@ class UIStateStore:
 			"single_state": single_state,
 			"single_peer": single_peer,
 		})
-
 	def update_login_transaction(self, login_state, result=None, error=None,
 							 force_stage="idle", transaction_id=None):
-		"""保存协议原始结果和强制登录阶段，供登录页精确显示。"""
 		values = {
 			"login_state": str(login_state),
 			"login_result": result,
@@ -279,15 +238,12 @@ class UIStateStore:
 		if transaction_id is not None:
 			values["login_transaction_id"] = int(transaction_id)
 		return self._update(values)
-
 	def begin_logout(self):
 		return self._update({
 			"logout_active": True,
 			"logout_result": None,
 		})
-
 	def finish_logout(self, result):
-		"""发布一次退出完成事件；成功或失败都结束UI等待。"""
 		self._lock.acquire()
 		try:
 			self._state["logout_active"] = False
@@ -297,10 +253,8 @@ class UIStateStore:
 			return self._state["logout_event_revision"]
 		finally:
 			self._lock.release()
-
 	def publish_floor_event(self, event_type, direction, call_type, group_id,
 							speaker_name=None, audio_selected=False):
-		"""发布一次不可混淆的麦权事件；序号由本机单调递增。"""
 		self._lock.acquire()
 		try:
 			revision = int(self._state["floor_event_revision"]) + 1
@@ -315,16 +269,13 @@ class UIStateStore:
 			return revision
 		finally:
 			self._lock.release()
-
 	def update_audio(self, tx_active, rx_active, volume):
 		return self._update({
 			"audio_tx_active": bool(tx_active),
 			"audio_rx_active": bool(rx_active),
 			"audio_volume": int(volume),
 		})
-
 	def publish_volume_key_event(self, volume):
-		"""发布实体音量键事件；音量到边界时仍需刷新UI显示时间。"""
 		self._lock.acquire()
 		try:
 			self._state["volume_key_event_revision"] += 1
@@ -333,19 +284,16 @@ class UIStateStore:
 			return self._state["volume_key_event_revision"]
 		finally:
 			self._lock.release()
-
 	def update_lamp(self, mode, brightness, alarm_active):
 		return self._update({
 			"lamp_mode": mode,
 			"lamp_brightness": int(brightness),
 			"lamp_alarm_active": bool(alarm_active),
 		})
-
 	def update_motion(self, double_click_enabled):
 		return self._update({
 			"double_click_enabled": bool(double_click_enabled),
 		})
-
 	def publish_key_notice(self, text, success=True, duration_ms=2000):
 		self._lock.acquire()
 		try:
@@ -357,15 +305,12 @@ class UIStateStore:
 			return self._state["key_notice_revision"]
 		finally:
 			self._lock.release()
-
 	def update_screen_brightness(self, percent):
 		return self._update({
 			"screen_brightness": int(percent),
 		})
-
 	def update_screen_sleeping(self, sleeping):
 		return self._update({"screen_sleeping": bool(sleeping)})
-
 	def update_gnss_location(self, state, fix, latitude, longitude, altitude,
 							 satellites, location_time, location_weekday,
 							 latitude_text=None, longitude_text=None):
@@ -375,48 +320,39 @@ class UIStateStore:
 			"location_weekday": location_weekday,
 			"latitude_text": latitude_text,
 			"longitude_text": longitude_text})
-
 	def update_sleep_timeout(self, seconds):
 		return self._update({
 			"sleep_timeout_seconds": seconds,
 		})
-
 	def update_business_page_active(self, active):
 		return self._update({
 			"business_page_active": bool(active),
 		})
-
 	def update_fall_detection(self, enabled):
 		return self._update({
 			"fall_detection_enabled": bool(enabled),
 		})
-
 	def update_intercom_directory(self, groups, people):
 		return self._update({
 			"group_items": tuple(groups),
 			"person_items": tuple(people),
 		})
-
 	def update_group_selection(self, group_id):
 		return self._update({
 			"confirmed_group_id": group_id,
 		})
-
 	def update_single_selection(self, person_key):
 		return self._update({
 			"single_peer": person_key,
 		})
-
 	def update_single_call(self, single_state, single_peer,
 						   single_group_id=None, error=None):
-		"""更新单呼会话状态，不改动登录、组呼和音频状态。"""
 		return self._update({
 			"single_state": str(single_state),
 			"single_peer": single_peer,
 			"single_group_id": single_group_id,
 			"single_error": error,
 		})
-
 	def update_device_versions(self, software, hardware, firmware,
 							 device_id=None):
 		values = {
@@ -427,11 +363,9 @@ class UIStateStore:
 		if device_id is not None:
 			values["device_id"] = str(device_id)
 		return self._update(values)
-
 	def update_upgrade_status(self, status, tone="normal"):
 		return self._update({"upgrade_status": str(status),
 			"upgrade_status_tone": str(tone)})
-
 	def update_ota_runtime(self, busy=None, thread_active=None,
 						 query_active=None, phase=None):
 		values = {}
@@ -444,7 +378,6 @@ class UIStateStore:
 		if phase is not None:
 			values["ota_phase"] = str(phase)
 		return self._update(values) if values else False
-
 	def publish_ota_event(self, kind, text=None, duration_ms=None):
 		self._lock.acquire()
 		try:
@@ -456,20 +389,17 @@ class UIStateStore:
 			return self._state["ota_event_revision"]
 		finally:
 			self._lock.release()
-
 	def set_error(self, domain, text):
 		return self._update({
 			"last_error_domain": domain,
 			"last_error_text": text,
 		})
-
 	def get_snapshot(self):
 		self._lock.acquire()
 		try:
 			return self._revision, self._state.copy()
 		finally:
 			self._lock.release()
-
 	def get_snapshot_if_changed(self):
 		self._lock.acquire()
 		try:
@@ -479,14 +409,9 @@ class UIStateStore:
 			return self._revision, self._state.copy()
 		finally:
 			self._lock.release()
-
-
 _default_store = None
 _default_store_lock = _thread.allocate_lock()
-
-
 def get_default_state_store():
-	"""返回进程内唯一状态存储实例。"""
 	global _default_store
 	_default_store_lock.acquire()
 	try:

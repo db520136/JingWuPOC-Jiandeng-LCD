@@ -1,11 +1,7 @@
 # -*- coding: utf-8 -*-
-
 import utime
-
 import lvgl as lv
 from machine import I2C
-
-
 I2C_BUS = I2C.I2C1
 I2C_MODE = I2C.FAST_MODE
 CST816D_ADDRESS = 0x15
@@ -15,10 +11,7 @@ LOGICAL_HEIGHT = 240
 REG_FINGER_NUM = 0x02
 TOUCH_SCROLL_THROW = 25
 TOUCH_SCROLL_LIMIT = 10
-
-
 class TouchPort:
-
 	def __init__(self, address=CST816D_ADDRESS, sample_ms=5):
 		self.address = int(address)
 		self.sample_ms = max(5, int(sample_ms))
@@ -30,7 +23,6 @@ class TouchPort:
 		self.started = False
 		self._indev_driver = None
 		self.indev = None
-
 	def configure_scroll(self, throw_value=TOUCH_SCROLL_THROW,
 						 limit_value=TOUCH_SCROLL_LIMIT):
 		throw_value = max(0, min(255, int(throw_value)))
@@ -62,7 +54,6 @@ class TouchPort:
 			except Exception:
 				pass
 		return throw_ok, limit_ok
-
 	def _read_regs(self, register, length):
 		data = bytearray(length)
 		result = self.i2c.read(
@@ -70,13 +61,11 @@ class TouchPort:
 		if result not in (None, 0):
 			raise OSError("CST816D I2C read failed: {}".format(result))
 		return data
-
 	@staticmethod
 	def _rotate(x, y):
 		# 触摸面板 portrait -> LCD landscape，整个系统只转换一次。
 		return max(0, min(LOGICAL_WIDTH - 1, RAW_HEIGHT - 1 - int(y))), \
 			max(0, min(LOGICAL_HEIGHT - 1, int(x)))
-
 	def poll(self, force=False):
 		if not self.started or not self.enabled:
 			self.pressed = False
@@ -101,17 +90,14 @@ class TouchPort:
 		except Exception:
 			self.pressed = False
 			return False
-
 	def _read_cb(self, indev_drv, data):
 		data.point.x = int(self.point[0])
 		data.point.y = int(self.point[1])
 		data.state = 1 if (self.enabled and self.pressed) else 0
-
 	def set_enabled(self, enabled):
 		self.enabled = bool(enabled)
 		if not self.enabled:
 			self.pressed = False
-
 	def start(self):
 		self.started = True
 		self.enabled = True
@@ -121,7 +107,6 @@ class TouchPort:
 		self._indev_driver.read_cb = self._read_cb
 		self.indev = self._indev_driver.register()
 		return self
-
 	def stop(self):
 		self.started = False
 		self.enabled = False

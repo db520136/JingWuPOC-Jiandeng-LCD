@@ -1,38 +1,28 @@
 # -*- coding: utf-8 -*-
-
 import _thread
-
 try:
 	import utime
 except ImportError:
 	import time as _time
-
 	class _TimeCompat:
 		@staticmethod
 		def ticks_ms():
 			return int(_time.monotonic() * 1000)
-
 		@staticmethod
 		def ticks_add(value, delta):
 			return int(value) + int(delta)
-
 		@staticmethod
 		def ticks_diff(first, second):
 			return int(first) - int(second)
-
 	utime = _TimeCompat()
-
 try:
 	import ujson as json
 except ImportError:
 	import json
-
 try:
 	import uos as os
 except ImportError:
 	import os
-
-
 CONFIG_PATH = "/ext/poc_config.json"
 SETTING_SAVE_IDLE_MS = 60000
 DEFERRED_SETTING_KEYS = (
@@ -55,14 +45,10 @@ DEFAULT_CONFIG = {
 	"ota_pending": None,
 	"ota_completed_tasks": [],
 }
-
-
 def _valid_police_no(value):
 	value = str(value or "")
 	return (len(value) == 7 and value[0] in ("M", "F") and
 		value[1:].isdigit())
-
-
 def _validated(values):
 	result = DEFAULT_CONFIG.copy()
 	if not isinstance(values, dict):
@@ -127,10 +113,7 @@ def _validated(values):
 					"status": str(item.get("status") or "unknown")})
 		result["ota_completed_tasks"] = items
 	return result
-
-
 class PersistentConfig:
-
 	def __init__(self, path=CONFIG_PATH):
 		self.path = str(path)
 		self.temp_path = self.path + ".tmp"
@@ -139,46 +122,37 @@ class PersistentConfig:
 		self._values = self._load()
 		self._pending_settings = {}
 		self._settings_save_due_ms = None
-
 	def _read_file(self, path):
 		with open(path, "r") as source:
 			return _validated(json.loads(source.read()))
-
 	def _load(self):
 		try:
 			values = self._read_file(self.path)
-			print("[配置] 已从外置Flash加载配置")
 			return values
 		except Exception:
 			try:
 				values = self._read_file(self.backup_path)
-				print("[配置] 主配置不可用，已从备份恢复")
 				return values
 			except Exception:
-				print("[配置] 未找到有效配置，使用首次开机默认值")
 				return DEFAULT_CONFIG.copy()
-
 	def snapshot(self):
 		self._lock.acquire()
 		try:
 			return self._values.copy()
 		finally:
 			self._lock.release()
-
 	def get(self, key, default=None):
 		self._lock.acquire()
 		try:
 			return self._values.get(key, default)
 		finally:
 			self._lock.release()
-
 	@staticmethod
 	def _remove(path):
 		try:
 			os.remove(path)
 		except Exception:
 			pass
-
 	def _write_locked(self, values):
 		self._remove(self.temp_path)
 		with open(self.temp_path, "w") as output:
@@ -199,7 +173,6 @@ class PersistentConfig:
 				pass
 			raise
 		self._remove(self.backup_path)
-
 	def update(self, **changes):
 		self._lock.acquire()
 		try:
@@ -212,13 +185,10 @@ class PersistentConfig:
 			self._values = candidate
 			return True
 		except Exception as error:
-			print("[配置] 保存失败：{}".format(error))
 			return False
 		finally:
 			self._lock.release()
-
 	def defer_settings_update(self, **changes):
-		"""设置立即生效，最后一次变动满一分钟后再合并写入Flash。"""
 		self._lock.acquire()
 		try:
 			accepted = {}
@@ -245,9 +215,7 @@ class PersistentConfig:
 			return True
 		finally:
 			self._lock.release()
-
 	def flush_deferred_settings(self, now_ms=None):
-		"""由现有低优先级Worker周期调用；未到期时不访问Flash。"""
 		self._lock.acquire()
 		try:
 			if not self._pending_settings or self._settings_save_due_ms is None:
@@ -265,37 +233,29 @@ class PersistentConfig:
 				self._values = candidate
 			self._pending_settings = {}
 			self._settings_save_due_ms = None
-			print("[配置] 设置连续60秒无变动，已持久化：{}".format(
-				",".join(changed_keys)))
 			return True
 		except Exception as error:
 			self._settings_save_due_ms = utime.ticks_add(
 				utime.ticks_ms(), SETTING_SAVE_IDLE_MS)
-			print("[配置] 延迟保存失败，60秒后重试：{}".format(error))
 			return False
 		finally:
 			self._lock.release()
-
 	def next_ota_request_id(self):
 		current = int(self.get("ota_request_id", 0))
 		value = 1 if current >= 65535 else current + 1
 		if not self.update(ota_request_id=value):
 			raise RuntimeError("OTA request_id保存失败")
 		return value
-
 	def save_ota_pending(self, metadata):
 		return self.update(ota_pending=dict(metadata))
-
 	def clear_ota_pending(self):
 		return self.update(ota_pending=None)
-
 	def complete_ota_task(self, task_id, status):
 		items = list(self.get("ota_completed_tasks", []))
 		items = [item for item in items
 			if str(item.get("task_id")) != str(task_id)]
 		items.append({"task_id": str(task_id), "status": str(status)})
 		return self.update(ota_completed_tasks=items[-8:])
-
 	def completed_ota_status(self, task_id):
 		for item in self.get("ota_completed_tasks", []):
 			if str(item.get("task_id")) == str(task_id):

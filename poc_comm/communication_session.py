@@ -1,61 +1,19 @@
 # -*- coding: utf-8 -*-
-"""PTT GPIO29 和 POC 麦权会话状态机。
-
-本模块不直接访问 Socket；所有 TCP/RTP 发送都通过注入的 ``submit_command``
-进入 CommunicationRuntime 的有界队列。正式入口由现有低优先级硬件Worker
-采集GPIO29，并通过最新状态槽唤醒通信业务循环；协议组包、状态改变和命令
-投递仍全部在统一通信线程上下文完成。
-
-正式 UI 入口由 CommunicationController 的唯一业务线程调用 ``poll_once``，
-因此不会额外创建 PTT 线程；独立阶段测试仍可使用默认的内部GPIO模式。
-"""
-
 import _thread
 import utime
-
 try:
 	from machine import ExtInt, Pin
 except ImportError:
 	ExtInt = None
 	Pin = None
-
-try:
-	from usr.comm_commands import (CMD_RELEASE_FLOOR, CMD_RTP_ACTIVATE,
-								   CMD_RTP_ACTIVATE_CANCEL,
-								   CMD_RTP_AUDIO_START, CMD_RTP_AUDIO_STOP,
-								   CMD_REQUEST_FLOOR,
-								   CMD_TCP_PRIORITY_RESPONSE,
-								   TCP_INITIAL_WAIT_MS, TCP_MAX_RETRIES,
-								   TCP_MAX_WAIT_MS, TCP_RETRY_STEP_MS)
-	from usr.poc_protocol import (MSG_DISSOLVE_SINGLE, MSG_FLOOR_IDLE,
-								  MSG_FLOOR_IDLE_ACK, MSG_FLOOR_OCCUPIED,
-								  MSG_FLOOR_OCCUPIED_ACK,
-								  MSG_FORCE_RELEASE_FLOOR,
-								  MSG_FORCE_RELEASE_FLOOR_ACK,
-								  MSG_LOGOUT, MSG_LOGOUT_ACK,
-								  MSG_RELEASE_FLOOR,
-								  MSG_RELEASE_FLOOR_ACK, MSG_REQUEST_FLOOR,
-								  MSG_REQUEST_FLOOR_ACK, MSG_SINGLE_INVITED,
-								  build_device_payload,
-								  build_logout_ack_payload,
-								  build_floor_idle_ack_payload,
-								  build_floor_payload,
-								  build_frame, parse_floor_idle,
-								  parse_floor_occupied,
-								  parse_dissolve_single,
-								  parse_logout_payload,
-								  parse_release_floor_ack,
-								  parse_request_floor_ack,
-								  parse_single_invited)
-except ImportError:
-	from comm_commands import (CMD_RELEASE_FLOOR, CMD_RTP_ACTIVATE,
+from usr.comm_commands import (CMD_RELEASE_FLOOR, CMD_RTP_ACTIVATE,
 							   CMD_RTP_ACTIVATE_CANCEL,
 							   CMD_RTP_AUDIO_START, CMD_RTP_AUDIO_STOP,
 							   CMD_REQUEST_FLOOR,
 							   CMD_TCP_PRIORITY_RESPONSE,
 							   TCP_INITIAL_WAIT_MS, TCP_MAX_RETRIES,
 							   TCP_MAX_WAIT_MS, TCP_RETRY_STEP_MS)
-	from poc_protocol import (MSG_DISSOLVE_SINGLE, MSG_FLOOR_IDLE,
+from usr.poc_protocol import (MSG_DISSOLVE_SINGLE, MSG_FLOOR_IDLE,
 							  MSG_FLOOR_IDLE_ACK, MSG_FLOOR_OCCUPIED,
 							  MSG_FLOOR_OCCUPIED_ACK,
 							  MSG_FORCE_RELEASE_FLOOR,
@@ -75,22 +33,15 @@ except ImportError:
 							  parse_release_floor_ack,
 							  parse_request_floor_ack,
 							  parse_single_invited)
-
-
 PTT_GPIO = 29
 PTT_ACTIVE_LEVEL = 0
 PTT_DEBOUNCE_MS = 30
-
 STATE_IDLE = "idle"
 STATE_REQUESTING_FLOOR = "requesting_floor"
 STATE_TRANSMITTING = "transmitting"
 STATE_RELEASING_FLOOR = "releasing_floor"
 STATE_DISCONNECTED = "disconnected"
-
-
 class CommunicationSession:
-	"""单实例 PTT/麦权会话；空闲时线程永久阻塞在信号量上。"""
-
 	def __init__(self, submit_command, device_id, police_no,
 				 audio_port=None, ptt_gpio=PTT_GPIO,
 				 event_callback=None, manage_ptt_gpio=True):
@@ -140,9 +91,7 @@ class CommunicationSession:
 		self.control_busy = False
 		self.logout_pending = False
 		self.intercom_enabled = True
-
 	def set_intercom_enabled(self, enabled):
-		"""只门控新的对讲动作；已有会话由控制器按协议退出。"""
 		self.intercom_enabled = bool(enabled)
 		if not self.intercom_enabled:
 			self._lock.acquire()
@@ -150,9 +99,7 @@ class CommunicationSession:
 				self._external_ptt_pending = None
 			finally:
 				self._lock.release()
-
 	def begin_logout(self):
-		"""立即隔离旧会话的PTT、TCP对讲控制和RTP音频。"""
 		self.logout_pending = True
 		self.control_busy = True
 		self.intercom_enabled = False
@@ -181,7 +128,6 @@ class CommunicationSession:
 		finally:
 			self._lock.release()
 		return True
-
 	@staticmethod
 	def _new_event_sem():
 		sem = _thread.allocate_semphore(1)
@@ -196,11 +142,9 @@ class CommunicationSession:
 			except Exception:
 				pass
 		return sem
-
 	def _emit(self, event_type, payload=None):
 		if self.event_callback is not None:
 			self.event_callback({"type": event_type, "payload": payload})
-
 	def _signal(self):
 		self._lock.acquire()
 		try:
@@ -220,13 +164,11 @@ class CommunicationSession:
 				self._wake_pending = False
 			finally:
 				self._lock.release()
-
 	def _on_ptt_irq(self, *args):
 		# ISR 只记录一次 GPIO 状态可能已变化的事实并唤醒 worker；
 		# 不在 ISR 中读取 GPIO 或执行协议业务。
 		self._ptt_irq_pending = True
 		self._signal()
-
 	def _queue_event(self, event):
 		self._lock.acquire()
 		try:
@@ -235,15 +177,12 @@ class CommunicationSession:
 		finally:
 			self._lock.release()
 		self._signal()
-
 	def on_runtime_event(self, event):
-		"""由 CommunicationRuntime 回调投递 TCP/RTP 事件。"""
 		# RTP 接收帧由测试入口/上层音频端口直接处理；PTT 状态机不需要
 		# 为每个 RTP 包排队，否则音频流会与 GPIO 松开事件竞争 worker。
 		if event["source"] != "tcp":
 			return
 		self._queue_event({"kind": "runtime", "event": event})
-
 	def configure_group(self, group_id, next_request_count=1):
 		self.group_id = int(group_id) & 0xFFFFFFFF
 		self.next_request_count = int(next_request_count) & 0xFFFF
@@ -251,9 +190,7 @@ class CommunicationSession:
 		if self.state == STATE_DISCONNECTED:
 			self.state = STATE_IDLE
 		self._emit("group_configured", self.group_id)
-
 	def configure_single(self, group_id, next_request_count=None):
-		"""保存单呼临时组，并让后续PTT优先操作单呼。"""
 		self.single_group_id = int(group_id) & 0xFFFFFFFF
 		if next_request_count is not None:
 			self.next_request_count = int(next_request_count) & 0xFFFF
@@ -261,9 +198,7 @@ class CommunicationSession:
 		if self.state == STATE_DISCONNECTED:
 			self.state = STATE_IDLE
 		self._emit("single_group_configured", self.single_group_id)
-
 	def clear_group(self):
-		"""退组确认后只清理普通组，保留单呼临时组及其收发状态。"""
 		old_group_id = self.group_id
 		if old_group_id is None:
 			return
@@ -290,7 +225,6 @@ class CommunicationSession:
 			if self.audio_port is not None:
 				self.audio_port.start_playback()
 		self._emit("group_cleared", old_group_id)
-
 	def prefer_group(self):
 		if self.group_id is None:
 			return False
@@ -298,7 +232,6 @@ class CommunicationSession:
 		self._emit("ptt_target_changed", {
 			"call_type": "group", "group_id": self.group_id})
 		return True
-
 	def _selected_group(self):
 		if (self.preferred_call_type == "single" and
 				self.single_group_id is not None):
@@ -308,14 +241,12 @@ class CommunicationSession:
 		if self.single_group_id is not None:
 			return self.single_group_id, "single"
 		return None, None
-
 	def _call_type(self, group_id):
 		if group_id is not None and self.single_group_id == int(group_id):
 			return "single"
 		if group_id is not None and self.group_id == int(group_id):
 			return "group"
 		return "unknown"
-
 	def _cache_server_response(self, request_type, request_count, packet):
 		key = (int(request_type), int(request_count) & 0xFFFF)
 		if key not in self._server_responses:
@@ -326,10 +257,8 @@ class CommunicationSession:
 			if old_key in self._server_responses:
 				del self._server_responses[old_key]
 			self._server_request_payloads.pop(old_key, None)
-
 	def submit_server_response(self, request_type, request_count,
 							   response_type, payload, retain_result=False):
-		"""服务器主动请求统一按request_cnt+1应答，并支持重复请求重发。"""
 		key = (int(request_type), int(request_count) & 0xFFFF)
 		cached = self._server_responses.get(key)
 		repeated = cached is not None
@@ -349,7 +278,6 @@ class CommunicationSession:
 			"accepted": accepted,
 		})
 		return accepted
-
 	def _repeat_server_request(self, frame):
 		key = (frame["msg_type"], frame["request_cnt"])
 		request_count = int(frame["request_cnt"]) & 0xFFFF
@@ -386,7 +314,6 @@ class CommunicationSession:
 		if len(self._server_request_payloads) > 32:
 			self._server_request_payloads = {key: bytes(frame["payload"])}
 		return False
-
 	def _finish_floor_locally(self):
 		self._submit(CMD_RTP_AUDIO_STOP)
 		self.pending_request_count = None
@@ -399,7 +326,6 @@ class CommunicationSession:
 		self.floor_udp_port = None
 		self.release_pending = False
 		self.state = STATE_IDLE
-
 	def _check_floor_timeout(self):
 		if (self.floor_deadline is not None and
 				utime.ticks_diff(utime.ticks_ms(), self.floor_deadline) >= 0):
@@ -432,13 +358,10 @@ class CommunicationSession:
 			self._emit("floor_timeout", {
 				"group_id": group_id, "call_type": self._call_type(group_id),
 				"phase": phase})
-
 	def _make_ptt_input(self):
 		if Pin is None:
 			raise RuntimeError("machine.Pin不可用")
-		# 硬件已确认 PTT 使用 GPIO29。
 		return Pin(Pin.GPIO29, Pin.IN, Pin.PULL_PU, 1)
-
 	def _make_ptt_irq(self):
 		if ExtInt is None:
 			raise RuntimeError("machine.ExtInt不可用")
@@ -446,16 +369,13 @@ class CommunicationSession:
 			# PTT GPIO29，使用双边沿中断，线程上下文再读取电平并消抖。
 			ExtInt.GPIO29, ExtInt.IRQ_RISING_FALLING,
 			ExtInt.PULL_PU, self._on_ptt_irq)
-
 	def _wait_thread_exit(self, timeout_ms=300):
-		"""等待 PTT worker 退出；_thread 没有 join，这里用 thread_id 完成回收。"""
 		deadline = utime.ticks_add(utime.ticks_ms(), int(timeout_ms))
 		while self.thread_id is not None:
 			if utime.ticks_diff(deadline, utime.ticks_ms()) <= 0:
 				break
 			utime.sleep_ms(1)
 		return self.thread_id is None
-
 	def start(self, threaded=True, wake_callback=None):
 		if self.running:
 			return False
@@ -497,7 +417,6 @@ class CommunicationSession:
 				raise
 		self._emit("ptt_service_started", self.ptt_gpio)
 		return True
-
 	def stop(self):
 		self.running = False
 		if self.ptt_irq is not None:
@@ -518,9 +437,7 @@ class CommunicationSession:
 			self._external_ptt_pending = None
 		finally:
 			self._lock.release()
-
 	def _process_pending(self):
-		"""在调用线程中处理一次 GPIO 和运行时事件。"""
 		events = self._take_events()
 		self._lock.acquire()
 		try:
@@ -552,9 +469,7 @@ class CommunicationSession:
 				except Exception as error:
 					self._emit("ptt_worker_error", error)
 		self._check_floor_timeout()
-
 	def poll_once(self):
-		"""非线程模式下由唯一通信业务线程调用一次。"""
 		if not self.running or self._threaded:
 			return False
 		try:
@@ -564,7 +479,6 @@ class CommunicationSession:
 			# 将无人处理。
 			self._emit("ptt_worker_error", error)
 		return True
-
 	def _take_events(self):
 		self._lock.acquire()
 		try:
@@ -574,13 +488,11 @@ class CommunicationSession:
 			return events
 		finally:
 			self._lock.release()
-
 	def _submit(self, command_type, payload=None):
 		accepted = self.submit_command(command_type, payload)
 		if not accepted:
 			self._emit("command_rejected", command_type)
 		return accepted
-
 	def _cancel_rtp_activation(self, group_id, call_type=None):
 		if group_id is None:
 			return
@@ -588,12 +500,10 @@ class CommunicationSession:
 			call_type = self._call_type(group_id)
 		self._submit(CMD_RTP_ACTIVATE_CANCEL, {
 			"retry_key": (call_type, int(group_id))})
-
 	def _next_count(self):
 		value = self.next_request_count
 		self.next_request_count = (value + 1) & 0xFFFF
 		return value
-
 	def _send_floor_request(self):
 		group_id, call_type = self._selected_group()
 		if not self.intercom_enabled:
@@ -626,7 +536,6 @@ class CommunicationSession:
 			"call_type": call_type,
 		})
 		return True
-
 	def _send_release(self):
 		group_id = self.floor_group_id
 		if group_id is None:
@@ -659,9 +568,7 @@ class CommunicationSession:
 			"call_type": self._call_type(group_id),
 		})
 		return True
-
 	def start_release_compensation(self, group_id, request_count):
-		"""新连接登录后使用新的request_cnt补发0x09释放事务。"""
 		if self.state not in (STATE_IDLE, STATE_DISCONNECTED):
 			return False
 		self.floor_group_id = int(group_id)
@@ -669,9 +576,7 @@ class CommunicationSession:
 		self.next_request_count = int(request_count) & 0xFFFF
 		self.release_pending = True
 		return self._send_release()
-
 	def request_stop_single(self):
-		"""解散前停止单呼发送；返回是否已经没有单呼麦权事务。"""
 		single_group_id = self.single_group_id
 		if single_group_id is None or self.floor_group_id != single_group_id:
 			return True
@@ -689,13 +594,9 @@ class CommunicationSession:
 			self.floor_group_id = None
 			return True
 		return self.state == STATE_IDLE
-
 	def request_stop_transmit(self):
-		"""控制事务停止当前发送，并按松键流程释放持有的麦权。"""
 		self._on_ptt_changed(False)
-
 	def signal_external_ptt(self, pressed):
-		"""保存外部PTT最新状态，并唤醒既有会话执行上下文。"""
 		if not self.running or self.logout_pending:
 			return False
 		self._lock.acquire()
@@ -705,16 +606,12 @@ class CommunicationSession:
 			self._lock.release()
 		self._signal()
 		return True
-
 	def request_stop_group(self):
-		"""仅停止普通组发送，退组不能停止已有单呼发送。"""
 		if self.group_id is not None and self.floor_group_id == self.group_id:
 			self.request_stop_transmit()
 			return True
 		return False
-
 	def clear_single(self):
-		"""清除单呼临时组以及只属于该临时组的收发状态。"""
 		old_group_id = self.single_group_id
 		if old_group_id is None:
 			return
@@ -737,7 +634,6 @@ class CommunicationSession:
 		self.single_group_id = None
 		self.preferred_call_type = "group"
 		self._emit("single_group_cleared", old_group_id)
-
 	def _on_ptt_changed(self, pressed):
 		self.ptt_pressed = bool(pressed)
 		self._emit("ptt_changed", self.ptt_pressed)
@@ -754,7 +650,6 @@ class CommunicationSession:
 		elif self.state == STATE_REQUESTING_FLOOR:
 			# 等待0x88结果；若服务器已经授予麦权，收到应答后立即释放。
 			self._emit("floor_release_deferred", None)
-
 	def _handle_tcp_frame(self, frame):
 		msg_type = frame["msg_type"]
 		request_count = frame["request_cnt"]
@@ -973,7 +868,6 @@ class CommunicationSession:
 				"group_id": released_group_id,
 				"call_type": self._call_type(released_group_id),
 			})
-
 	def _handle_runtime_event(self, event):
 		if event["source"] == "tcp":
 			inner = event["event"]
@@ -996,7 +890,6 @@ class CommunicationSession:
 				self._emit("communication_disconnected", inner)
 		elif event["source"] == "rtp":
 			self._emit("rtp_event", event["event"])
-
 	def _run(self):
 		try:
 			while self.running:

@@ -1,40 +1,20 @@
 # -*- coding: utf-8 -*-
-"""正式 UI 交互基线应用（不启动真实业务线程）。"""
-
 import gc
 import utime
-
 import lvgl as lv
-
-try:
-	from usr.display_port import DisplayPort
-	from usr.touch_port import TouchPort
-	from usr.ui_pages import PageFactory
-	from usr.ui_router import Router
-	from usr.ui_commands import (UICommandQueue, CMD_SET_LAMP_MODE,
-		CMD_COMMIT_LAMP_BRIGHTNESS, CMD_COMMIT_SCREEN_BRIGHTNESS,
-		CMD_SET_DOUBLE_CLICK_ENABLED, CMD_SET_LAMP_BRIGHTNESS,
-		CMD_SET_SCREEN_BRIGHTNESS, CMD_SET_SLEEP_TIMEOUT,
-		CMD_REFRESH_NETWORK)
-	from usr.ui_messages import UIMessageBus
-	from usr.ui_state import get_default_state_store
-	from usr.ota_service import (OTA_PROGRESS_DOT_INTERVAL_MS,
-		OTA_PROGRESS_DOT_MAX)
-except Exception:
-	from display_port import DisplayPort
-	from touch_port import TouchPort
-	from ui_pages import PageFactory
-	from ui_router import Router
-	from ui_commands import (UICommandQueue, CMD_SET_LAMP_MODE,
-		CMD_COMMIT_LAMP_BRIGHTNESS, CMD_COMMIT_SCREEN_BRIGHTNESS,
-		CMD_SET_DOUBLE_CLICK_ENABLED, CMD_SET_LAMP_BRIGHTNESS,
-		CMD_SET_SCREEN_BRIGHTNESS, CMD_SET_SLEEP_TIMEOUT,
-		CMD_REFRESH_NETWORK)
-	from ui_messages import UIMessageBus
-	from ui_state import get_default_state_store
-	from ota_service import OTA_PROGRESS_DOT_INTERVAL_MS, OTA_PROGRESS_DOT_MAX
-
-
+from usr.display_port import DisplayPort
+from usr.touch_port import TouchPort
+from usr.ui_pages import PageFactory
+from usr.ui_router import Router
+from usr.ui_commands import (UICommandQueue, CMD_SET_LAMP_MODE,
+	CMD_COMMIT_LAMP_BRIGHTNESS, CMD_COMMIT_SCREEN_BRIGHTNESS,
+	CMD_SET_DOUBLE_CLICK_ENABLED, CMD_SET_LAMP_BRIGHTNESS,
+	CMD_SET_SCREEN_BRIGHTNESS, CMD_SET_SLEEP_TIMEOUT,
+	CMD_REFRESH_NETWORK)
+from usr.ui_messages import UIMessageBus
+from usr.ui_state import get_default_state_store
+from usr.ota_service import (OTA_PROGRESS_DOT_INTERVAL_MS,
+	OTA_PROGRESS_DOT_MAX)
 ROOT_NAMES = ("location", "shoulder", "intercom", "settings")
 ROOT_TITLES = ("定位", "肩灯", "对讲机", "设置")
 CLICK_MAX_DISTANCE_PX = 6
@@ -43,8 +23,6 @@ ROOT_SCROLL_THROW = 40
 ROOT_SCROLL_LIMIT = 5
 # 子页面原生切换动画期间禁止重复点击，避免重复创建 tile/JPG 对象。
 CHILD_TRANSITION_LOCK_MS = 600
-
-
 class NavigationTestApp:
 	def __init__(self, battery=None, network=None, lamp=None,
 				 low_priority_worker=None, low_priority_worker_factory=None,
@@ -53,7 +31,6 @@ class NavigationTestApp:
 				 communication_controller=None, ota_service=None,
 				 initial_police_no=None, watchdog=None,
 				 watchdog_feed_interval_ms=5000):
-		print("[UI入口] 创建UI应用，11111内存={}KB".format(gc.mem_free() // 1024))
 		self.width = 296
 		self.height = 240
 		self.status_height = 30
@@ -66,8 +43,6 @@ class NavigationTestApp:
 							else get_default_state_store())
 		self.message_bus = (message_bus if message_bus is not None
 							else UIMessageBus())
-		# 业务对象由启动入口显式创建并注入；UI 不创建硬件对象，也不访问
-		# ADC、网络或 I2C。未注入 Worker 时仍可作为纯导航验证程序运行。
 		self.battery = battery
 		self.network = network
 		self.lamp = lamp
@@ -154,9 +129,7 @@ class NavigationTestApp:
 		self._pending_key_notice = None
 		self._ota_dot_count = 1
 		self._ota_dot_at = None
-
 	def _sync_display_sleep(self):
-		"""由UI线程串行执行LCD电源命令并切换触摸输入。"""
 		_sleeping = bool(self.state_store.get_snapshot()[1]["screen_sleeping"])
 		if self._display_sleep_state == _sleeping:
 			return
@@ -173,10 +146,8 @@ class NavigationTestApp:
 			if self.touch is not None:
 				self.touch.set_enabled(True)
 		self._display_sleep_state = _sleeping
-
 	@staticmethod
 	def _remove_frame(obj):
-		"""移除LVGL默认边框和外轮廓，不改变对象布局或滚动行为。"""
 		obj.set_style_border_width(0, lv.PART.MAIN)
 		obj.set_style_border_opa(0, lv.PART.MAIN)
 		obj.set_style_outline_width(0, lv.PART.MAIN)
@@ -201,10 +172,8 @@ class NavigationTestApp:
 			obj.set_style_pad_all(0, lv.PART.SCROLLBAR)
 		except Exception:
 			pass
-
 	@staticmethod
 	def _make_black_surface(obj):
-		"""清除导航容器主题底色；只调整视觉样式，不改变滚动行为。"""
 		obj.set_style_bg_color(lv.color_hex(0), lv.PART.MAIN)
 		obj.set_style_bg_opa(255, lv.PART.MAIN)
 		try:
@@ -213,10 +182,8 @@ class NavigationTestApp:
 			obj.set_style_pad_all(0, lv.PART.MAIN)
 		except Exception:
 			pass
-
 	@staticmethod
 	def _make_fixed_container(obj):
-		"""固定普通页面容器；不改变外层 tileview 的跟手处理。"""
 		try:
 			obj.clear_flag(lv.obj.FLAG.SCROLLABLE)
 		except Exception:
@@ -237,14 +204,12 @@ class NavigationTestApp:
 			obj.clear_flag(lv.obj.FLAG.SCROLL_ELASTIC)
 		except Exception:
 			pass
-
 	def _set_ui_busy(self, busy):
 		busy = bool(busy)
 		if busy == self._ui_busy:
 			return
 		self._ui_busy = busy
 		self.command_queue.set_ui_busy(busy)
-
 	def _make_root(self):
 		self.root_screen = lv.obj()
 		self.root_screen.set_size(self.width, self.height)
@@ -314,7 +279,6 @@ class NavigationTestApp:
 		self.root_screen.invalidate()
 		# 首帧在登录页创建完成后立即提交，避免等待触摸事件才触发重绘。
 		self.display.present_initial_frame()
-
 	def _finish_login_transition(self):
 		if not self._login_transition_pending:
 			return
@@ -343,30 +307,37 @@ class NavigationTestApp:
 		except Exception:
 			self.nav_host.set_tile_id(0, 0)
 		self.root_screen.invalidate()
-
 	def set_login_prefix(self, prefix):
 		if prefix not in ("M", "F"):
 			return
 		self.login_prefix = prefix
-		# 登录页的颜色属于页面样式，由 PageFactory 统一管理。应用层只
-		# 传递状态，避免直接引用 ui_pages.py 内部的颜色常量。
 		self.pages.update_login_prefix(prefix)
-
 	def login_digit(self, digit):
 		if len(self.login_digits) >= 6:
 			return
 		self.login_digits += str(digit)
 		self.login_display.set_text(self.login_digits)
-
 	def login_delete(self):
 		if self.login_digits:
 			self.login_digits = self.login_digits[:-1]
 		self.login_display.set_text(
 			self.login_digits if self.login_digits else "")
-
 	def login_confirm(self):
 		if len(self.login_digits) < 6:
 			self.pages.show_transient_popup("请输入6位编号")
+			return
+		if self.login_digits == "000000":
+			if (self.communication_controller is None or
+					not self.communication_controller.enter_fixed_guest_mode()):
+				self.pages.show_transient_popup("游客登录失败")
+				return
+			self._returning_to_login = False
+			self._guest_relogin_prompt_shown = False
+			self._guest_relogin_prompt_seen = int(
+				self.state_store.get_snapshot()[1].get(
+					"guest_relogin_prompt_revision") or 0)
+			self._pending_login_transaction_id = None
+			self._login_transition_pending = True
 			return
 		police_no = self.login_prefix + self.login_digits
 		self._returning_to_login = False
@@ -386,9 +357,7 @@ class NavigationTestApp:
 		self.state_store.update_identity(
 			self.state_store.get_snapshot()[1]["police_name"], police_no)
 		self._login_transition_pending = True
-
 	def _confirm_guest_login(self):
-		"""确认无网登录；若确认前连接已恢复，则转为普通登录。"""
 		if self.communication_controller is None:
 			return
 		self._returning_to_login = False
@@ -408,25 +377,21 @@ class NavigationTestApp:
 		self._guest_relogin_prompt_shown = False
 		self._pending_login_transaction_id = None
 		self._login_transition_pending = True
-
 	def _cancel_guest_login(self):
 		# 取消只关闭弹框，后台连接继续运行，用户仍可再次确认登录。
 		self._login_transition_pending = False
 		self._pending_login_transaction_id = None
-
 	def _confirm_force_login(self):
 		if (self.communication_controller is None or
 				not self.communication_controller.request_force_login()):
 			self._login_transition_pending = False
 			self._pending_login_transaction_id = None
 			self.pages.show_transient_popup("登录服务不可用")
-
 	def _cancel_force_login(self):
 		if self.communication_controller is not None:
 			self.communication_controller.cancel_force_login()
 		self._login_transition_pending = False
 		self._pending_login_transaction_id = None
-
 	def _process_login_popup(self, snapshot):
 		key = (snapshot.get("login_state"), snapshot.get("login_result"),
 			   snapshot.get("force_login_stage"), snapshot.get("login_error"),
@@ -490,7 +455,6 @@ class NavigationTestApp:
 			self.pages.show_transient_popup(text)
 		elif state == "idle":
 			self.pages.hide_login_progress_popup()
-
 	def _process_connection_popup(self, snapshot=None):
 		current = snapshot or {}
 		state_store = getattr(self, "state_store", None)
@@ -513,7 +477,6 @@ class NavigationTestApp:
 				self._confirm_guest_relogin,
 				self._cancel_guest_relogin)
 			return
-
 		if snapshot is not None:
 			events = snapshot.get("connection_events") or ()
 			if events:
@@ -574,17 +537,13 @@ class NavigationTestApp:
 				signature=("connection", event["stage"], "progress",
 					event["revision"]),
 				duration_ms=event["duration_ms"] or 3000)
-
 	@staticmethod
 	def _call_type_text(call_type):
 		return "单呼" if call_type == "single" else "组呼"
-
 	def _cancel_current_touch_for_popup(self):
-		"""终止当前点击资格；不改变触摸采集和跟手状态机结构。"""
 		self.touch_session_click_allowed = False
 		if self.touch is not None and self.touch.pressed:
 			self.touch_moved = True
-
 	def _process_floor_event(self, snapshot):
 		revision = int(snapshot.get("floor_event_revision") or 0)
 		if revision == self._floor_event_seen:
@@ -682,9 +641,7 @@ class NavigationTestApp:
 			self._active_call_direction = None
 			self._active_call_group_id = None
 			self.pages.hide_communication_popup()
-
 	def _return_to_login(self, notify_controller):
-		"""复位导航；服务器强退时不再反向发送主动退出请求。"""
 		self._returning_to_login = True
 		if notify_controller and self.communication_controller is not None:
 			self.communication_controller.request_logout()
@@ -725,12 +682,10 @@ class NavigationTestApp:
 		self.child_screen = self.nav_tiles.get(0)
 		self.pages.update_root_indicator(0)
 		self.pages.set_status_context("police")
-
 		if self.login_display is not None:
 			self.login_display.set_text(self.login_digits)
 			self.login_display.invalidate()
 		self.set_login_prefix(self.login_prefix)
-
 		self.nav_host.add_flag(lv.obj.FLAG.HIDDEN)
 		self.status_bar.add_flag(lv.obj.FLAG.HIDDEN)
 		self.login_page.clear_flag(lv.obj.FLAG.HIDDEN)
@@ -739,7 +694,6 @@ class NavigationTestApp:
 		except Exception:
 			pass
 		self.root_screen.invalidate()
-
 	def logout_to_login(self):
 		if self._returning_to_login:
 			return
@@ -755,23 +709,19 @@ class NavigationTestApp:
 		self.pages.show_progress_popup(
 			"正在退出... ...", locked=True,
 			signature=("logout", "progress"))
-
 	def _confirm_guest_relogin(self):
 		if self.communication_controller is None:
 			return
 		self.communication_controller.exit_guest_mode()
 		self._return_to_login(False)
-
 	def _cancel_guest_relogin(self):
 		# 保持游客身份；下一次网络断开并重新恢复时重新允许询问。
 		return
-
 	def select_lamp_mode(self, mode):
 		if mode not in ("off", "alternate", "diagonal"):
 			return False
 		if self.low_priority_worker is not None:
 			if self.lamp is None:
-				print("[肩灯] 服务不可用，模式设置已忽略")
 				return False
 			if not self.command_queue.put_latest(CMD_SET_LAMP_MODE, mode):
 				return False
@@ -780,7 +730,6 @@ class NavigationTestApp:
 			mode, snapshot["lamp_brightness"],
 			snapshot["lamp_alarm_active"])
 		return True
-
 	def select_double_click(self, enabled):
 		enabled = bool(enabled)
 		if self.low_priority_worker is not None:
@@ -788,7 +737,6 @@ class NavigationTestApp:
 				CMD_SET_DOUBLE_CLICK_ENABLED, enabled)
 		self.state_store.update_motion(enabled)
 		return True
-
 	def select_group(self, group_id):
 		getter = getattr(self.state_store, "get_snapshot", None)
 		if getter is not None:
@@ -804,7 +752,6 @@ class NavigationTestApp:
 		self.state_store.update_group_selection(
 			None if group_id == "__none_group__" else group_id)
 		return True
-
 	def select_person(self, person_key):
 		getter = getattr(self.state_store, "get_snapshot", None)
 		if getter is not None:
@@ -820,7 +767,6 @@ class NavigationTestApp:
 		self.state_store.update_single_selection(
 			None if person_key == "__none_person__" else person_key)
 		return True
-
 	def set_screen_brightness(self, percent):
 		value = max(5, min(100, int(percent)))
 		if self.low_priority_worker is not None:
@@ -828,12 +774,10 @@ class NavigationTestApp:
 				return self.state_store.get_snapshot()[1]["screen_brightness"]
 		self.state_store.update_screen_brightness(value)
 		return value
-
 	def set_lamp_brightness(self, percent):
 		value = max(5, min(100, int(percent)))
 		if self.low_priority_worker is not None:
 			if self.lamp is None:
-				print("[肩灯] 服务不可用，亮度设置已忽略")
 				return self.state_store.get_snapshot()[1]["lamp_brightness"]
 			if not self.command_queue.put_latest(CMD_SET_LAMP_BRIGHTNESS, value):
 				return self.state_store.get_snapshot()[1]["lamp_brightness"]
@@ -842,7 +786,6 @@ class NavigationTestApp:
 			snapshot["lamp_mode"], value,
 			snapshot["lamp_alarm_active"])
 		return value
-
 	def set_audio_volume(self, level):
 		value = max(0, min(11, int(level)))
 		if self.communication_controller is not None:
@@ -852,7 +795,6 @@ class NavigationTestApp:
 		self.state_store.update_audio(
 			snapshot["audio_tx_active"], snapshot["audio_rx_active"], value)
 		return value
-
 	def commit_slider_setting(self, setting):
 		if setting == "screen_brightness":
 			return self.command_queue.put(
@@ -863,7 +805,6 @@ class NavigationTestApp:
 		if setting == "audio_volume" and self.communication_controller is not None:
 			return self.communication_controller.request_commit_volume()
 		return False
-
 	def select_sleep_timeout(self, seconds):
 		if seconds not in (10, 15, 20, 30, 60, None):
 			return False
@@ -872,39 +813,31 @@ class NavigationTestApp:
 				return False
 		self.state_store.update_sleep_timeout(seconds)
 		return True
-
 	def refresh_network(self, event=None):
-		"""请求低优先级Worker立即重新读取网络和信号值。"""
 		if self.low_priority_worker is None:
 			return False
 		return self.command_queue.put_coalesced(
 			CMD_REFRESH_NETWORK, None)
-
 	def select_fall_detection(self, enabled):
 		self.state_store.update_fall_detection(bool(enabled))
 		return True
-
 	def check_upgrade(self):
 		if self.ota_service is None:
 			self.pages.show_transient_popup("升级服务不可用")
 			return False
 		return self.ota_service.start_query()
-
 	def before_leave_page(self, name):
 		if name == "upgrade" and self.ota_service is not None:
 			if self.ota_service.leave_page():
 				self.pages.hide_ota_popup()
-
 	@staticmethod
 	def _disable_horizontal_elastic(obj):
-		"""关闭 tileview 边界横向弹性，避免无效方向出现晃动回弹。"""
 		try:
 			obj.clear_flag(lv.obj.FLAG.SCROLL_ELASTIC)
 		except Exception:
 			# 某些 QuecPython LVGL 版本没有导出该 flag；tile 的方向限制
 			# 仍然生效，因此不阻断启动。
 			pass
-
 	def _begin_touch_session(self):
 		self._set_ui_busy(True)
 		self._release_ui_after_task = False
@@ -915,7 +848,6 @@ class NavigationTestApp:
 		self.touch_horizontal_swipe = False
 		self.touch_session_click_allowed = True
 		self._root_session_index = self.root_view
-
 	def _update_touch_session(self):
 		if self.touch_start_point is None or not self.touch.pressed:
 			return
@@ -928,12 +860,9 @@ class NavigationTestApp:
 		if (abs(self.touch_dx) >= PAGE_SWITCH_DISTANCE_PX and
 				abs(self.touch_dx) > abs(self.touch_dy) * 1.2):
 			self.touch_horizontal_swipe = True
-
 	def can_click_current_touch(self):
-		"""按钮 CLICKED 回调使用：只有全程近似原地才允许点击。"""
 		return bool(self.touch_session_click_allowed and
 					not self.touch_moved)
-
 	def _root_changed(self, event):
 		try:
 			tile = event.get_target().get_tile_act()
@@ -955,14 +884,11 @@ class NavigationTestApp:
 		except Exception:
 			# LVGL 回调异常不能中断 UI 主循环。
 			self.root_view = None
-
 	def _active_nav_depth(self):
 		if self.router.current is None:
 			return 0
 		return len(self.router.stack)
-
 	def _nav_changed(self, event):
-		"""处理子页面槽位的原生 LVGL 横向返回。"""
 		try:
 			tile = event.get_target().get_tile_act()
 			index = int(tile.get_x() / self.width)
@@ -984,7 +910,6 @@ class NavigationTestApp:
 					self._active_nav_depth(), 0, lv.ANIM.OFF)
 			except Exception:
 				pass
-
 	def _remove_route_tiles_from(self, depth):
 		for index in sorted(list(self.nav_tiles.keys()), reverse=True):
 			if index < depth or index == 0:
@@ -997,7 +922,6 @@ class NavigationTestApp:
 					lv.obj_del(tile)
 				except Exception:
 					pass
-
 	def _make_child_tile(self, depth, page_info):
 		self._remove_route_tiles_from(depth)
 		# 子页面保留双向许可，以便右滑返回过程中可以反向拖回当前页；
@@ -1013,7 +937,6 @@ class NavigationTestApp:
 		self.pages.child(page_info[0], page_info[2], parent=tile)
 		self._disable_horizontal_elastic(tile)
 		return tile
-
 	def _show_child(self, page_info, direction="forward"):
 		depth = len(self.router.stack)
 		gc.collect()
@@ -1031,7 +954,6 @@ class NavigationTestApp:
 			# 反向回到原页，返回完成后上一级右侧也不会残留旧页面。
 			self._remove_route_tiles_from(depth + 1)
 		self.nav_tiles[depth].invalidate()
-
 	def show_root_page(self):
 		self.pages.set_status_context("police")
 		self.child_screen = self.nav_tiles.get(0)
@@ -1043,7 +965,6 @@ class NavigationTestApp:
 		# 根槽位内部的 root_content 保持原来的一级页面索引，因此不会显示 A/B 过渡帧。
 		self._remove_route_tiles_from(1)
 		self.root_screen.invalidate()
-
 	def show_child_page(self, page_info, direction="forward"):
 		if page_info[0] == "volume":
 			self.pages.hide_volume_overlay()
@@ -1052,7 +973,6 @@ class NavigationTestApp:
 		self._show_child(page_info, direction)
 		if page_info[0] == "intercom_menu" and self.communication_controller is not None:
 			self.communication_controller.request_refresh_directory()
-
 	def open_child(self, name):
 		if self._child_transition_busy:
 			return False
@@ -1072,7 +992,6 @@ class NavigationTestApp:
 		if not result:
 			self._child_transition_busy = False
 		return result
-
 	def _login_transition_ready(self, snapshot):
 		if snapshot["login_state"] == "guest":
 			return True
@@ -1082,7 +1001,6 @@ class NavigationTestApp:
 				self._pending_login_transaction_id and
 			snapshot.get("login_result") == 0 and
 			snapshot["login_state"] in ("logged_in", "joined"))
-
 	def start(self):
 		device = getattr(self.low_priority_worker, "device", None)
 		initial_brightness = self.state_store.get_snapshot()[1][
@@ -1161,7 +1079,6 @@ class NavigationTestApp:
 				self._child_transition_busy = False
 			self._feed_watchdog_if_due(utime.ticks_ms())
 			utime.sleep_ms(1)
-
 	def _feed_watchdog_if_due(self, now):
 		if (self.watchdog is None or
 				utime.ticks_diff(now, self._watchdog_next_feed_ms) < 0):
@@ -1174,7 +1091,6 @@ class NavigationTestApp:
 			return
 		self._watchdog_next_feed_ms = utime.ticks_add(
 			now, self.watchdog_feed_interval_ms)
-
 	def _refresh_page_state(self):
 		changed = self.state_store.get_snapshot_if_changed()
 		if changed is None:
@@ -1222,7 +1138,6 @@ class NavigationTestApp:
 			self._process_floor_event(snapshot)
 		self._process_ota_event(snapshot)
 		self.pages.refresh_state(snapshot)
-
 	def _process_logout_state(self, snapshot):
 		revision = int(snapshot.get("logout_event_revision") or 0)
 		if snapshot.get("logout_active"):
@@ -1237,7 +1152,6 @@ class NavigationTestApp:
 		self.pages.hide_logout_popup()
 		self._return_to_login(False)
 		return True
-
 	def _process_volume_key_event(self, snapshot):
 		revision = int(snapshot.get("volume_key_event_revision") or 0)
 		if revision <= self._volume_key_event_seen:
@@ -1249,7 +1163,6 @@ class NavigationTestApp:
 			return
 		self.pages.show_volume_overlay(
 			snapshot.get("volume_key_event_value", snapshot["audio_volume"]))
-
 	def _queue_key_notice(self, snapshot):
 		revision = int(snapshot.get("key_notice_revision") or 0)
 		if revision <= self._key_notice_seen:
@@ -1262,7 +1175,6 @@ class NavigationTestApp:
 			"duration_ms": int(
 				snapshot.get("key_notice_duration_ms") or 2000),
 		}
-
 	def _process_pending_key_notice(self):
 		notice = self._pending_key_notice
 		if notice is None or not self.pages.can_show_low_priority_popup():
@@ -1273,7 +1185,6 @@ class NavigationTestApp:
 		if shown:
 			self._pending_key_notice = None
 		return shown
-
 	def _process_ota_event(self, snapshot):
 		revision = int(snapshot.get("ota_event_revision") or 0)
 		if revision <= self._ota_event_seen:
@@ -1305,7 +1216,6 @@ class NavigationTestApp:
 				signature=("ota", "confirm", revision))
 		if shown:
 			self._ota_event_seen = revision
-
 	def _animate_ota_popup(self, now):
 		if self.ota_service is None:
 			return
@@ -1324,8 +1234,6 @@ class NavigationTestApp:
 		self.pages.show_ota_progress(
 			"下载中" + "." * self._ota_dot_count,
 			signature=("ota", "download", self._ota_dot_count))
-
-
 def main(battery=None, network=None, lamp=None,
 		 low_priority_worker=None, low_priority_worker_factory=None,
 		 sensor_service=None, command_queue=None, state_store=None,

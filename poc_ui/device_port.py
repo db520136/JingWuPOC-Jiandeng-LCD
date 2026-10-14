@@ -1,7 +1,5 @@
 # -*- coding: utf-8 -*-
-
 import utime
-
 try:
 	from misc import PWM_V2
 except ImportError:
@@ -14,8 +12,9 @@ try:
 	import modem
 except ImportError:
 	modem = None
-
-
+def _screen_pwm_duty(percent):
+	# UI及持久化保留5~100%，背光占空比按80%上限等比例映射。
+	return (percent * 80 + 50) // 100
 def _coordinate(value, direction, latitude):
 	digits = 2 if latitude else 3
 	if len(value) <= digits:
@@ -37,8 +36,6 @@ def _coordinate(value, direction, latitude):
 	# 直接str(float)显示二进制浮点尾数。
 	display = ("{:0." + str(minute_fraction_digits + 2) + "f}").format(result)
 	return result, display
-
-
 def parse_gga(line):
 	body, checksum = line.strip().split("*")
 	if not body.startswith("$") or len(checksum) != 2:
@@ -69,8 +66,6 @@ def parse_gga(line):
 			raise ValueError("GGA海拔格式错误")
 		result["altitude"] = altitude
 	return result
-
-
 class DevicePort:
 	def __init__(self, software_version="1.0.0", hardware_version="1.0.0",
 				 device_id="--"):
@@ -84,12 +79,11 @@ class DevicePort:
 		self.gnss_initialized = False
 		self._gnss_retry_at = None
 		self._nmea_tail = ""
-
 	def set_screen_brightness(self, percent):
 		value = max(5, min(100, int(percent)))
 		if PWM_V2 is None:
 			raise RuntimeError("PWM_V2模块不可用")
-		duty = 0 if self.screen_sleeping else value
+		duty = 0 if self.screen_sleeping else _screen_pwm_duty(value)
 		if self.pwm is None:
 			pwm = PWM_V2(PWM_V2.PWM0, 1250.0, duty)
 			pwm.open()
@@ -99,9 +93,7 @@ class DevicePort:
 		self.brightness = value
 		self._screen_backlight_enabled = not self.screen_sleeping
 		return value
-
 	def prepare_screen_brightness(self, percent):
-		"""Initialize the backlight output dark, before the first UI frame."""
 		value = max(5, min(100, int(percent)))
 		if PWM_V2 is None:
 			raise RuntimeError("PWM_V2模块不可用")
@@ -115,15 +107,12 @@ class DevicePort:
 		self.screen_sleeping = False
 		self._screen_backlight_enabled = False
 		return value
-
 	def reveal_screen(self):
-		"""Show the already-rendered screen using its configured brightness."""
 		if self.pwm is None:
 			return self.set_screen_brightness(self.brightness)
-		self.pwm.open(1250.0, 0 if self.screen_sleeping else self.brightness)
+		self.pwm.open(1250.0, 0 if self.screen_sleeping else _screen_pwm_duty(self.brightness))
 		self._screen_backlight_enabled = not self.screen_sleeping
 		return self.brightness
-
 	def screen_off(self):
 		if self.screen_sleeping:
 			return False
@@ -133,17 +122,15 @@ class DevicePort:
 		self.screen_sleeping = True
 		self._screen_backlight_enabled = False
 		return True
-
 	def screen_on(self):
 		if not self.screen_sleeping:
 			return False
 		if self.pwm is None:
 			raise RuntimeError("背光PWM未初始化")
-		self.pwm.open(1250.0, self.brightness)
+		self.pwm.open(1250.0, _screen_pwm_duty(self.brightness))
 		self.screen_sleeping = False
 		self._screen_backlight_enabled = True
 		return True
-
 	def read_versions(self):
 		if modem is None:
 			raise RuntimeError("modem模块不可用，无法读取固件版本")
@@ -153,7 +140,6 @@ class DevicePort:
 		if not firmware or firmware == -1:
 			raise RuntimeError("固件版本查询失败")
 		return self.software_version, self.hardware_version, str(firmware)
-
 	def initialize_gnss(self):
 		if quecgnss is None:
 			raise RuntimeError("quecgnss模块不可用")
@@ -164,16 +150,13 @@ class DevicePort:
 				utime.ticks_diff(now, self._gnss_retry_at) < 0):
 			return False
 		self._gnss_retry_at = utime.ticks_add(now, 10000)
-		# 沿用已确认的北斗/GGA/AGPS/备电参数。
 		for setting in (0, 1, 2, 4):
 			quecgnss.configSet(setting, 1)
 		if quecgnss.init() != 0:
 			raise RuntimeError("GNSS初始化失败")
 		self.gnss_initialized = True
 		self._gnss_retry_at = None
-		print("[定位] GNSS初始化成功：北斗、GGA、AGPS、备电")
 		return True
-
 	def read_location(self):
 		if not self.gnss_initialized:
 			if not self.initialize_gnss():

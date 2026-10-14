@@ -1,7 +1,5 @@
 # -*- coding: utf-8 -*-
-
 import _thread
-
 try:
 	import ujson as json
 except ImportError:
@@ -10,30 +8,23 @@ try:
 	import utime
 except ImportError:
 	import time as _time
-
 	class _UTime:
 		@staticmethod
 		def ticks_ms():
 			return int(_time.monotonic() * 1000)
-
 		@staticmethod
 		def ticks_add(value, delta):
 			return value + delta
-
 		@staticmethod
 		def ticks_diff(first, second):
 			return first - second
-
 		@staticmethod
 		def sleep_ms(value):
 			_time.sleep(value / 1000.0)
-
 		@staticmethod
 		def time():
 			return int(_time.time())
-
 	utime = _UTime()
-
 try:
 	from umqtt import MQTTClient
 except ImportError:
@@ -46,8 +37,6 @@ try:
 	from misc import Power
 except ImportError:
 	Power = None
-
-
 MQTT_RECONNECT_MAX_RETRIES = 3
 MQTT_RECONNECT_INTERVAL_MS = 2000
 OTA_QUERY_TIMEOUT_MS = 3000
@@ -60,8 +49,6 @@ OTA_REBOOT_READY_DURATION_MS = 2000
 OTA_PROGRESS_DOT_INTERVAL_MS = 1000
 OTA_PROGRESS_DOT_MAX = 6
 OTA_POST_BOOT_NETWORK_WAIT_MS = 90000
-
-
 def _version_parts(value):
 	text = str(value or "").strip()
 	if text[:1] in ("v", "V"):
@@ -70,8 +57,6 @@ def _version_parts(value):
 	if not parts or any(not item.isdigit() for item in parts):
 		return None
 	return tuple(int(item) for item in parts)
-
-
 def _is_newer_version(target, current):
 	target_parts = _version_parts(target)
 	current_parts = _version_parts(current)
@@ -81,23 +66,16 @@ def _is_newer_version(target, current):
 	target_parts += (0,) * (length - len(target_parts))
 	current_parts += (0,) * (length - len(current_parts))
 	return target_parts > current_parts
-
-
 def _version_matches(value, allowed):
 	if isinstance(allowed, str):
 		allowed = [allowed]
 	if not isinstance(allowed, (list, tuple)):
 		return False
 	return str(value) in [str(item) for item in allowed]
-
-
 def _current_time_value():
 	callback = getattr(utime, "time", None)
 	return int(callback()) if callback is not None else int(utime.ticks_ms())
-
-
 class OTAService:
-
 	def __init__(self, config, state_store, communication_controller,
 				 persistent_config, mqtt_factory=None, fota_factory=None,
 				 restart_callback=None):
@@ -118,11 +96,9 @@ class OTAService:
 		self._phase = "idle"
 		self._task = None
 		self._saved_group_id = None
-
 	def enter_page(self):
 		if not self._thread_active:
 			self.state.update_upgrade_status("", "normal")
-
 	def leave_page(self):
 		self._lock.acquire()
 		try:
@@ -136,16 +112,13 @@ class OTAService:
 		finally:
 			self._lock.release()
 		if client is not None:
-			print("[OTA] 离开升级页面，取消查询并关闭MQTT")
 			self._close_client(client)
 			self.state.publish_ota_event("hide")
 		return cancellable
-
 	def start_query(self):
 		self._lock.acquire()
 		try:
 			if self._thread_active:
-				print("[OTA] 上一次OTA临时线程尚未退出，本次查询已忽略")
 				return False
 			self._thread_active = True
 			self._cancel_requested = False
@@ -161,7 +134,6 @@ class OTAService:
 		self.state.update_ota_runtime(
 			thread_active=True, query_active=True, phase="querying")
 		self.state.publish_ota_event("progress", "查询中... ...")
-		print("[OTA][查询] 启动临时线程：request_id={}".format(request_id))
 		try:
 			_thread.start_new_thread(self._query_worker, (request_id,))
 			return True
@@ -170,7 +142,6 @@ class OTAService:
 			self._show_error("OTA线程启动失败")
 			print("[OTA] 临时线程启动失败：{}".format(error))
 			return False
-
 	def confirm_update(self):
 		self._lock.acquire()
 		try:
@@ -180,7 +151,6 @@ class OTAService:
 			return True
 		finally:
 			self._lock.release()
-
 	def reject_update(self):
 		self._lock.acquire()
 		try:
@@ -190,7 +160,6 @@ class OTAService:
 			return True
 		finally:
 			self._lock.release()
-
 	def start_post_boot_report(self):
 		pending = self.persistent.get("ota_pending")
 		if not isinstance(pending, dict) or not pending.get("pending_report"):
@@ -207,14 +176,12 @@ class OTAService:
 		print("[OTA][启动确认] 发现待确认任务：{}".format(pending))
 		_thread.start_new_thread(self._post_boot_worker, (dict(pending),))
 		return True
-
 	def _cancelled(self):
 		self._lock.acquire()
 		try:
 			return self._cancel_requested
 		finally:
 			self._lock.release()
-
 	def _set_phase(self, phase, query_active=None, busy=None):
 		self._lock.acquire()
 		try:
@@ -223,7 +190,6 @@ class OTAService:
 			self._lock.release()
 		self.state.update_ota_runtime(
 			query_active=query_active, busy=busy, phase=phase)
-
 	def _finish_thread(self):
 		self._lock.acquire()
 		try:
@@ -236,11 +202,9 @@ class OTAService:
 			self._lock.release()
 		self.state.update_ota_runtime(
 			thread_active=False, query_active=False, phase=phase)
-
 	def _show_error(self, text):
 		self.state.publish_ota_event(
 			"error", str(text), OTA_ERROR_POPUP_DURATION_MS)
-
 	def _query_worker(self, request_id):
 		client = None
 		try:
@@ -259,8 +223,6 @@ class OTAService:
 				if query_round:
 					reason = ("等待应答超时" if wait_status == "timeout"
 						else "等待应答期间连接异常")
-					print("[OTA][查询] 第{}轮{}，重连MQTT后再次查询".format(
-						query_round, reason))
 					self._close_client(client)
 					client = self._connect_with_retries()
 					if client is None:
@@ -274,22 +236,12 @@ class OTAService:
 					self._show_error("MQTT连接失败")
 					return
 				self._set_phase("waiting_response", query_active=True)
-				print("[OTA][查询] 第{}/{}轮等待平台应答：超时={}ms".format(
-					query_round + 1, total_rounds, OTA_QUERY_TIMEOUT_MS))
 				wait_status, response, wait_error = self._wait_response(
 					client, OTA_QUERY_TIMEOUT_MS)
 				if wait_status == "response":
-					print("[OTA][查询] 第{}/{}轮收到有效应答".format(
-						query_round + 1, total_rounds))
 					break
 				if wait_status == "cancelled":
 					return
-				if wait_status == "timeout":
-					print("[OTA][查询] 第{}/{}轮等待超时：{}ms内无有效应答".format(
-						query_round + 1, total_rounds, OTA_QUERY_TIMEOUT_MS))
-				else:
-					print("[OTA][查询] 第{}/{}轮等待期间连接异常：{}".format(
-						query_round + 1, total_rounds, wait_error))
 			if self._cancelled():
 				return
 			if response is None:
@@ -309,8 +261,6 @@ class OTAService:
 			if client is not None:
 				self._close_client(client)
 			self._finish_thread()
-			print("[OTA] 临时线程已退出，MQTT资源已释放")
-
 	def _build_query_payload(self, request_id):
 		snapshot = self.state.get_snapshot()[1]
 		payload = {
@@ -323,9 +273,7 @@ class OTAService:
 			"Hardware_Ver": snapshot["hardware_version"],
 			"Firmware_Ver": snapshot["firmware_version"],
 		}
-		print("[OTA][查询] 发布版本查询：{}".format(payload))
 		return payload
-
 	def _new_client(self):
 		if self.mqtt_factory is None:
 			raise RuntimeError("umqtt模块不可用")
@@ -337,7 +285,6 @@ class OTAService:
 		if hasattr(client, "error_register_cb"):
 			client.error_register_cb(self._mqtt_error_callback)
 		return client
-
 	def _connect_with_retries(self, max_retries=None):
 		retries = (MQTT_RECONNECT_MAX_RETRIES if max_retries is None
 			else max(0, int(max_retries)))
@@ -347,9 +294,6 @@ class OTAService:
 				return None
 			client = None
 			try:
-				print("[OTA][MQTT] 第{}/{}次连接：{}:{}".format(
-					index + 1, attempts, self.config["mqtt_host"],
-					self.config["mqtt_port"]))
 				client = self._new_client()
 				client.connect()
 				client.subscribe(self._topic(), 1)
@@ -358,47 +302,34 @@ class OTAService:
 					self._mqtt = client
 				finally:
 					self._lock.release()
-				print("[OTA][MQTT] 连接并订阅成功：topic={} qos=1".format(
-					self._topic()))
 				return client
 			except Exception as error:
-				print("[OTA][MQTT] 第{}/{}次连接失败：{}".format(
-					index + 1, attempts, error))
 				self._close_client(client)
 				if index + 1 < attempts:
 					self._sleep_cancelable(MQTT_RECONNECT_INTERVAL_MS)
 		return None
-
 	def _topic(self):
 		return "/deviceStatusInfo/poc/Information/OTA_MSG/{}".format(
 			self.config["device_id"])
-
 	def _publish(self, client, payload, label):
 		try:
 			body = json.dumps(payload)
 			client.publish(self._topic(), body, 1)
-			print("[OTA][MQTT] {}发布成功：qos=1 内容={}".format(label, body))
 			return True
 		except Exception as error:
-			print("[OTA][MQTT] {}发布失败：{}".format(label, error))
 			return False
-
 	def _publish_query_with_reconnect(self, client, payload):
 		if self._publish(client, payload, "版本查询"):
 			return client, True
 		for retry in range(1, MQTT_RECONNECT_MAX_RETRIES + 1):
 			if self._cancelled():
 				return client, False
-			print("[OTA][MQTT] 版本查询发布失败，{}ms后第{}/{}次重连".format(
-				MQTT_RECONNECT_INTERVAL_MS, retry,
-				MQTT_RECONNECT_MAX_RETRIES))
 			self._close_client(client)
 			self._sleep_cancelable(MQTT_RECONNECT_INTERVAL_MS)
 			client = self._connect_with_retries(0)
 			if client is not None and self._publish(client, payload, "版本查询"):
 				return client, True
 		return client, False
-
 	def _mqtt_callback(self, topic, message=None):
 		if message is None:
 			return
@@ -406,14 +337,10 @@ class OTAService:
 			topic_text = topic.decode() if hasattr(topic, "decode") else str(topic)
 			message_text = (message.decode() if hasattr(message, "decode")
 				else str(message))
-			print("[OTA][MQTT] 收到原始消息：topic={} 内容={}".format(
-				topic_text, message_text))
 			data = json.loads(message_text)
 		except Exception as error:
-			print("[OTA][MQTT] 消息解析失败，已过滤：{}".format(error))
 			return
 		if topic_text != self._topic():
-			print("[OTA][MQTT] topic不匹配，已过滤")
 			return
 		try:
 			response_request_id = int(data.get("request_id", -1))
@@ -428,15 +355,10 @@ class OTAService:
 		)
 		for valid, reason in checks:
 			if not valid:
-				print("[OTA][MQTT] {}，已过滤".format(reason))
 				return
 		self._response = data
-		print("[OTA][MQTT] 收到有效版本查询应答：request_id={}".format(
-			self._request_id))
-
 	def _mqtt_error_callback(self, error):
-		print("[OTA][MQTT] 底层异常回调：{}".format(error))
-
+		pass
 	@staticmethod
 	def _socket_object(client):
 		for name in ("sock", "socket", "_sock", "_socket"):
@@ -444,7 +366,6 @@ class OTAService:
 			if value is not None:
 				return value
 		return None
-
 	@staticmethod
 	def _is_receive_timeout(error):
 		code = getattr(error, "errno", None)
@@ -460,7 +381,6 @@ class OTAService:
 		text = str(error).upper()
 		return ("EAGAIN" in text or "EWOULDBLOCK" in text or
 			"ETIMEDOUT" in text or "TIMED OUT" in text)
-
 	@staticmethod
 	def _set_receive_timeout(sock, remaining_ms):
 		seconds = max(0.001, float(remaining_ms) / 1000.0)
@@ -469,7 +389,6 @@ class OTAService:
 		except Exception:
 			# 少数固件只接受整数秒；向上取整避免提前超时。
 			sock.settimeout(max(1, (int(remaining_ms) + 999) // 1000))
-
 	def _wait_response(self, client, timeout_ms):
 		deadline = utime.ticks_add(utime.ticks_ms(), int(timeout_ms))
 		sock = self._socket_object(client)
@@ -500,7 +419,6 @@ class OTAService:
 					return "response", self._response, None
 				# 收到非目标MQTT报文时，按总截止时间继续阻塞等待。
 				utime.sleep_ms(1)
-
 		# 兼容拿不到底层Socket的umqtt封装；仍以同一个3秒截止时间为准。
 		checker = getattr(client, "check_msg", None)
 		if checker is None:
@@ -521,7 +439,6 @@ class OTAService:
 			if self._response is not None:
 				return "response", self._response, None
 			utime.sleep_ms(min(50, remaining))
-
 	def _validate_task(self, response):
 		task_id = str(response.get("task_id") or "").strip()
 		target_version = str(response.get("Upgrad_Software_Ver") or "").strip()
@@ -549,7 +466,6 @@ class OTAService:
 			"total_size": total_size,
 			"hardware_versions": response.get("Adapt_Hardware_Ver"),
 			"firmware_versions": response.get("Adapt_Firmware_Ver")}
-
 	def _handle_query_response(self, client, response):
 		if int(response.get("has_update") or 0) == 0:
 			print("[OTA][查询] 平台返回当前已是最新版本")
@@ -565,17 +481,11 @@ class OTAService:
 			return
 		self._task = task
 		snapshot = self.state.get_snapshot()[1]
-		print("[OTA][适配] 当前软件={} 硬件={} 固件={} 目标软件={} 适配硬件={} 适配固件={}".format(
-			snapshot["software_version"], snapshot["hardware_version"],
-			snapshot["firmware_version"], task["target_version"],
-			task["hardware_versions"], task["firmware_versions"]))
 		completed = self.persistent.completed_ota_status(task["task_id"])
 		pending = self.persistent.get("ota_pending")
 		if completed is not None or (isinstance(pending, dict) and
 				str(pending.get("task_id")) == task["task_id"]):
 			status = completed or pending.get("stage") or "device_busy"
-			print("[OTA][幂等] task_id={}已存在，状态={}，不重复执行".format(
-				task["task_id"], status))
 			self._report_status(client, status, task)
 			self._show_error("升级任务已处理")
 			return
@@ -614,10 +524,8 @@ class OTAService:
 			self._set_phase("rejected", query_active=False)
 			return
 		if decision != "accept":
-			print("[OTA] 查询页面已离开，不执行升级")
 			return
 		self._execute_upgrade(client, task)
-
 	def _report_status(self, client, status, task):
 		payload = {"schema_version": "1.1",
 			"deviceId": self.config["device_id"],
@@ -630,7 +538,6 @@ class OTAService:
 		if not ok:
 			print("[OTA][状态] 状态上报失败，不中断本地升级：{}".format(status))
 		return ok
-
 	def _execute_upgrade(self, client, task):
 		self._set_phase("preparing", query_active=False, busy=True)
 		self.state.publish_ota_event("progress", "开始升级")
@@ -651,15 +558,11 @@ class OTAService:
 			fota = self._new_fota()
 			remaining = list(task["files"])
 			for attempt in range(1, OTA_DOWNLOAD_MAX_ATTEMPTS + 1):
-				print("[OTA][下载] 第{}/{}次调用bulk_download".format(
-					attempt, OTA_DOWNLOAD_MAX_ATTEMPTS))
-				print("[OTA][下载] 本次下载文件={}".format(remaining))
 				try:
 					result = fota.bulk_download(info=remaining)
 				except Exception as error:
 					print("[OTA][下载] bulk_download抛出异常：{}".format(error))
 					result = list(remaining)
-				print("[OTA][下载] bulk_download原始返回值={}".format(result))
 				if result is None or result == [] or result == ():
 					remaining = []
 					break
@@ -674,6 +577,7 @@ class OTAService:
 			if remaining:
 				raise RuntimeError("三次下载后仍有失败文件：{}".format(remaining))
 			download_finished = True
+			print("[OTA][下载] 全部文件下载完成")
 			self._report_status(client, "download_complete", task)
 			self._set_phase("download_complete", busy=True)
 			self.state.publish_ota_event(
@@ -712,14 +616,12 @@ class OTAService:
 			utime.sleep_ms(OTA_ERROR_POPUP_DURATION_MS)
 			self.communication.restore_after_ota_failure(self._saved_group_id)
 			self._set_phase("upgrade_fail", busy=False)
-
 	def _new_fota(self):
 		if self.fota_factory is not None:
 			return self.fota_factory()
 		if app_fota is None:
 			raise RuntimeError("app_fota模块不可用")
 		return app_fota.new()
-
 	def _save_pending_report(self, task, status):
 		metadata = {"task_id": task["task_id"],
 			"request_id": task.get("request_id", 0),
@@ -728,7 +630,6 @@ class OTAService:
 			"pending_report": True}
 		if not self.persistent.save_ota_pending(metadata):
 			print("[OTA][状态] 待补报状态保存失败：{}".format(status))
-
 	@staticmethod
 	def _failed_files(result, original):
 		items = list(result) if isinstance(result, (list, tuple)) else [result]
@@ -751,14 +652,12 @@ class OTAService:
 				if value not in failed:
 					failed.append(value)
 		return failed
-
 	def _restart(self):
 		if self.restart_callback is not None:
 			return self.restart_callback()
 		if Power is None or not hasattr(Power, "powerRestart"):
 			raise RuntimeError("设备重启接口不可用")
 		return Power.powerRestart()
-
 	def _post_boot_worker(self, pending):
 		client = None
 		try:
@@ -801,7 +700,6 @@ class OTAService:
 		finally:
 			self._close_client(client)
 			self._finish_thread()
-
 	def _sleep_cancelable(self, duration_ms, cancelable=True):
 		deadline = utime.ticks_add(utime.ticks_ms(), int(duration_ms))
 		while utime.ticks_diff(deadline, utime.ticks_ms()) > 0:
@@ -809,7 +707,6 @@ class OTAService:
 				return False
 			utime.sleep_ms(50)
 		return True
-
 	@staticmethod
 	def _close_client(client):
 		if client is None:

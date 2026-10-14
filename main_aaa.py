@@ -1,9 +1,6 @@
 # -*- coding: utf-8 -*-
 from machine import Pin
 Pin(Pin.GPIO38, Pin.OUT, Pin.PULL_PD , 1)
-# 正式设备把所有业务模块平铺到 /usr；直接按模块名导入。不要用一个
-# 大范围备用导入捕获 ImportError，否则任一依赖缺失都会被误报成
-# “no module named poc_ui”，掩盖真正缺少的文件或固件模块。
 from usr.font_port import mount_external_flash
 from usr.ui_app import main as start_ui
 from usr.ui_commands import UICommandQueue
@@ -20,28 +17,20 @@ from usr.hardware_key_port import HardwareKeyPort
 from usr.config_store import PersistentConfig
 from usr.ota_service import OTAService
 from machine import WDT
-
-
-# ============================ 设备端配置 ============================
-
 SERVER_MODE_PUBLIC = 0
 SERVER_MODE_PRIVATE = 1
-SERVER_MODE = SERVER_MODE_PUBLIC
-
-DEVICE_ID = "33030002002000000590"
+SERVER_MODE = SERVER_MODE_PRIVATE
+DEVICE_ID = "YNPOC110160930100012"
 TCP_SERVER_PORT = 6060
 RTP_LOCAL_PORT = 4001
-
 PUBLIC_TCP_HOST = "125.124.233.231"
 PUBLIC_HTTP_BASE = "http://125.124.233.231:18081"
 PRIVATE_TCP_HOST = "68.95.0.31"
 PRIVATE_HTTP_BASE = "http://68.95.0.31:38080"
 PUBLIC_MQTT_HOST = "125.124.233.231"
 PUBLIC_MQTT_PORT = 1883
-# 专网MQTT地址是占位值，拿到正式参数后只需修改这里。
 PRIVATE_MQTT_HOST = "68.95.0.31"
 PRIVATE_MQTT_PORT = 1883
-
 PTT_GPIO = 29
 SPEAKER_ENABLE_GPIO = 27
 VOLUME_UP_GPIO = 30
@@ -50,14 +39,12 @@ SCREEN_CONTROL_GPIO = 5
 LAMP_CONTROL_GPIO = 28
 BATTERY_CHARGE_GPIO = 14
 BATTERY_FULL_GPIO = 13
-SOFTWARE_VERSION = "1.5.4"  # 当前新架构项目版本，不沿用旧程序的软件版本号。
-HARDWARE_VERSION = "1.0.1"  # 沿用旧入口的板级硬件版本。
+SOFTWARE_VERSION = "1.5.8"
+HARDWARE_VERSION = "1.0.1"
 GNSS_SAMPLE_UPLOAD_INTERVAL_MS = 30000
 GNSS_CHANGE_THRESHOLD_M = 5.0
 WATCHDOG_TIMEOUT_S = 20
 WATCHDOG_FEED_INTERVAL_MS = 5000
-
-
 def selected_server():
 	if SERVER_MODE == SERVER_MODE_PUBLIC:
 		return {
@@ -90,8 +77,6 @@ def selected_server():
 			"udp_local_port": RTP_LOCAL_PORT,
 		}
 	raise ValueError("SERVER_MODE配置无效")
-
-
 def _make_services(state_store, message_bus, command_queue, communication,
 				   persistent_config):
 	battery = BatteryMonitor(
@@ -125,13 +110,8 @@ def _make_services(state_store, message_bus, command_queue, communication,
 		motion_sensor, worker.notify_double_click, int1_pin=25,
 		double_click_enabled=state_store.get_snapshot()[1]["double_click_enabled"])
 	return battery, network, lamp, motion_sensor, worker, sensor_service
-
-
 def start():
 	server = selected_server()
-	print("[正式入口] 启动，环境={} 设备ID={} TCP={}:{} UDP本地端口={}".format(
-		server["mode_name"], DEVICE_ID, server["tcp_host"],
-		server["tcp_port"], server["udp_local_port"]))
 	# 字库必须先挂载，随后 UI 才会创建 LVGL 文字对象。
 	mount_external_flash()
 	persistent_config = PersistentConfig()
@@ -152,13 +132,9 @@ def start():
 		persistent_config)
 	(battery, network, lamp, motion_sensor,
 	 worker, sensor_service) = services
-	print("[正式入口] UI硬件服务已创建：电池、网络、肩灯={}、加速度、音量键、低优先级Worker".format(
-		"可用" if lamp is not None else "不可用，已跳过"))
 	watchdog = None
 	try:
 		watchdog = WDT(WATCHDOG_TIMEOUT_S)
-		print("[看门狗] 已启动：超时={}秒，UI主循环每{}毫秒喂狗".format(
-			WATCHDOG_TIMEOUT_S, WATCHDOG_FEED_INTERVAL_MS))
 	except Exception as error:
 		print("[看门狗] 启动失败，程序继续运行：{}".format(error))
 	return start_ui(
@@ -175,7 +151,5 @@ def start():
 		initial_police_no=settings["police_no"],
 		watchdog=watchdog,
 		watchdog_feed_interval_ms=WATCHDOG_FEED_INTERVAL_MS)
-
-
 if __name__ == "__main__":
 	start()

@@ -1,9 +1,6 @@
 # -*- coding: utf-8 -*-
-
 import lvgl as lv
 from machine import LCD
-
-
 LCD_WIDTH = 296
 LCD_HEIGHT = 240
 DISPLAY_BUFFER_LINES = 100
@@ -12,10 +9,8 @@ DISPLAY_BOOT_CLEAR_LINES = 20
 # EC800M 图片缓存容量（缓存项数量，不是字节数）。页面图片统一使用
 # 标准 JPG，缓存初始化放在显示层，避免页面或业务线程重复清空缓存。
 IMAGE_CACHE_SIZE = 12
-
 XSTART_H, XSTART_L, YSTART_H, YSTART_L = 0xF0, 0xF1, 0xF2, 0xF3
 XEND_H, XEND_L, YEND_H, YEND_L = 0xE0, 0xE1, 0xE2, 0xE3
-
 _INIT = (
 	0, 0, 0x01, 2, 0, 120,
 	0, 0, 0x11, 2, 0, 120,
@@ -51,10 +46,7 @@ _INVALID_P = bytearray((
 	1, 1, YEND_H, 1, 1, YEND_L,
 	0, 0, 0x2C,
 ))
-
-
 class DisplayPort:
-
 	def __init__(self, width=LCD_WIDTH, height=LCD_HEIGHT,
 				 buffer_lines=DISPLAY_BUFFER_LINES):
 		self.width = int(width)
@@ -65,7 +57,6 @@ class DisplayPort:
 		self.draw_buffer_bytes = None
 		self.display_driver = None
 		self.display = None
-
 	def start(self):
 		self.lcd = LCD()
 		self.lcd.lcd_init(
@@ -80,7 +71,6 @@ class DisplayPort:
 			# 个别固件若不支持启动清屏，不阻断 LVGL 页面启动。
 			pass
 		lv.init()
-		# 图片缓存只在 LVGL 初始化后设置一次。
 		try:
 			lv.img.cache_invalidate_src(None)
 			lv.img.cache_set_size(IMAGE_CACHE_SIZE)
@@ -106,7 +96,6 @@ class DisplayPort:
 		self.display_driver.ver_res = self.height
 		self.display = self.display_driver.register()
 		return self
-
 	def enter_sleep(self):
 		if self.lcd is None:
 			return False
@@ -115,7 +104,6 @@ class DisplayPort:
 		except Exception:
 			return False
 		return True
-
 	def leave_sleep(self):
 		if self.lcd is None:
 			return False
@@ -124,7 +112,6 @@ class DisplayPort:
 		except Exception:
 			return False
 		return True
-
 	def _clear_display_memory(self):
 		block_lines = min(DISPLAY_BOOT_CLEAR_LINES, self.height)
 		clear_block = bytearray(self.width * block_lines * 2)
@@ -135,7 +122,6 @@ class DisplayPort:
 					bytearray(self.width * lines * 2))
 			self.lcd.lcd_write(data, 0, y, self.width - 1, y + lines - 1)
 			y += lines
-
 	def present_initial_frame(self):
 		try:
 			lv.refr_now(self.display)
@@ -145,9 +131,7 @@ class DisplayPort:
 				lv.task_handler()
 			except Exception:
 				pass
-
 	def tick(self, elapsed_ms):
 		lv.tick_inc(max(0, int(elapsed_ms)))
-
 	def task_handler(self):
 		lv.task_handler()
