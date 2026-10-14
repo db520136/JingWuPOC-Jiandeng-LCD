@@ -16,11 +16,12 @@ from usr.device_port import DevicePort
 from usr.hardware_key_port import HardwareKeyPort
 from usr.config_store import PersistentConfig
 from usr.ota_service import OTAService
+from usr.device_identity import get_identity
 from machine import WDT
 SERVER_MODE_PUBLIC = 0
 SERVER_MODE_PRIVATE = 1
 SERVER_MODE = SERVER_MODE_PRIVATE
-DEVICE_ID = "YNPOC110160930100012"
+DEVICE_ID, HARDWARE_VERSION = get_identity()
 TCP_SERVER_PORT = 6060
 RTP_LOCAL_PORT = 4001
 PUBLIC_TCP_HOST = "125.124.233.231"
@@ -39,8 +40,7 @@ SCREEN_CONTROL_GPIO = 5
 LAMP_CONTROL_GPIO = 28
 BATTERY_CHARGE_GPIO = 14
 BATTERY_FULL_GPIO = 13
-SOFTWARE_VERSION = "1.5.10"
-HARDWARE_VERSION = "1.0.1"
+SOFTWARE_VERSION = "1.5.11"
 GNSS_SAMPLE_UPLOAD_INTERVAL_MS = 30000
 GNSS_CHANGE_THRESHOLD_M = 5.0
 WATCHDOG_TIMEOUT_S = 20

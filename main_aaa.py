@@ -39,7 +39,7 @@ SCREEN_CONTROL_GPIO = 5
 LAMP_CONTROL_GPIO = 28
 BATTERY_CHARGE_GPIO = 14
 BATTERY_FULL_GPIO = 13
-SOFTWARE_VERSION = "1.5.8"
+SOFTWARE_VERSION = "1.5.10"
 HARDWARE_VERSION = "1.0.1"
 GNSS_SAMPLE_UPLOAD_INTERVAL_MS = 30000
 GNSS_CHANGE_THRESHOLD_M = 5.0
@@ -151,5 +151,8 @@ def start():
 		initial_police_no=settings["police_no"],
 		watchdog=watchdog,
 		watchdog_feed_interval_ms=WATCHDOG_FEED_INTERVAL_MS)
+import utime
 if __name__ == "__main__":
+	while 1:
+		utime.sleep_ms(3000)
 	start()
