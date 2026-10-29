@@ -175,6 +175,8 @@ class DevicePort:
 				self.gnss_initialized = False
 			return result
 		raw = quecgnss.read(4096)
+		if raw == -1:
+			return result
 		if isinstance(raw, (tuple, list)):
 			raw = raw[1] if len(raw) >= 2 else b""
 		text = raw if isinstance(raw, str) else bytes(raw or b"").decode("ascii")
@@ -187,7 +189,10 @@ class DevicePort:
 		for line in lines:
 			if line.startswith("$") and line[3:6] == "GGA":
 				try:
-					result.update(parse_gga(line))
+					parsed = parse_gga(line)
 				except ValueError:
 					continue
+				# 无效GGA不能覆盖本次读取中已有的有效定位。
+				if parsed["fix"] or not result["fix"]:
+					result.update(parsed)
 		return result

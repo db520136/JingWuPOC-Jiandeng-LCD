@@ -162,6 +162,7 @@ class PageFactory:
 		self.app = app
 		self._status_labels = {}
 		self._location_labels = {}
+		self._location_label_values = {}
 		self._location_detail_voltage_label = None
 		self._location_detail_name_label = None
 		self._device_version_labels = {}
@@ -456,6 +457,29 @@ class PageFactory:
 			duration_ms, signature or ("key_notice", str(text)))
 	def can_show_low_priority_popup(self):
 		return self._popup_mode is None and self._pending_confirm is None
+	def hide_checkin_popup(self):
+		if (isinstance(self._popup_signature, tuple) and
+				self._popup_signature and self._popup_signature[0] == "checkin"):
+			self._hide_popup()
+	def show_checkin_popup(self, request_id, phase):
+		if self._pending_confirm is not None:
+			return False
+		if self._popup_mode is not None and not (
+				isinstance(self._popup_signature, tuple) and self._popup_signature and
+				self._popup_signature[0] == "checkin"):
+			return False
+		signature = ("checkin", request_id, phase)
+		if signature == self._popup_signature:
+			return True
+		active = phase in ("locating", "sending")
+		text = {"locating": "打卡中... ...", "sending": "打卡中... ...",
+			"location_failed": "打卡：定位失败", "send_failed": "打卡：发送失败",
+			"success": "打卡成功"}.get(phase)
+		if text is None:
+			return False
+		return self._show_popup("progress" if active else "transient", text,
+			None, GREEN if active or phase == "success" else RED, False,
+			None if active else 2000, signature)
 	def show_ota_progress(self, text, duration_ms=None, signature=None,
 						  locked=True):
 		return self._show_popup(
@@ -697,6 +721,7 @@ class PageFactory:
 		return page
 	def _make_location(self, page):
 		values = self._location_values(self._snapshot())
+		self._location_label_values = dict(values)
 		specs = values[:5]
 		ys = (3, 39, 75, 111, 147)
 		for index, item in enumerate(specs):
@@ -738,9 +763,10 @@ class PageFactory:
 		values = self._location_values(snapshot)
 		for key, value in values:
 			label = self._location_labels.get(key)
-			if label is not None:
+			if label is not None and self._location_label_values.get(key) != value:
 				label.set_text(str(value))
 				label.invalidate()
+				self._location_label_values[key] = value
 		if self._location_detail_voltage_label is not None:
 			self._location_detail_voltage_label.set_text("用户")
 			self._location_detail_voltage_label.invalidate()

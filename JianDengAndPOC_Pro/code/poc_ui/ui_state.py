@@ -28,6 +28,8 @@ class UIStateStore:
 			"battery_full_confirmed": False,
 			"gnss_state": None,
 			"gnss_fix": False,
+			"checkin_id": 0,
+			"checkin_phase": "idle",
 			"latitude": None,
 			"longitude": None,
 			"latitude_text": None,
@@ -77,7 +79,7 @@ class UIStateStore:
 			"lamp_mode": "off",
 			"lamp_brightness": 42,
 			"lamp_alarm_active": False,
-			"double_click_enabled": True,
+			"double_click_enabled": False,
 			"key_notice_revision": 0,
 			"key_notice_text": None,
 			"key_notice_success": True,
@@ -192,6 +194,11 @@ class UIStateStore:
 			"battery_charging": charging,
 			"battery_full_confirmed": bool(full_confirmed),
 		})
+	def update_location_clock(self, time_text, weekday):
+		return self._update({"location_time": time_text,
+			"location_weekday": weekday})
+	def update_checkin(self, request_id, phase):
+		return self._update({"checkin_id": request_id, "checkin_phase": phase})
 	def update_location(self, location_name, latitude, longitude, altitude,
 						satellites, location_time, location_weekday):
 		return self._update({
@@ -312,12 +319,11 @@ class UIStateStore:
 	def update_screen_sleeping(self, sleeping):
 		return self._update({"screen_sleeping": bool(sleeping)})
 	def update_gnss_location(self, state, fix, latitude, longitude, altitude,
-							 satellites, location_time, location_weekday,
+							 satellites,
 							 latitude_text=None, longitude_text=None):
 		return self._update({"gnss_state": state, "gnss_fix": bool(fix),
 			"latitude": latitude, "longitude": longitude, "altitude": altitude,
-			"satellites": satellites, "location_time": location_time,
-			"location_weekday": location_weekday,
+			"satellites": satellites,
 			"latitude_text": latitude_text,
 			"longitude_text": longitude_text})
 	def update_sleep_timeout(self, seconds):

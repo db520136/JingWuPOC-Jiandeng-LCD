@@ -77,6 +77,8 @@ class LogoutRequested(RuntimeError):
 	pass
 class ServerLogoutRequested(RuntimeError):
 	pass
+class CheckinCancelled(RuntimeError):
+	pass
 class CommunicationController:
 	def __init__(self, config, state_store, message_bus,
 				 project_name="JingWuPOC", project_version="1.0.0",
@@ -169,6 +171,11 @@ class CommunicationController:
 		self._gnss_empty_uploaded = False
 		self._gnss_last_uploaded_fix = None
 		self._gnss_deferred_result = None
+		self._gnss_generation = 0
+		self._checkin_lock = _thread.allocate_lock()
+		self._checkin = None
+		self._checkin_sequence = 0
+		self._manual_gnss_request = None
 	def start(self):
 		if self.running:
 			return False
@@ -180,6 +187,7 @@ class CommunicationController:
 		return True
 	def stop(self):
 		self.running = False
+		self._cancel_checkin()
 		self._signal()
 		self._close_resources()
 	def request_login(self, police_no):
@@ -463,6 +471,8 @@ class CommunicationController:
 		return accepted
 	def _begin_logout_isolation(self):
 		self._logout_requested = True
+		self._gnss_generation += 1
+		self._cancel_checkin()
 		self._auto_reconnect_enabled = False
 		self._stop_heartbeat_timer()
 		self.state.begin_logout()
@@ -500,12 +510,97 @@ class CommunicationController:
 		return accepted
 	def set_gnss_sample_request(self, callback):
 		self._gnss_sample_request = callback
+	def set_manual_gnss_request(self, callback):
+		self._manual_gnss_request = callback
+	def request_checkin(self):
+		self._checkin_lock.acquire()
+		try:
+			snapshot = self.state.get_snapshot()[1]
+			if (not self.running or self._checkin is not None or
+					self._guest_mode or self._logout_requested or self._server_logout_pending or
+					self._ota_busy or not self.police_no or not self._auto_reconnect_enabled or
+					not snapshot.get("business_page_active") or
+					self._manual_gnss_request is None):
+				return False
+			self._checkin_sequence += 1
+			ticket = {"id": self._checkin_sequence, "police_no": self.police_no,
+				"cancelled": False, "result": None}
+			self._checkin = ticket
+			self.state.update_checkin(ticket["id"], "locating")
+		finally:
+			self._checkin_lock.release()
+		try:
+			if not self._manual_gnss_request(ticket):
+				self._finish_checkin(ticket, "location_failed")
+		except Exception as error:
+			print("[打卡] 请求定位失败：{}".format(error))
+			self._finish_checkin(ticket, "location_failed")
+		return True
+	def _finish_checkin(self, ticket, phase):
+		self._checkin_lock.acquire()
+		try:
+			if ticket is None or self._checkin is not ticket:
+				return False
+			ticket["cancelled"] = True
+			self._checkin = None
+			self.state.update_checkin(ticket["id"], phase)
+			return True
+		finally:
+			self._checkin_lock.release()
+	def _cancel_checkin(self):
+		self._checkin_lock.acquire()
+		try:
+			if self._checkin is not None:
+				self._checkin["cancelled"] = True
+				self._checkin = None
+			# 也清除尚未显示的旧结果，防止下一次登录后补弹旧打卡提示。
+			self.state.update_checkin(self._checkin_sequence, "cancelled")
+		finally:
+			self._checkin_lock.release()
+	def _service_checkin(self):
+		ticket = self._checkin
+		if ticket is None or ticket.get("result") is None:
+			return
+		result = ticket["result"]
+		if not result.get("fix"):
+			self._finish_checkin(ticket, "location_failed")
+			return
+		if (self._logout_requested or self._server_logout_pending or self._ota_busy or
+				self.police_no != ticket["police_no"]):
+			self._finish_checkin(ticket, "cancelled")
+			return
+		if (self._reconnect_pending or not self.connection_ready() or
+				self.login_state not in (STATE_LOGGED_IN, STATE_JOINED)):
+			self._finish_checkin(ticket, "send_failed")
+			return
+		if self._gnss_send_busy():
+			return
+		session = self.session
+		if session is not None:
+			session.control_busy = True
+		try:
+			if self._upload_gnss(result):
+				self._finish_checkin(ticket, "success")
+			else:
+				self._finish_checkin(ticket, "send_failed")
+		except (LogoutRequested, ServerLogoutRequested, CheckinCancelled):
+			self._finish_checkin(ticket, "cancelled")
+		except Exception as error:
+			print("[打卡] TCP定位发送失败：{}".format(error))
+			self._finish_checkin(ticket, "send_failed")
+		finally:
+			if (self._active_tcp_transaction is not None and
+					self._active_tcp_transaction.get("checkin_ticket") is ticket):
+				self._active_tcp_transaction = None
+			if self.session is session and session is not None and not self._logout_requested:
+				session.control_busy = False
 	def set_screen_wake_request(self, callback):
 		self._screen_wake_request = callback
 	def prepare_for_ota(self, timeout_ms=30000):
 		if self._ota_busy:
 			return False, self._ota_saved_group_id, "OTA事务已在执行"
 		self._ota_busy = True
+		self._cancel_checkin()
 		self._ota_saved_group_id = self.group_id
 		self.state.update_ota_runtime(busy=True)
 		ticket = {"done": False, "ok": False, "error": None,
@@ -584,6 +679,8 @@ class CommunicationController:
 			return False
 		return self.enter_guest_mode(resume_login=False)
 	def enter_guest_mode(self, police_no=None, resume_login=True):
+		self._gnss_generation += 1
+		self._cancel_checkin()
 		self._directory_session_generation += 1
 		self._login_directory_context = None
 		self._http_pending_context = None
@@ -665,12 +762,25 @@ class CommunicationController:
 	def request_gnss_result(self, result):
 		if not isinstance(result, dict):
 			return False
+		ticket = result.get("checkin_ticket")
+		if ticket is not None:
+			self._checkin_lock.acquire()
+			try:
+				if self._checkin is not ticket or ticket.get("cancelled"):
+					return True
+				ticket["result"] = dict(result)
+				self.state.update_checkin(ticket["id"],
+					"sending" if result.get("fix") else "locating")
+			finally:
+				self._checkin_lock.release()
+			self._signal()
+			return True
 		return self._enqueue("gnss_result", dict(result))
 	def _request_gnss_sample(self, force):
 		if self._gnss_sample_request is None:
 			return False
 		try:
-			return bool(self._gnss_sample_request(bool(force)))
+			return bool(self._gnss_sample_request(bool(force), self._gnss_generation))
 		except Exception as error:
 			print("[定位] 请求GNSS采样失败：{}".format(error))
 			return False
@@ -827,6 +937,9 @@ class CommunicationController:
 		deadline = utime.ticks_add(utime.ticks_ms(), timeout_ms)
 		while self.running and utime.ticks_diff(deadline, utime.ticks_ms()) > 0:
 			transaction = self._active_tcp_transaction or {}
+			checkin_ticket = transaction.get("checkin_ticket")
+			if checkin_ticket is not None and checkin_ticket.get("cancelled"):
+				raise CheckinCancelled("手动打卡已取消")
 			if self._logout_requested and not transaction.get("logout"):
 				raise LogoutRequested("用户已确认退出登录")
 			# 正式入口的 PTT 状态机与本线程共用执行上下文；登录/入组
@@ -879,10 +992,13 @@ class CommunicationController:
 			utime.sleep_ms(5)
 		return None
 	def _send_tcp_transaction(self, command, packet, ack_type, request_count,
-							  label, until_single_cleared=None, logout=False):
+							  label, until_single_cleared=None, logout=False,
+							  checkin_ticket=None):
 		if self._logout_requested and not logout:
 			raise LogoutRequested("用户已确认退出登录")
 		for attempt in range(TCP_MAX_RETRIES + 1):
+			if checkin_ticket is not None and checkin_ticket.get("cancelled"):
+				raise CheckinCancelled("手动打卡已取消")
 			if self._logout_requested and not logout:
 				raise LogoutRequested("用户已确认退出登录")
 			wait_ms = min(
@@ -895,12 +1011,14 @@ class CommunicationController:
 				"request_cnt": int(request_count),
 				"attempt": attempt, "attempt_text": attempt_text,
 				"logout": bool(logout),
+				"checkin_ticket": checkin_ticket,
 			}
 			if self.runtime is None or not self.runtime.running:
 				if not logout:
 					self._schedule_reconnect("{}发送前连接已失效".format(label))
 				raise TCPReconnectScheduled("TCP连接已失效")
-			if not self.runtime.submit(command, packet):
+			submitted = self.runtime.submit(command, packet)
+			if not submitted:
 				if not logout:
 					self._schedule_reconnect("{}命令入队失败".format(label))
 				raise TCPReconnectScheduled("{}命令入队失败".format(label))
@@ -1473,11 +1591,17 @@ class CommunicationController:
 		except Exception as error:
 			self._schedule_reconnect("TCP心跳应答超时")
 	def _upload_gnss(self, result):
+		manual = result.get("checkin_ticket") is not None
+		if manual and (self._checkin is not result["checkin_ticket"] or
+				result["checkin_ticket"].get("cancelled")):
+			return False
 		if (self.login_state not in (STATE_LOGGED_IN, STATE_JOINED) or
 				self.runtime is None or not self.runtime.running or
 				self._reconnect_pending):
 			return False
 		fix = bool(result.get("fix"))
+		if manual and not fix:
+			return False
 		raw_gga = result.get("raw_gga") or b""
 		if isinstance(raw_gga, str):
 			raw_gga = raw_gga.encode("ascii")
@@ -1491,7 +1615,8 @@ class CommunicationController:
 			raw_gga = b""
 		count = self.request_count
 		packet = build_frame(MSG_GNSS_UPLOAD, count,
-			build_gnss_upload_payload(self.config["device_id"], raw_gga))
+			build_gnss_upload_payload(self.config["device_id"], raw_gga,
+				1 if manual else 0))
 		print("[定位] TCP定位发送包：request_cnt={} 数据={}".format(
 			count, ubinascii.hexlify(packet).decode("ascii").upper()))
 		self.request_count = (count + 1) & 0xFFFF
@@ -1499,8 +1624,10 @@ class CommunicationController:
 			self.session.next_request_count = self.request_count
 		frame = self._send_tcp_transaction(
 			CMD_GNSS_UPLOAD, packet, MSG_GNSS_UPLOAD_ACK, count,
-			"0x0D定位上报")
+			"0x0D定位上报", checkin_ticket=result.get("checkin_ticket"))
 		parse_gnss_upload_ack(frame["payload"])
+		if manual:
+			return True
 		if fix:
 			self._gnss_last_uploaded_fix = {
 				"latitude": result.get("latitude"),
@@ -1521,6 +1648,8 @@ class CommunicationController:
 			snapshot["floor_state"] in floor_busy_states or
 			snapshot["single_state"] != "idle")
 	def _process_gnss_result(self, result):
+		if result.get("session_generation", self._gnss_generation) != self._gnss_generation:
+			return False
 		if self._gnss_send_busy():
 			self._gnss_deferred_result = dict(result)
 			return False
@@ -1536,6 +1665,7 @@ class CommunicationController:
 		self._gnss_deferred_result = None
 		return True
 	def _release_runtime(self, close_audio=False):
+		self._finish_checkin(self._checkin, "send_failed")
 		self._gnss_deferred_result = None
 		if self.runtime is not None or self.tcp_socket is not None:
 			pass
@@ -1768,6 +1898,8 @@ class CommunicationController:
 			self._handle_single_dissolve(payload)
 		elif kind == "server_logout_requested":
 			self._server_logout_pending = True
+			self._gnss_generation += 1
+			self._cancel_checkin()
 			self._auto_reconnect_enabled = False
 			self.login_result = None
 			self.force_login_stage = "idle"
@@ -1875,6 +2007,8 @@ class CommunicationController:
 			self.session.active_audio_group_id is not None,
 			snapshot["audio_volume"])
 		if self._gnss_sampling_started and not self._gnss_send_busy():
+			if self._checkin is not None:
+				self._signal()
 			self._flush_deferred_gnss()
 			# 若30秒截止点落在通话中，通话结束后立即唤醒低优先级
 			# Worker；未到期时该Worker只检查截止时间，不读取GNSS。
@@ -2000,6 +2134,7 @@ class CommunicationController:
 		self._publish_error("释放麦权失败")
 		return False
 	def _complete_login(self, auto_join_first=True, resume_group=None):
+		self._gnss_generation += 1
 		self._guest_mode = False
 		self._fixed_guest_mode = False
 		self._guest_resume_police_no = None
@@ -2424,6 +2559,7 @@ class CommunicationController:
 					break
 				if self.session is not None:
 					self.session.poll_once()
+				self._service_checkin()
 				if not self._server_logout_pending:
 					self._finish_floor_transaction()
 				send_error = self._take_tcp_send_failure()

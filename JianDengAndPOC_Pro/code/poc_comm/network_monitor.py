@@ -22,11 +22,26 @@ except Exception:
 	checkNet = None
 SIGNAL_REFRESH_INTERVAL_MS = 30000
 NETWORK_DIRECT_STATUS = True
+KEY_NETWORK_DIAGNOSTIC = False
 SIGNAL_VERY_WEAK = "极弱"
 SIGNAL_WEAK = "弱"
 SIGNAL_GENERAL = "一般"
 SIGNAL_STRONG = "强"
 SIGNAL_VERY_GOOD = "极好"
+def _diagnostic_network_call(label, callback, *args):
+	if not KEY_NETWORK_DIAGNOSTIC:
+		return callback(*args)
+	print("[按键调度诊断][网络] 开始={} t={}ms".format(label, utime.ticks_ms()))
+	started = utime.ticks_ms()
+	succeeded = False
+	try:
+		result = callback(*args)
+		succeeded = True
+		return result
+	finally:
+		finished = utime.ticks_ms()
+		print("[按键调度诊断][网络] 结束={} 正常返回={} 耗时={}ms 起止={}/{}ms".format(
+			label, succeeded, utime.ticks_diff(finished, started), started, finished))
 def classify_signal(signal):
 	try:
 		value = int(signal)
@@ -83,7 +98,7 @@ class NetworkMonitor:
 		if sim is None:
 			return None
 		try:
-			value = sim.getIccid()
+			value = _diagnostic_network_call("sim.getIccid", sim.getIccid)
 			if value is None:
 				return None
 			if isinstance(value, bytes):
@@ -98,7 +113,7 @@ class NetworkMonitor:
 		if net is None:
 			return None
 		try:
-			value = net.getSignal()
+			value = _diagnostic_network_call("net.getSignal", net.getSignal)
 			if isinstance(value, (tuple, list)):
 				if len(value) < 2 or not isinstance(value[1], (tuple, list)):
 					return None
@@ -121,7 +136,7 @@ class NetworkMonitor:
 			net_ready = None
 			data_ready = None
 			if NETWORK_DIRECT_STATUS and net is not None:
-				net_state = net.getState()
+				net_state = _diagnostic_network_call("net.getState", net.getState)
 				if isinstance(net_state, (tuple, list)):
 					if (len(net_state) >= 2 and
 							not isinstance(net_state[1], (tuple, list))):
@@ -136,7 +151,7 @@ class NetworkMonitor:
 				elif net_state is not None:
 					net_ready = int(net_state) == 1
 			if NETWORK_DIRECT_STATUS and dataCall is not None:
-				data_state = dataCall.getInfo(1, 0)
+				data_state = _diagnostic_network_call("dataCall.getInfo", dataCall.getInfo, 1, 0)
 				if isinstance(data_state, (tuple, list)):
 					if (len(data_state) > 2 and
 							isinstance(data_state[2], (tuple, list))):
@@ -160,7 +175,7 @@ class NetworkMonitor:
 			else:
 				if checkNet is None:
 					raise RuntimeError("网络状态接口不可用")
-				stage, state = checkNet.waitNetworkReady(1)
+				stage, state = _diagnostic_network_call("checkNet.waitNetworkReady", checkNet.waitNetworkReady, 1)
 				connected = (stage == 3 and state == 1)
 			self.last_error = None
 		except Exception as exc:

@@ -30,7 +30,7 @@ class UICommandQueue:
 	def __init__(self, max_length=24):
 		self.max_length = max(1, int(max_length))
 		self._lock = _thread.allocate_lock()
-		self._wake = _thread.allocate_semphore(1)
+		self._wake = _thread.allocate_lock()
 		self._wake.acquire()
 		self._wake_pending = False
 		self._double_click_signal_count = 0
@@ -42,17 +42,21 @@ class UICommandQueue:
 		self._screen_timeout_pending = False
 		self._hardware_key_signal_count = 0
 		self._hardware_key_taken_count = 0
-		self._lamp_key_long_pending = False
 		self._ui_busy = False
+		self.ui_busy_callback = None
 		self._sequence = 0
 		self._items = []
 	def _release_once_isr(self):
 		if self._wake_pending:
 			return False
 		self._wake_pending = True
-		self._wake.release()
+		try:
+			self._wake.release()
+		except Exception:
+			# A token may already be available if a concurrent wake raced this flag.
+			return False
 		return True
-	def put(self, command_type, payload=None, priority=PRIORITY_P2):
+	def put(self, command_type, payload=None, priority=PRIORITY_P2, defer_if_busy=False):
 		item = {
 			"type": str(command_type),
 			"payload": payload,
@@ -65,7 +69,7 @@ class UICommandQueue:
 			if len(self._items) >= self.max_length:
 				return False
 			self._items.append(item)
-			should_wake = not self._wake_pending
+			should_wake = not self._wake_pending and (not defer_if_busy or not self._ui_busy)
 			if should_wake:
 				self._wake_pending = True
 		finally:
@@ -93,7 +97,7 @@ class UICommandQueue:
 		if should_wake:
 			self._wake.release()
 		return True
-	def put_latest(self, command_type, payload=None, priority=PRIORITY_P2):
+	def put_latest(self, command_type, payload=None, priority=PRIORITY_P2, defer_if_busy=False):
 		self._lock.acquire()
 		try:
 			for item in self._items:
@@ -105,7 +109,7 @@ class UICommandQueue:
 			self._items.append({"type": str(command_type), "payload": payload,
 				"priority": int(priority), "sequence": self._sequence})
 			self._sequence += 1
-			should_wake = not self._wake_pending
+			should_wake = not self._wake_pending and (not defer_if_busy or not self._ui_busy)
 			if should_wake:
 				self._wake_pending = True
 		finally:
@@ -118,10 +122,6 @@ class UICommandQueue:
 		self._release_once_isr()
 	def signal_hardware_key_isr(self):
 		self._hardware_key_signal_count += 1
-		self._release_once_isr()
-		return True
-	def signal_lamp_key_long_isr(self):
-		self._lamp_key_long_pending = True
 		self._release_once_isr()
 		return True
 	def is_ui_busy(self):
@@ -148,7 +148,7 @@ class UICommandQueue:
 		try:
 			self._ui_busy = busy
 			if (not busy and
-					self._periodic_signal_count != self._periodic_taken_count and
+					(self._periodic_signal_count != self._periodic_taken_count or self._items) and
 					not self._wake_pending):
 				self._wake_pending = True
 				should_wake = True
@@ -156,6 +156,8 @@ class UICommandQueue:
 			self._lock.release()
 		if should_wake:
 			self._wake.release()
+		if self.ui_busy_callback is not None:
+			self.ui_busy_callback(busy)
 		return should_wake
 	def take_events(self):
 		self._lock.acquire()
@@ -175,8 +177,6 @@ class UICommandQueue:
 			hardware_key_signal_count = self._hardware_key_signal_count
 			hardware_key_pending = (hardware_key_signal_count !=
 									self._hardware_key_taken_count)
-			lamp_key_long_pending = self._lamp_key_long_pending
-			self._lamp_key_long_pending = False
 			self._stop_pending = False
 			if double_click_pending:
 				self._double_click_taken_count = double_click_signal_count
@@ -193,11 +193,9 @@ class UICommandQueue:
 			result = (stop_pending, double_click_pending,
 					periodic_pending, periodic_deferred,
 					double_click_count, periodic_count, items,
-					screen_timeout_pending, hardware_key_pending,
-					lamp_key_long_pending)
+					screen_timeout_pending, hardware_key_pending)
 			# 取批次期间可能又有 ISR/Timer 事件，以计数器为准补一次唤醒。
 			follow_up = (self._stop_pending or self._screen_timeout_pending or
-						 self._lamp_key_long_pending or
 						 self._double_click_signal_count !=
 						 self._double_click_taken_count or
 						 self._hardware_key_signal_count !=
@@ -205,11 +203,12 @@ class UICommandQueue:
 						 (self._periodic_signal_count !=
 						  self._periodic_taken_count and not self._ui_busy) or
 						 bool(self._items))
-			if follow_up:
+			wake_follow_up = follow_up and not self._wake_pending
+			if wake_follow_up:
 				self._wake_pending = True
 		finally:
 			self._lock.release()
-		if follow_up:
+		if wake_follow_up:
 			self._wake.release()
 		return result
 	def pending_count(self):
@@ -217,7 +216,6 @@ class UICommandQueue:
 		try:
 			return (len(self._items) +
 					(1 if self._screen_timeout_pending else 0) +
-					(1 if self._lamp_key_long_pending else 0) +
 					(1 if self._hardware_key_signal_count !=
 					 self._hardware_key_taken_count else 0) +
 					(1 if self._double_click_signal_count !=
@@ -229,6 +227,8 @@ class UICommandQueue:
 			self._lock.release()
 	def wait(self):
 		self._wake.acquire()
+	def try_wait(self):
+		return bool(self._wake.acquire(0))
 	def wake(self):
 		self._lock.acquire()
 		try:

@@ -1,7 +1,23 @@
 # -*- coding: utf-8 -*-
 from machine import Pin
+from misc import Power
 RUN_INDICATOR = Pin(Pin.GPIO38, Pin.OUT, Pin.PULL_PD, 1)
 from usr.font_port import mount_external_flash
+from usr.ui_app import main as start_ui
+from usr.ui_commands import UICommandQueue
+from usr.ui_messages import UIMessageBus
+from usr.ui_state import UIStateStore
+from usr.low_priority_worker import LowPriorityWorker
+from usr.battery_monitor import BatteryMonitor
+from usr.network_monitor import NetworkMonitor
+from usr.et6312b import initialize_shoulder_lamp
+from usr.sc7a20h import SC7A20H, SC7A20HDoubleClickAdapter, SCALE_4G
+from usr.communication_controller import CommunicationController
+from usr.device_port import DevicePort
+from usr.hardware_key_port import HardwareKeyPort
+from usr.config_store import PersistentConfig
+from usr.ota_service import OTAService
+from machine import WDT
 SERVER_MODE_PUBLIC = 0
 SERVER_MODE_PRIVATE = 1
 SERVER_MODE = SERVER_MODE_PRIVATE
@@ -25,7 +41,7 @@ SCREEN_CONTROL_GPIO = 5
 LAMP_CONTROL_GPIO = 28
 BATTERY_CHARGE_GPIO = 14
 BATTERY_FULL_GPIO = 13
-SOFTWARE_VERSION = "1.5.11"
+SOFTWARE_VERSION = "1.5.13"
 GNSS_SAMPLE_UPLOAD_INTERVAL_MS = 30000
 GNSS_CHANGE_THRESHOLD_M = 5.0
 WATCHDOG_TIMEOUT_S = 20
@@ -74,13 +90,6 @@ def selected_server():
 	raise ValueError("SERVER_MODE配置无效")
 def _make_services(state_store, message_bus, command_queue, communication,
 				   persistent_config):
-	from usr.low_priority_worker import LowPriorityWorker
-	from usr.battery_monitor import BatteryMonitor
-	from usr.network_monitor import NetworkMonitor
-	from usr.et6312b import initialize_shoulder_lamp
-	from usr.sc7a20h import SC7A20H, SC7A20HDoubleClickAdapter, SCALE_4G
-	from usr.device_port import DevicePort
-	from usr.hardware_key_port import HardwareKeyPort
 	battery = BatteryMonitor(
 		nchrg_gpio=BATTERY_CHARGE_GPIO,
 		nstdby_gpio=BATTERY_FULL_GPIO,
@@ -99,10 +108,12 @@ def _make_services(state_store, message_bus, command_queue, communication,
 		device=DevicePort(SOFTWARE_VERSION, HARDWARE_VERSION, DEVICE_ID),
 		key_action_callback=communication.request_hardware_key,
 		gnss_result_callback=communication.request_gnss_result,
+		checkin_request_callback=communication.request_checkin,
 		persistent_config=persistent_config,
 		gnss_interval_ms=GNSS_SAMPLE_UPLOAD_INTERVAL_MS,
 		gnss_change_threshold_m=GNSS_CHANGE_THRESHOLD_M)
 	communication.set_gnss_sample_request(worker.request_gnss_sample)
+	communication.set_manual_gnss_request(worker.request_manual_gnss)
 	communication.set_screen_wake_request(worker.request_screen_wake)
 	hardware_keys = HardwareKeyPort(
 		worker.notify_hardware_key, VOLUME_UP_GPIO, VOLUME_DOWN_GPIO,
@@ -115,22 +126,17 @@ def _make_services(state_store, message_bus, command_queue, communication,
 def start():
 	# 字库必须先挂载，随后 UI 才会创建 LVGL 文字对象。
 	mount_external_flash()
-	from usr.config_store import PersistentConfig
 	persistent_config = PersistentConfig()
 	device_id, hardware_version = get_identity(persistent_config)
 	_set_identity(device_id, hardware_version)
+	print("开机原因：",Power.powerOnReason())
+	print("关机原因：",Power.powerDownReason())
 	if device_id is None or hardware_version is None:
 		# 未经上位机确认的身份不得启动业务，也不启用业务看门狗。
 		from usr.uart import ProductionConfigUART
 		ProductionConfigUART(persistent_config, _set_identity, RUN_INDICATOR).run()
 		return None
-	from machine import WDT
-	from usr.ui_app import main as start_ui
-	from usr.ui_commands import UICommandQueue
-	from usr.ui_messages import UIMessageBus
-	from usr.ui_state import UIStateStore
-	from usr.communication_controller import CommunicationController
-	from usr.ota_service import OTAService
+	
 	server = selected_server()
 	settings = persistent_config.snapshot()
 	state_store = UIStateStore(settings)

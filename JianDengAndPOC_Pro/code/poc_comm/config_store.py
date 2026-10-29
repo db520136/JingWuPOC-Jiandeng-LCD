@@ -40,7 +40,7 @@ DEFAULT_CONFIG = {
 	"audio_volume": 11,
 	"lamp_brightness": 42,
 	"screen_brightness": 100,
-	"double_click_enabled": True,
+	"double_click_enabled": False,
 	"battery_percent": None,
 	"battery_high_active": False,
 	"battery_full_confirmed": False,

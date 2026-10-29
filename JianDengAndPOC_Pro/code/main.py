@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 from machine import Pin
+from misc import Power
 RUN_INDICATOR = Pin(Pin.GPIO38, Pin.OUT, Pin.PULL_PD, 1)
 from usr.font_port import mount_external_flash
 from usr.ui_app import main as start_ui
@@ -40,7 +41,7 @@ SCREEN_CONTROL_GPIO = 5
 LAMP_CONTROL_GPIO = 28
 BATTERY_CHARGE_GPIO = 14
 BATTERY_FULL_GPIO = 13
-SOFTWARE_VERSION = "1.5.12"
+SOFTWARE_VERSION = "1.5.13"
 GNSS_SAMPLE_UPLOAD_INTERVAL_MS = 30000
 GNSS_CHANGE_THRESHOLD_M = 5.0
 WATCHDOG_TIMEOUT_S = 20
@@ -107,10 +108,12 @@ def _make_services(state_store, message_bus, command_queue, communication,
 		device=DevicePort(SOFTWARE_VERSION, HARDWARE_VERSION, DEVICE_ID),
 		key_action_callback=communication.request_hardware_key,
 		gnss_result_callback=communication.request_gnss_result,
+		checkin_request_callback=communication.request_checkin,
 		persistent_config=persistent_config,
 		gnss_interval_ms=GNSS_SAMPLE_UPLOAD_INTERVAL_MS,
 		gnss_change_threshold_m=GNSS_CHANGE_THRESHOLD_M)
 	communication.set_gnss_sample_request(worker.request_gnss_sample)
+	communication.set_manual_gnss_request(worker.request_manual_gnss)
 	communication.set_screen_wake_request(worker.request_screen_wake)
 	hardware_keys = HardwareKeyPort(
 		worker.notify_hardware_key, VOLUME_UP_GPIO, VOLUME_DOWN_GPIO,
@@ -131,6 +134,8 @@ def start():
 		from usr.uart import ProductionConfigUART
 		ProductionConfigUART(persistent_config, _set_identity, RUN_INDICATOR).run()
 		return None
+	print("开机原因：",Power.powerOnReason())
+	print("关机原因：",Power.powerDownReason())
 	server = selected_server()
 	settings = persistent_config.snapshot()
 	state_store = UIStateStore(settings)

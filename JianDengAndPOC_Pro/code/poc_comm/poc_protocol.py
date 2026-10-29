@@ -165,7 +165,9 @@ def parse_logout_ack(payload):
 	return {"logout_result": int(payload[0])}
 def build_heartbeat_payload(device_id):
 	return _device_id_bytes(device_id)
-def build_gnss_upload_payload(device_id, gnss_data=b""):
+def build_gnss_upload_payload(device_id, gnss_data=b"", data_type=0):
+	if data_type not in (0, 1):
+		raise ValueError("GNSS数据类型必须为0或1")
 	if gnss_data is None:
 		gnss_data = b""
 	if isinstance(gnss_data, str):
@@ -174,7 +176,7 @@ def build_gnss_upload_payload(device_id, gnss_data=b""):
 		gnss_data = bytes(gnss_data)
 	if len(gnss_data) > 0xFF:
 		raise ValueError("GNSS定位数据超过UINT8长度范围")
-	return (_device_id_bytes(device_id) + bytes((len(gnss_data),)) +
+	return (_device_id_bytes(device_id) + bytes((data_type, len(gnss_data))) +
 			gnss_data)
 def parse_gnss_upload_ack(payload):
 	return True

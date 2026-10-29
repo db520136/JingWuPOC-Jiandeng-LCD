@@ -127,6 +127,9 @@ class NavigationTestApp:
 		self._volume_key_event_seen = 0
 		self._key_notice_seen = 0
 		self._pending_key_notice = None
+		self._checkin_view = (0, "idle")
+		self._checkin_popup_seen = None
+		self._checkin_popup_allowed = False
 		self._ota_dot_count = 1
 		self._ota_dot_at = None
 	def _sync_display_sleep(self):
@@ -1058,6 +1061,7 @@ class NavigationTestApp:
 			self._refresh_page_state()
 			self._process_connection_popup()
 			self.pages.process_popup()
+			self._process_checkin_popup()
 			self._process_pending_key_notice()
 			self.pages.process_volume_overlay()
 			self._animate_ota_popup(now)
@@ -1096,6 +1100,10 @@ class NavigationTestApp:
 		if changed is None:
 			return
 		_revision, snapshot = changed
+		self._checkin_view = (snapshot.get("checkin_id", 0), snapshot.get("checkin_phase", "idle"))
+		self._checkin_popup_allowed = bool(snapshot.get("business_page_active") and
+			not snapshot.get("logout_active") and not snapshot.get("ota_busy") and
+			snapshot.get("identity_mode") != "guest")
 		forced_revision = int(snapshot.get("forced_logout_revision") or 0)
 		if forced_revision > self._forced_logout_seen:
 			self._forced_logout_seen = forced_revision
@@ -1138,6 +1146,17 @@ class NavigationTestApp:
 			self._process_floor_event(snapshot)
 		self._process_ota_event(snapshot)
 		self.pages.refresh_state(snapshot)
+	def _process_checkin_popup(self):
+		request_id, phase = self._checkin_view
+		if (not self._checkin_popup_allowed or not self._logged_in or
+				phase in ("idle", "cancelled")):
+			self.pages.hide_checkin_popup()
+			return
+		key = (request_id, phase)
+		if phase not in ("locating", "sending") and self._checkin_popup_seen == key:
+			return
+		if self.pages.show_checkin_popup(request_id, phase):
+			self._checkin_popup_seen = key
 	def _process_logout_state(self, snapshot):
 		revision = int(snapshot.get("logout_event_revision") or 0)
 		if snapshot.get("logout_active"):
